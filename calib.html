@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="de">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<meta name="color-scheme" content="light">
+	<title>Rasterlabor | Mikroskopkalibrierung</title>
+	<link rel="stylesheet" href="/app.css">
+	<script type="module" src="/app.js"></script>
+</head>
+<body>
+	<header class="app-header">
+		<div class="identity"><span class="brand-mark"><i data-lucide="scan-line"></i></span><div><h1>Rasterlabor</h1><span>Mikroskopkalibrierung</span></div></div>
+		<div class="header-actions"><span class="local-state"><i data-lucide="hard-drive"></i> Lokal</span>
+			<button id="openVideo" title="Video &ouml;ffnen" aria-label="Video &ouml;ffnen"><i data-lucide="folder-open"></i><span>Video &ouml;ffnen</span></button>
+			<button id="importButton" title="Kalibrierung laden" aria-label="Kalibrierung laden"><i data-lucide="upload"></i></button>
+			<button id="exportButton" title="Kalibrierung speichern" aria-label="Kalibrierung speichern" disabled><i data-lucide="download"></i></button>
+			<button id="correctedVideoButton" title="Korrigiertes Video speichern" aria-label="Korrigiertes Video speichern" disabled><i data-lucide="file-video"></i><span>Korrigiertes Video speichern</span></button>
+			<button id="infoButton" title="Kalibrierinformationen" aria-label="Kalibrierinformationen"><i data-lucide="info"></i></button>
+		</div>
+		<input id="videoFile" type="file" accept="video/mp4,.mp4,.m4v,.mov" hidden>
+		<input id="calibrationFile" type="file" accept=".zip" hidden>
+	</header>
+	<div class="processing-bar" role="region" aria-label="Verarbeitungsfortschritt"><span id="processingStatus">Bereit</span><progress id="progress" value="0" max="1" aria-label="Fortschritt des aktuellen Rechenschritts"></progress><span id="pendingStatus">Keine ausstehenden Frames</span></div>
+	<details id="timeProfiles" class="fit-profile"><summary id="timeProfilesSummary">Zeitprofile</summary><div id="exportProfileSection" hidden><h2>Videoexport</h2><table><thead><tr><th>Rechenschritt</th><th>Dauer / Frame</th></tr></thead><tbody id="exportProfileRows"></tbody></table><p id="exportProfileNote"></p></div><div id="patchProfileSection" hidden><h2>Erkennung</h2><table><thead><tr><th>Rechenschritt</th><th>Dauer</th></tr></thead><tbody id="patchProfileRows"></tbody></table><p id="patchProfileNote"></p></div><div id="fitProfileSection" hidden><h2>Kalibrierungs-Fit</h2><table><thead><tr><th>Rechenschritt</th><th>Dauer</th></tr></thead><tbody id="fitProfileRows"></tbody></table><p id="fitProfileNote"></p></div></details>
+	<div class="workspace">
+		<aside class="settings">
+			<section><div class="section-heading"><h2>01 / Muster</h2><span id="phaseOneState" class="tag">Ungepr&uuml;ft</span></div>
+				<label>Mustertyp<select id="pattern"><option value="lines">Linien-Karopapier</option><option value="chessboard">Schwarz-Wei&szlig;-Schachbrett</option><option value="patches">Image-Patches</option></select></label>
+				<div id="patchControls" hidden><div class="form-grid"><label>Patchgr&ouml;&szlig;e, px<input id="patchSize" type="number" min="16" max="256" step="16" value="32"></label><label>Suchradius, px<input id="patchSearchRadius" type="number" min="4" max="128" step="1" value="16"></label></div>
+					<label>Patch-Maske</label><div class="mask-tools" role="toolbar" aria-label="Werkzeuge f&uuml;r die Patch-Maske"><button type="button" data-mask-tool="pan" aria-pressed="true" title="Ansicht verschieben" aria-label="Ansicht verschieben"><i data-lucide="hand"></i></button><button type="button" data-mask-tool="search" aria-pressed="false" title="Suchfl&auml;che malen" aria-label="Suchfl&auml;che malen"><i data-lucide="paintbrush"></i><span class="mask-swatch search"></span></button><button type="button" data-mask-tool="forbidden" aria-pressed="false" title="Verbotene Fl&auml;che malen" aria-label="Verbotene Fl&auml;che malen"><i data-lucide="paintbrush"></i><span class="mask-swatch forbidden"></span></button><button type="button" data-mask-tool="erase" aria-pressed="false" title="Maske radieren" aria-label="Maske radieren"><i data-lucide="eraser"></i></button><button id="clearPatchMask" type="button" title="Patch-Maske l&ouml;schen" aria-label="Patch-Maske l&ouml;schen"><i data-lucide="trash-2"></i></button></div>
+					<label class="mask-brush-label">Pinselgr&ouml;&szlig;e <input id="maskBrushSize" type="range" min="4" max="256" step="4" value="48"><span id="maskBrushValue">48 px</span></label>
+				</div>
+				<div id="gridGeometryControls">
+				<div class="form-grid"><label>Rasterweite, mm<input id="gridMm" type="number" min="0.0001" step="any" placeholder="Unbekannt"></label><label>Ziel-px / Raster<input id="step" type="number" min="1" step="any" placeholder="Automatisch"></label></div>
+				<div class="form-grid"><label>Spalten (Punkte)<input id="columns" type="number" min="3" step="1" placeholder="Unbekannt"></label><label>Zeilen (Punkte)<input id="rows" type="number" min="3" step="1" placeholder="Unbekannt"></label></div>
+				<label>Rasterabstand im Rohbild, px<input id="approxStep" type="number" min="10" step="any" placeholder="Automatisch"></label>
+				</div>
+				<details><summary>Erkennungsparameter</summary>
+					<label>Mindestkontrast<input id="threshold" type="number" min="1" max="200" value="16"></label>
+					<label id="lineRadiusControl">Linienradius, px<input id="lineRadius" type="number" min="2" max="40" placeholder="Automatisch"></label>
+				</details>
+				<button id="detectButton" class="wide" disabled><i data-lucide="scan"></i> Erkennung pr&uuml;fen</button>
+				<div id="detectionStatus" class="status-line" aria-live="polite">Kein Frame geladen.</div>
+			</section>
+			<section><div class="section-heading"><h2>02 / Kalibrierung</h2><span id="fieldVersion" class="tag">Kein Feld</span></div>
+				<button id="startButton" class="primary wide" disabled><i data-lucide="play"></i> Kalibrierung starten</button>
+				<div class="action-row"><button id="pauseButton" disabled><i data-lucide="pause"></i><span>Pause</span></button><button id="resumeButton" disabled><i data-lucide="play"></i><span>Fortsetzen</span></button></div>
+				<button id="evaluateButton" class="wide" disabled><i data-lucide="focus"></i> Diesen Frame auswerten</button>
+				<button id="evaluateNextButton" class="wide" disabled><i data-lucide="step-forward"></i> N&auml;chsten Frame auswerten</button>
+				<details><summary>Fit und Frameauswahl</summary>
+					<label>Mindestbewegung, px<input id="minMotion" type="number" min="0" step="0.5" value="0"></label>
+					<div class="form-grid"><label>Start, %<input id="startPercent" type="number" min="0" max="99" value="0"></label><label>Ende, %<input id="endPercent" type="number" min="1" max="100" value="100"></label></div>
+					<label>Validierungsabschnitt ab, %<input id="validationFrom" type="number" min="10" max="95" value="80"></label>
+					<label>Splineweite, Quell-px<input id="spacing" type="number" min="16" step="1" placeholder="Automatisch, grob"></label>
+					<label>Glattheitsgewicht<input id="lambda" type="number" min="0" step="0.001" value="0.01"></label>
+					<div class="form-grid"><label>Messunsicherheit, px<input id="sigma" type="number" min="0.01" step="0.1" value="1"></label><label>Huber-Delta<input id="delta" type="number" min="0.1" step="0.1" value="1.5"></label></div>
+					<div class="form-grid"><label>Min. sing. Wert<input id="tau" type="number" min="0.001" step="0.01" value="0.12"></label><label>Abnahme P95, px<input id="acceptance" type="number" min="0.01" step="0.1" value="1"></label></div>
+					<div class="form-grid"><label>Fit-Iterationen<input id="iterations" type="number" min="5" max="300" value="35"></label><label>Update alle Frames<input id="updateEvery" type="number" min="2" max="100" value="4"></label></div>
+					<label class="check" title="Beschleunigt Patch-Tracking und linearen Fit mit Float32-Compute; bei Problemen wird automatisch die CPU verwendet."><input id="useWebGpu" type="checkbox"> WebGPU-Beschleunigung</label>
+				</details>
+				<div class="action-row"><button id="refitButton" disabled><i data-lucide="refresh-cw"></i> Neu fitten</button><button id="resetButton" title="Kalibrierung zur&uuml;cksetzen" aria-label="Kalibrierung zur&uuml;cksetzen"><i data-lucide="trash-2"></i></button></div>
+				<label class="check"><input id="follow" type="checkbox" checked> Verarbeitetem Frame folgen</label>
+			</section>
+			<section><h2>Optischer Aufbau</h2><textarea id="opticalConfiguration" rows="3" placeholder="Mikroskop, Zoom, Fokus, Kamera, Objektebene"></textarea><div id="metricScale" class="status-line">Ma&szlig;stab in Rastereinheiten</div></section>
+		</aside>
+		<main>
+			<div class="video-strip"><div><strong id="videoName">Kein Video</strong><span id="videoMetadata">MP4</span></div><span id="frameTime">Frame &mdash; / PTS &mdash;</span></div>
+			<div id="message" role="status" hidden></div>
+			<div class="view-toolbar"><div class="tabs" role="tablist" aria-label="Feldansicht">
+				<button role="tab" aria-selected="true" data-view="field">R/B-Feld</button><button role="tab" aria-selected="false" data-view="field3d">3D-Feld</button><button role="tab" aria-selected="false" data-view="rectified">Entzerrt</button><button role="tab" aria-selected="false" data-view="data">Datenlage</button><button role="tab" aria-selected="false" data-view="coverage">Abdeckung</button><button role="tab" aria-selected="false" data-view="residual">Restfehler</button>
+			</div><div class="view-tools"><label class="check"><input id="overlay" type="checkbox" checked> Overlay</label><details class="image-adjustments"><summary title="Bildanpassung" aria-label="Bildanpassung"><i data-lucide="sliders-horizontal"></i></summary><div class="adjustment-panel" role="group" aria-label="Live-Bildanpassung">
+				<label>Helligkeit <input id="previewBrightness" type="range" min="-100" max="100" step="1" value="0"><span id="previewBrightnessValue">0</span></label>
+				<label>Kontrast <input id="previewContrast" type="range" min="0" max="300" step="1" value="100"><span id="previewContrastValue">100%</span></label>
+				<label>Gamma <input id="previewGamma" type="range" min="0.1" max="3" step="0.05" value="1"><span id="previewGammaValue">1.00</span></label>
+				<button id="resetPreviewAdjustments" title="Bildanpassung zur&uuml;cksetzen" aria-label="Bildanpassung zur&uuml;cksetzen"><i data-lucide="rotate-ccw"></i></button>
+			</div></details><button id="zoomOut" title="Verkleinern" aria-label="Verkleinern"><i data-lucide="zoom-out"></i></button><span id="zoomValue">100%</span><button id="zoomIn" title="Vergr&ouml;&szlig;ern" aria-label="Vergr&ouml;&szlig;ern"><i data-lucide="zoom-in"></i></button><button id="fitView" title="Ansicht einpassen" aria-label="Ansicht einpassen"><i data-lucide="maximize"></i></button></div></div>
+			<div class="view-grid">
+				<section class="image-pane"><div class="pane-heading"><h2>Rohbild</h2><span id="rawState">Kein Frame</span></div><div class="canvas-host"><canvas id="rawCanvas" aria-label="Rohbild mit erkannten Merkmalen"></canvas><div id="rawEmpty" class="empty-state"><i data-lucide="film"></i><span>Kein Video geladen</span></div></div></section>
+				<section class="image-pane"><div class="pane-heading"><h2 id="resultTitle">Dichtes Offsetfeld</h2><span id="resultState">Keine Kalibrierung</span></div><div class="canvas-host"><canvas id="resultCanvas" aria-label="Berechnetes Kalibrierfeld"></canvas><canvas id="field3dCanvas" aria-label="Dreidimensionale Darstellung des Verschiebungsfeldes" hidden></canvas><div id="resultEmpty" class="empty-state"><i data-lucide="grid-3x3"></i><span>Kein Feld berechnet</span></div></div></section>
+			</div>
+			<div class="legend-bar"><div id="fieldLegend"><span class="swatch red"></span><span>Rot: dx &minus; / +</span><span class="swatch blue"></span><span>Blau: dy &minus; / +</span><label>&plusmn;<input id="colorRange" type="number" min="0.1" step="10" value="100"> px</label><span id="clipping">Clipping &mdash;</span></div>
+				<label id="rigidControl" class="check"><input id="hideRigid" type="checkbox"> Globale Rotation/Translation ausgeblendet</label>
+				<label id="height3dControl" hidden>H&ouml;he &times;<input id="height3d" type="range" min="0.1" max="3" step="0.1" value="1"><span id="height3dValue">1.0</span></label>
+				<div id="otherLegend" hidden></div>
+				<label id="coverageControl" class="check" hidden><input id="relativeCoverage" type="checkbox"> Relative Messabdeckung</label>
+				<div id="dataControls" class="data-controls" hidden><select id="dataMode" aria-label="Datenansicht"><option value="diversity">Framevielfalt</option><option value="rigid">Rigid-Abweichung</option></select><button id="refreshData" title="Datenlage aktualisieren" aria-label="Datenlage aktualisieren"><i data-lucide="refresh-cw"></i></button><label>Skala &plusmn;<input id="dataScaleTolerance" type="number" min="0.1" max="20" step="0.1" value="1">%</label><label>Anisotropie &plusmn;<input id="dataTiltTolerance" type="number" min="0.1" max="20" step="0.1" value="1">%</label><button id="selectConsistent" class="text-button" title="Dominanten Geometriecluster ausw&auml;hlen"><i data-lucide="list-checks"></i> Konsistente w&auml;hlen</button><button id="enableAccepted" class="text-button" title="Alle brauchbaren Frames wieder aktivieren"><i data-lucide="list-restart"></i> Alle brauchbaren</button></div>
+				<div id="coverageLegend" hidden>Gruen: &gt;=3 Messframes | Gelb: 1-2 | Grau: unbeobachtet</div>
+			</div>
+			<div class="transport"><div class="transport-buttons"><button id="firstFrame" title="Zum Anfang" aria-label="Zum Anfang" disabled><i data-lucide="skip-back"></i></button><button id="previousFrame" title="Vorheriger Frame" aria-label="Vorheriger Frame" disabled><i data-lucide="step-back"></i></button><button id="playButton" title="Wiedergabe" aria-label="Wiedergabe" disabled><i data-lucide="play"></i></button><button id="nextFrame" title="N&auml;chster Frame" aria-label="N&auml;chster Frame" disabled><i data-lucide="step-forward"></i></button></div>
+				<input id="timeline" type="range" min="0" max="0" value="0" step="1" aria-label="Videozeitpunkt" disabled><span id="elapsed">00:00.000</span><select id="speed" aria-label="Wiedergabegeschwindigkeit"><option value="0.25">0.25&times;</option><option value="0.5">0.5&times;</option><option value="1" selected>1&times;</option><option value="2">2&times;</option></select>
+			</div>
+			<div class="inspector"><span id="pixelInfo">Quelle &mdash; &nbsp; Ebene &mdash; &nbsp; dx/dy &mdash;</span><span id="measurement">Abstand &mdash;</span><button id="clearMeasurement" title="Messung l&ouml;schen" aria-label="Messung l&ouml;schen"><i data-lucide="eraser"></i></button></div>
+			<div class="metrics"><div><span>Trainingsframes</span><strong id="trainCount">0</strong></div><div><span>Validierungsframes</span><strong id="validationCount">0</strong></div><div><span>Messpunkte</span><strong id="pointCount">0</strong></div><div><span>Training RMS</span><strong id="trainRms">&mdash;</strong></div><div><span>Validierung P95</span><strong id="validationP95">&mdash;</strong></div><div><span>G&uuml;ltige Ausgabe</span><strong id="validCoverage">&mdash;</strong></div></div>
+			<section class="observations"><div class="section-heading"><h2>Beobachtungen</h2><span id="observationSummary">0 verworfen / deaktiviert</span></div><div class="table-scroll"><table><thead><tr><th>Aktiv</th><th>Frame / PTS</th><th>Rolle</th><th>Punkte</th><th>Status</th></tr></thead><tbody id="frameTable"><tr><td colspan="5" class="muted">Keine Messframes</td></tr></tbody></table></div></section>
+		</main>
+	</div>
+	<footer id="memoryStats" class="memory-footer" aria-live="polite">RAM-Statistik wird ermittelt.</footer>
+	<video id="video" muted playsinline preload="metadata" hidden></video>
+	<svg class="filter-definitions" aria-hidden="true"><filter id="imageAdjustmentFilter" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB"><feComponentTransfer result="levels"><feFuncR id="previewRedLevel" type="linear" slope="1" intercept="0"></feFuncR><feFuncG id="previewGreenLevel" type="linear" slope="1" intercept="0"></feFuncG><feFuncB id="previewBlueLevel" type="linear" slope="1" intercept="0"></feFuncB></feComponentTransfer><feComponentTransfer in="levels"><feFuncR id="previewRedGamma" type="gamma" amplitude="1" exponent="1" offset="0"></feFuncR><feFuncG id="previewGreenGamma" type="gamma" amplitude="1" exponent="1" offset="0"></feFuncG><feFuncB id="previewBlueGamma" type="gamma" amplitude="1" exponent="1" offset="0"></feFuncB></feComponentTransfer></filter></svg>
+	<dialog id="infoDialog"><div class="section-heading"><h2>Kalibrierinformationen</h2><button id="closeInfo" title="Schlie&szlig;en" aria-label="Schlie&szlig;en"><i data-lucide="x"></i></button></div><p>G&uuml;ltig nur bei unver&auml;nderter Optik, Fokus, Zoom, Aufl&ouml;sung, Crop und Objektebene. Rasterweite und Papierplanlage begrenzen die Messgenauigkeit. Pixelaufl&ouml;sung ist keine Genauigkeitsgarantie.</p><p>Abdeckung z&auml;hlt unterschiedliche angenommene Messframes, keine statistische Konfidenz. Invertierbarkeit wird diskret gepr&uuml;ft, nicht analytisch bewiesen.</p><pre id="qualityDetails">Noch keine Kalibrierung.</pre></dialog>
+</body>
+</html>
