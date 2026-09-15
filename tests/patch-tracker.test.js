@@ -164,3 +164,71 @@ test('image patches can check the current frame repeatedly without changing sett
   assert.equal(repeated.generation, first.generation);
   assert.equal(repeated.interrupted, undefined);
 });
+
+test('tracking rediscovers original patch identities after an overlapping out-and-back pass', () => {
+  const tracker = new PatchTracker();
+  const options = { patchSize: 32, patchSearchRadius: 16, threshold: 16, rediscoverPatches: true };
+  const first = tracker.process(texturedImage(256, 176), 0, options);
+  let result;
+  for (let index = 1; index <= 12; index++) result = tracker.process(texturedImage(256, 176, -index * 6), index, options);
+  const absent = first.points.filter(point => !result.points.some(current => current.id === point.id));
+  assert.ok(absent.length >= 3, 'original patches must actually leave the image');
+  let rediscovered = 0;
+  for (let index = 13; index <= 24; index++) {
+    result = tracker.process(texturedImage(256, 176, -(24 - index) * 6), index, options);
+    rediscovered += result.rediscovered || 0;
+  }
+  const recovered = result.points.filter(point => absent.some(original => original.id === point.id));
+  assert.ok(rediscovered >= 3, 'returning pass must reuse archived patches');
+  assert.ok(recovered.length >= 3, 'recovered identities must survive the return');
+  for (const point of recovered) {
+    const original = absent.find(candidate => candidate.id === point.id);
+    assert.equal(point.col, original.col);
+    assert.equal(point.row, original.row);
+    assert.ok(Math.hypot(point.x - original.x, point.y - original.y) < 1, 'loop returns to its original anchor');
+  }
+  assert.equal(new Set(result.points.map(point => point.id)).size, result.points.length);
+});
+
+test('patch rediscovery rejects unrelated appearance and respects forbidden areas', () => {
+  const tracker = new PatchTracker();
+  const options = { patchSize: 32, patchSearchRadius: 16, threshold: 16, rediscoverPatches: true };
+  const first = tracker.process(texturedImage(256, 176), 0, options);
+  const survivors = first.points.filter(point => point.x > 128);
+  tracker.features = survivors;
+  assert.equal(tracker.rediscoverPatches(new Float32Array(256 * 176).fill(128), 256, 176, 32, 16, null, 3), 0);
+  const mask = createPatchMask(256, 176, 1);
+  mask.data.fill(MASK_FORBIDDEN);
+  assert.equal(tracker.rediscoverPatches(tracker.previous, 256, 176, 32, 16, mask, 4), 0);
+  assert.deepEqual(tracker.features, survivors);
+  assert.ok(tracker.patchArchive.size > 0);
+  tracker.reset();
+  assert.equal(tracker.patchArchive.size, 0);
+  assert.equal(tracker.archiveBytes, 0);
+});
+
+test('patch template archive stays within its memory budget', () => {
+  const tracker = new PatchTracker();
+  tracker.reset();
+  tracker.features = Array.from({ length: 600 }, (_, index) => ({ x: 80, y: 80, col: index, row: 80 }));
+  tracker.rememberPatches(new Float32Array(160 * 160), 160, 160, 128, 0);
+  assert.ok(tracker.patchArchive.size > 0 && tracker.patchArchive.size < 600);
+  assert.ok(tracker.archiveBytes <= 32 * 1024 * 1024);
+  assert.equal(tracker.archiveBytes, [...tracker.patchArchive.values()].reduce((sum, patch) => sum + patch.pixels.byteLength, 0));
+});
+
+test('GPU tracking postprocessing also rediscovers dormant patches', async () => {
+  const tracker = new PatchTracker();
+  const image = texturedImage(256, 176);
+  const options = { patchSize: 32, patchSearchRadius: 16, threshold: 16, rediscoverPatches: true, useWebGpu: true };
+  const first = await tracker.processAsync(image, 0, options);
+  const absent = first.points.filter(point => point.x < 90);
+  tracker.features = first.points.filter(point => point.x >= 90);
+  tracker.index = 2;
+  tracker.gpuLocator = { track: async () => ({ pairs: tracker.features.map(feature => ({ feature,
+    tracked: { x: feature.x, y: feature.y, score: 1 }, backward: { x: feature.x, y: feature.y, score: 1 } })), profile: {} }) };
+  const result = await tracker.processAsync(image, 3, options);
+  assert.equal(result.accelerator, 'WebGPU');
+  assert.ok(result.rediscovered >= 3);
+  assert.ok(result.points.some(point => absent.some(original => original.id === point.id)));
+});

@@ -36,14 +36,14 @@ function structureScore(gray, width, px, py, size) {
   return { score: minimum, dimensionality: minimum / Math.max(maximum, 1e-9) };
 }
 
-function correlation(previous, current, width, height, fromX, fromY, toX, toY, size) {
+function correlation(previous, current, width, height, fromX, fromY, toX, toY, size, sourceWidth = width) {
   const radius = Math.floor(size / 2) - 1;
   const stride = Math.max(1, Math.floor(size / 12));
   if (toX - radius < 1 || toY - radius < 1 || toX + radius >= width - 1 || toY + radius >= height - 1) return -1;
   let sumA = 0; let sumB = 0; let sumAA = 0; let sumBB = 0; let sumAB = 0; let count = 0;
   for (let offsetY = -radius; offsetY <= radius; offsetY += stride) {
     for (let offsetX = -radius; offsetX <= radius; offsetX += stride) {
-      const first = previous[Math.round(fromY + offsetY) * width + Math.round(fromX + offsetX)];
+      const first = previous[Math.round(fromY + offsetY) * sourceWidth + Math.round(fromX + offsetX)];
       const second = current[Math.round(toY + offsetY) * width + Math.round(toX + offsetX)];
       sumA += first; sumB += second; sumAA += first * first; sumBB += second * second; sumAB += first * second; count++;
     }
@@ -53,7 +53,9 @@ function correlation(previous, current, width, height, fromX, fromY, toX, toY, s
   return variance > 1e-6 ? covariance / Math.sqrt(variance) : -1;
 }
 
-function locate(previous, current, width, height, feature, size, searchRadius) {
+function locate(previous, current, width, height, feature, size, searchRadius, reference = feature) {
+  const scoreAt = (px, py) => correlation(previous, current, width, height,
+    reference.x, reference.y, px, py, size, reference.width ?? width);
   let centerX = feature.x;
   let centerY = feature.y;
   let step = Math.max(2, Math.ceil(searchRadius / 6));
@@ -67,7 +69,7 @@ function locate(previous, current, width, height, feature, size, searchRadius) {
       for (let offsetX = -range; offsetX <= range; offsetX += step) {
         const candidateX = Math.round(centerX + offsetX);
         const candidateY = Math.round(centerY + offsetY);
-        const score = correlation(previous, current, width, height, feature.x, feature.y, candidateX, candidateY, size);
+        const score = scoreAt(candidateX, candidateY);
         if (score > bestScore) { bestScore = score; bestX = candidateX; bestY = candidateY; }
       }
     }
@@ -77,10 +79,10 @@ function locate(previous, current, width, height, feature, size, searchRadius) {
     step = Math.max(1, Math.floor(step / 2));
   }
   if (bestScore < 0.72) return null;
-  const left = correlation(previous, current, width, height, feature.x, feature.y, centerX - 1, centerY, size);
-  const right = correlation(previous, current, width, height, feature.x, feature.y, centerX + 1, centerY, size);
-  const top = correlation(previous, current, width, height, feature.x, feature.y, centerX, centerY - 1, size);
-  const bottom = correlation(previous, current, width, height, feature.x, feature.y, centerX, centerY + 1, size);
+  const left = scoreAt(centerX - 1, centerY);
+  const right = scoreAt(centerX + 1, centerY);
+  const top = scoreAt(centerX, centerY - 1);
+  const bottom = scoreAt(centerX, centerY + 1);
   const refine = (low, middle, high) => {
     const curvature = low - 2 * middle + high;
     return Math.abs(curvature) > 1e-6 ? clamp(0.5 * (low - high) / curvature, -0.75, 0.75) : 0;
@@ -146,6 +148,81 @@ export class PatchTracker {
     this.index = null;
     this.signature = null;
     this.generation = 0;
+    this.patchArchive = new Map();
+    this.archiveBytes = 0;
+    this.nextPatchId = 0;
+  }
+
+  rememberPatches(current, width, height, size, index) {
+    const tileSize = size + 6;
+    const half = Math.floor(tileSize / 2);
+    for (const feature of this.features) {
+      feature.id ??= this.nextPatchId++;
+      const known = this.patchArchive.get(feature.id);
+      if (known) { known.lastSeen = index; continue; }
+      const left = Math.floor(feature.x) - half;
+      const top = Math.floor(feature.y) - half;
+      if (left < 0 || top < 0 || left + tileSize > width || top + tileSize > height) continue;
+      const pixels = new Float32Array(tileSize * tileSize);
+      for (let row = 0; row < tileSize; row++) pixels.set(current.subarray((top + row) * width + left,
+        (top + row) * width + left + tileSize), row * tileSize);
+      this.patchArchive.set(feature.id, { id: feature.id, col: feature.col, row: feature.row, pixels,
+        x: feature.x - left, y: feature.y - top, width: tileSize, lastSeen: index, lastAttempt: -1 });
+      this.archiveBytes += pixels.byteLength;
+      while (this.patchArchive.size > 2000 || this.archiveBytes > 32 * 1024 * 1024) {
+        const oldest = this.patchArchive.keys().next().value;
+        this.archiveBytes -= this.patchArchive.get(oldest).pixels.byteLength;
+        this.patchArchive.delete(oldest);
+      }
+    }
+  }
+
+  rediscoverPatches(current, width, height, size, searchRadius, mask, index) {
+    if (this.features.length < 3) return 0;
+    const pose = rigidPose(this.features, point => point.col, point => point.row, point => point.x, point => point.y);
+    const active = new Set(this.features.map(point => point.id));
+    const margin = Math.floor(size / 2) + 2;
+    const candidates = [...this.patchArchive.values()].filter(entry => !active.has(entry.id) && entry.lastSeen < index - 1)
+      .map(entry => ({ entry, x: pose.cosine * entry.col - pose.sine * entry.row + pose.tx,
+        y: pose.sine * entry.col + pose.cosine * entry.row + pose.ty }))
+      .filter(point => point.x >= margin && point.y >= margin && point.x < width - margin && point.y < height - margin &&
+        patchAllowed(mask, point.x, point.y, size) && !this.features.some(activePoint => activePoint.id < point.entry.id &&
+          Math.hypot(activePoint.x - point.x, activePoint.y - point.y) < size * 0.5))
+      .sort((first, second) => first.entry.lastAttempt - second.entry.lastAttempt || first.entry.id - second.entry.id)
+      .slice(0, 48);
+    const matches = [];
+    for (const predicted of candidates) {
+      const entry = predicted.entry;
+      entry.lastAttempt = index;
+      const found = locate(entry.pixels, current, width, height, predicted, size, searchRadius, entry);
+      if (!found || found.score < 0.9 || Math.hypot(found.x - predicted.x, found.y - predicted.y) > searchRadius ||
+        !patchAllowed(mask, found.x, found.y, size)) continue;
+      let competing = -1;
+      for (let offsetY = -searchRadius; offsetY <= searchRadius; offsetY += 3) {
+        for (let offsetX = -searchRadius; offsetX <= searchRadius; offsetX += 3) {
+          const candidateX = Math.round(predicted.x + offsetX);
+          const candidateY = Math.round(predicted.y + offsetY);
+          if (Math.hypot(candidateX - found.x, candidateY - found.y) < 4) continue;
+          competing = Math.max(competing, correlation(entry.pixels, current, width, height,
+            entry.x, entry.y, candidateX, candidateY, size, entry.width));
+        }
+      }
+      if (found.score - competing < 0.04) continue;
+      const backward = locate(current, entry.pixels, entry.width, entry.width, entry, size, 2, { ...found, width });
+      if (!backward || backward.score < 0.9 || Math.hypot(backward.x - entry.x, backward.y - entry.y) > 1.5) continue;
+      if (matches.some(point => Math.hypot(point.x - found.x, point.y - found.y) < size * 0.5)) continue;
+      matches.push({ id: entry.id, col: entry.col, row: entry.row, x: found.x, y: found.y,
+        predictedX: predicted.x, predictedY: predicted.y, confidence: Math.min(found.score, backward.score) });
+    }
+    if (matches.length < 3) return 0;
+    const deltaX = median(matches.map(point => point.x - point.predictedX));
+    const deltaY = median(matches.map(point => point.y - point.predictedY));
+    const consistent = matches.filter(point => Math.hypot(point.x - point.predictedX - deltaX,
+      point.y - point.predictedY - deltaY) <= Math.max(2, size * 0.08));
+    if (consistent.length < 3) return 0;
+    this.features = this.features.filter(point => !consistent.some(match => Math.hypot(point.x - match.x, point.y - match.y) < size * 0.5));
+    this.features = [...consistent.map(({ predictedX, predictedY, ...point }) => point), ...this.features].slice(0, 400);
+    return consistent.length;
   }
 
   process(image, index, options = {}) {
@@ -153,7 +230,7 @@ export class PatchTracker {
     const searchRadius = clamp(Math.round(options.patchSearchRadius || size / 2), 4, 128);
     const mask = options.patchMask;
     const roi = { x: 0, y: 0, width: image.width, height: image.height };
-    const signature = `${image.width}:${image.height}:${size}:${searchRadius}:${mask?.revision || 0}`;
+    const signature = `${image.width}:${image.height}:${size}:${searchRadius}:${mask?.revision || 0}:${Boolean(options.rediscoverPatches)}`;
     const current = options.currentGray || grayscale(image);
     if (mask?.data && !mask.data.includes(MASK_SEARCH)) {
       return { points: [], lines: [], rejected: [], roi, step: 1, success: false,
@@ -166,7 +243,11 @@ export class PatchTracker {
         coverage: 0, confidence: 0, patchSize: size, initialized: false, generation: this.generation, interrupted: true };
     }
     const initialized = !this.previous || signature !== this.signature || index > this.index + 1;
+    let rediscovered = 0;
     if (initialized) {
+      this.patchArchive = new Map();
+      this.archiveBytes = 0;
+      this.nextPatchId = 0;
       this.generation = (this.generation || 0) + 1;
       this.features = selectCandidates(current, image.width, image.height, size, options.threshold || 16, [], 400, mask)
         .map(candidate => ({ x: candidate.x, y: candidate.y, col: candidate.x, row: candidate.y,
@@ -196,6 +277,8 @@ export class PatchTracker {
         tracked = tracked.filter((point, local) => residuals[local] <= maximumResidual);
       }
       this.features = tracked.map(({ previousX, previousY, ...feature }) => feature);
+      if (options.rediscoverPatches) rediscovered = this.rediscoverPatches(current, image.width, image.height, size,
+        Math.min(searchRadius, 32), mask, index);
       if (this.features.length >= 3 && this.features.length < 400) {
         const planePose = rigidPose(this.features, point => point.col, point => point.row, point => point.x, point => point.y);
         const additions = selectCandidates(current, image.width, image.height, size, options.threshold || 16, this.features, 400 - this.features.length, mask);
@@ -215,6 +298,7 @@ export class PatchTracker {
       }
     }
     this.features = this.features.filter(feature => patchAllowed(mask, feature.x, feature.y, size));
+    if (options.rediscoverPatches) this.rememberPatches(current, image.width, image.height, size, index);
     this.previous = current;
     this.index = index;
     this.signature = signature;
@@ -223,14 +307,15 @@ export class PatchTracker {
     return { points: this.features.map(feature => ({ ...feature })), lines: [], rejected: [], roi, step: 1,
       success, reason: success ? '' : 'Zu wenige zweidimensional strukturierte Image-Patches. Patchgroesse, Kontrast oder Bildausschnitt anpassen.',
       coverage: occupied.size / 108, confidence: this.features.length ? this.features.reduce((sum, feature) => sum + feature.confidence, 0) / this.features.length : 0,
-      patchSize: size, initialized, generation: this.generation, accelerator: options.trackerAccelerator || 'CPU' };
+      patchSize: size, initialized, generation: this.generation, accelerator: options.trackerAccelerator || 'CPU',
+      rediscovered, archivedPatches: this.patchArchive.size, archiveBytes: this.archiveBytes };
   }
 
   async processAsync(image, index, options = {}) {
     const started = performance.now();
     const size = clamp(Math.round(options.patchSize || 32), 16, 256);
     const searchRadius = clamp(Math.round(options.patchSearchRadius || size / 2), 4, 128);
-    const signature = `${image.width}:${image.height}:${size}:${searchRadius}:${options.patchMask?.revision || 0}`;
+    const signature = `${image.width}:${image.height}:${size}:${searchRadius}:${options.patchMask?.revision || 0}:${Boolean(options.rediscoverPatches)}`;
     const consecutive = this.previous && signature === this.signature && index === this.index + 1;
     if (!options.useWebGpu || !consecutive) {
       if (!consecutive) this.gpuLocator?.reset();

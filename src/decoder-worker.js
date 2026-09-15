@@ -16,6 +16,7 @@ let sequentialSafe = false;
 let resolveSelected = null;
 let rejectSelected = null;
 let orientation = null;
+let decodedColor = null;
 
 function closeDecoder() {
   selectedFrame?.close();
@@ -64,6 +65,7 @@ async function openVideo(source) {
   closeDecoder();
   for (const bitmap of cache.values()) bitmap.close();
   cache.clear();
+  decodedColor = null;
   file = source;
   const parser = createFile(false);
   let information = null;
@@ -129,7 +131,8 @@ async function openVideo(source) {
 async function decodeFrame(index) {
   if (!file || !presentation[index]) throw new Error('Frameindex ausserhalb der Videospur.');
   const target = presentation[index];
-  if (cache.has(target.timestamp)) return { bitmap: await createImageBitmap(cache.get(target.timestamp)), index, timestamp: target.timestamp };
+  if (cache.has(target.timestamp)) return { bitmap: await createImageBitmap(cache.get(target.timestamp)), index,
+    timestamp: target.timestamp, color: decodedColor };
   let keyIndex = target.index;
   while (keyIndex > 0 && !samples[keyIndex].key) keyIndex--;
   if (!samples[keyIndex].key) throw new Error('Kein vorausgehender Keyframe fuer dieses Sample vorhanden.');
@@ -160,6 +163,9 @@ async function decodeFrame(index) {
     if (selectedFrame.displayWidth !== configuration.codedWidth || selectedFrame.displayHeight !== configuration.codedHeight) {
       throw new Error('Anzeigecrop oder nichtquadratische Pixel stimmen nicht mit der indexierten Quellgeometrie ueberein.');
     }
+    decodedColor ||= { format: selectedFrame.format, primaries: selectedFrame.colorSpace?.primaries,
+      transfer: selectedFrame.colorSpace?.transfer, matrix: selectedFrame.colorSpace?.matrix,
+      fullRange: selectedFrame.colorSpace?.fullRange };
     const bitmap = await createOrientedBitmap(selectedFrame);
     cache.set(target.timestamp, bitmap);
     while (cache.size > cacheLimit) {
@@ -167,7 +173,7 @@ async function decodeFrame(index) {
       cache.get(oldest).close();
       cache.delete(oldest);
     }
-    return { bitmap: await createImageBitmap(bitmap), index, timestamp: target.timestamp };
+    return { bitmap: await createImageBitmap(bitmap), index, timestamp: target.timestamp, color: decodedColor };
   } catch (error) {
     closeDecoder();
     throw error;

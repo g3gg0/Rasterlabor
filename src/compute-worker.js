@@ -3,6 +3,7 @@ import { fitCalibration, geometryCheck } from './solver.js';
 import { buildMaps, remapRGBA } from './maps.js';
 import { exportCalibration, importCalibration } from './format.js';
 import { PatchTracker } from './patch-tracker.js';
+import { WindowTracker } from './window-tracker.js';
 import { patchGpuStatus } from './webgpu-patch-tracker.js';
 import { remapGpuStatus, WebGpuRemapper } from './webgpu-remapper.js';
 import { restoreDetectionScale, scaleDetectionOptions } from './detection-scale.js';
@@ -14,6 +15,7 @@ let calibration = null;
 let cancelled = false;
 let active = false;
 const patchTracker = new PatchTracker();
+const windowTracker = new WindowTracker();
 const gpuRemapper = new WebGpuRemapper();
 const progress = value => self.postMessage({ progress: value });
 
@@ -88,6 +90,9 @@ self.onmessage = async ({ data }) => {
       result = { available: Boolean(gpu), maximumChannelDifference: gpu ? Math.max(...cpu.data.map((value, index) => Math.abs(value - gpu.data[index]))) : null,
         timing: gpu?.timing };
     }
+    else if (data.type === 'track-window') {
+      result = windowTracker.process(data.image, data.index, data.options.rectangle, data.options.patchSearchRadius, data.options.maxRotation);
+    }
     else if (data.type === 'detect' || data.type === 'detect-bitmap') {
       const started = performance.now();
       if (data.type === 'detect-bitmap') {
@@ -141,7 +146,7 @@ self.onmessage = async ({ data }) => {
       result.processingMs = performance.now() - started;
       transfer = [result.data.buffer];
     } else if (data.type === 'export') {
-      result = exportCalibration(calibration, data.frames, data.video, data.parameters, data.opticalConfiguration);
+      result = exportCalibration(calibration, data.frames, data.video, data.parameters, data.opticalConfiguration, data.tracking);
       transfer = [result.buffer];
     } else if (data.type === 'import') {
       const imported = importCalibration(data.bytes);
@@ -152,7 +157,7 @@ self.onmessage = async ({ data }) => {
       const response = calibrationTransferCopy(calibration);
       result = { ...imported, calibration: response.value };
       transfer = response.transfer;
-    } else if (data.type === 'reset') { calibration = null; patchTracker.reset(); gpuRemapper.reset(); result = true; }
+    } else if (data.type === 'reset') { calibration = null; patchTracker.reset(); windowTracker.reset(); gpuRemapper.reset(); result = true; }
     else throw new Error(`Unbekannter Workerauftrag: ${data.type}`);
     self.postMessage({ id: data.id, result }, transfer);
   } catch (error) { self.postMessage({ id: data.id, error: error.message }); }

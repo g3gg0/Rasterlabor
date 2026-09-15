@@ -36,7 +36,9 @@ test('dense inverse, coverage mask, signed forward coordinates and lossless ZIP 
   const image = { width: 48, height: 40, data: new Uint8ClampedArray(48 * 40 * 4).fill(200) };
   const rectified = remapRGBA(image, calibration.maps);
   assert.ok(rectified.data.some(value => value === 200));
-  const packed = exportCalibration(calibration, frames, { name: 'test.mp4' }, { gridMm: null }, 'synthetic');
+  const tracking = { format: 'rasterlabor-xyr-tracking', model_version: 1,
+    path: [{ frame: 12, timestamp: 400000, pose: { x: 1.25, y: -2.5, rotation: 0.01 } }] };
+  const packed = exportCalibration(calibration, frames, { name: 'test.mp4' }, { gridMm: null }, 'synthetic', tracking);
   const restored = importCalibration(packed);
   assert.equal(restored.metadata.mm_per_pixel, null);
   assert.equal(restored.metadata.dpi, null);
@@ -46,6 +48,7 @@ test('dense inverse, coverage mask, signed forward coordinates and lossless ZIP 
   assert.deepEqual(restored.calibration.maps.coverageGrid,
     { cols: calibration.maps.coverageGrid.cols, rows: calibration.maps.coverageGrid.rows });
   assert.deepEqual(restored.observations, frames);
+  assert.deepEqual(restored.tracking, tracking);
   for (let index = 0; index < calibration.maps.valid.length; index += 19) {
     if (!calibration.maps.valid[index]) continue;
     const point = evaluate(field, calibration.maps.inverseX[index], calibration.maps.inverseY[index]);
@@ -66,6 +69,7 @@ test('calibration ZIP stores the patch mask as validated binary data', async () 
   paintPatchMask(patchMask, 8, 8, 5, MASK_SEARCH);
   paintPatchMask(patchMask, 36, 28, 5, MASK_FORBIDDEN);
   const restored = importCalibration(exportCalibration(calibration, frames, {}, { gridMm: null, patchMask }, ''));
+  assert.equal(restored.tracking, null);
   assert.deepEqual(restored.parameters.patchMask.data, patchMask.data);
   assert.equal(restored.parameters.patchMask.cellSize, 4);
   assert.equal(restored.metadata.parameters.patchMask, undefined);

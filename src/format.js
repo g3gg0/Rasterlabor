@@ -15,7 +15,7 @@ function bytesFor(array) {
   return bytes;
 }
 
-export function exportCalibration(calibration, observations, video, parameters, opticalConfiguration) {
+export function exportCalibration(calibration, observations, video, parameters, opticalConfiguration, tracking = null) {
   if (!calibration?.maps) throw new Error('Keine konsistente Kalibrierung zum Speichern vorhanden.');
   const { field, maps } = calibration;
   const arrays = { coefficients: field.coefficients, forward: maps.forward, inverseX: maps.inverseX, inverseY: maps.inverseY,
@@ -54,6 +54,7 @@ export function exportCalibration(calibration, observations, video, parameters, 
         name === 'sourceCoverage' ? [field.height, field.width] : [maps.outputHeight, maps.outputWidth] };
   }
   files['metadata.json'] = strToU8(JSON.stringify(metadata));
+  if (tracking) files['tracking.json'] = strToU8(JSON.stringify(tracking));
   return zipSync(files, { level: 1 });
 }
 
@@ -144,6 +145,7 @@ export function importCalibration(bytes) {
       roundtrip: metadata.roundtrip } };
   const parameters = { ...metadata.parameters, ...(patchMask ? { patchMask } : {}) };
   calibration.parameters = parameters;
+  const tracking = files['tracking.json'] ? JSON.parse(strFromU8(files['tracking.json'])) : null;
   return { calibration, observations, video: metadata.video, parameters,
-    opticalConfiguration: metadata.optical_configuration, metadata };
+    opticalConfiguration: metadata.optical_configuration, tracking, metadata };
 }

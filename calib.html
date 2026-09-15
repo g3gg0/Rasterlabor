@@ -12,6 +12,12 @@
 	<header class="app-header">
 		<div class="identity"><span class="brand-mark"><i data-lucide="scan-line"></i></span><div><h1>Rasterlabor</h1><span>Mikroskopkalibrierung</span></div></div>
 		<div class="header-actions"><span class="local-state"><i data-lucide="hard-drive"></i> Lokal</span>
+			<details class="image-adjustments"><summary title="Globale Bildanpassung" aria-label="Globale Bildanpassung"><i data-lucide="sliders-horizontal"></i></summary><div class="adjustment-panel" role="group" aria-label="Globale Bildanpassung">
+				<label>Helligkeit <input id="previewBrightness" type="range" min="-100" max="100" step="1" value="0"><span id="previewBrightnessValue">0</span></label>
+				<label>Kontrast <input id="previewContrast" type="range" min="0" max="300" step="1" value="100"><span id="previewContrastValue">100%</span></label>
+				<label>Gamma <input id="previewGamma" type="range" min="0.1" max="3" step="0.05" value="1"><span id="previewGammaValue">1.00</span></label>
+				<button id="resetPreviewAdjustments" title="Bildanpassung zur&uuml;cksetzen" aria-label="Bildanpassung zur&uuml;cksetzen"><i data-lucide="rotate-ccw"></i></button>
+			</div></details>
 			<button id="openVideo" title="Video &ouml;ffnen" aria-label="Video &ouml;ffnen"><i data-lucide="folder-open"></i><span>Video &ouml;ffnen</span></button>
 			<button id="importButton" title="Kalibrierung laden" aria-label="Kalibrierung laden"><i data-lucide="upload"></i></button>
 			<button id="exportButton" title="Kalibrierung speichern" aria-label="Kalibrierung speichern" disabled><i data-lucide="download"></i></button>
@@ -21,9 +27,15 @@
 		<input id="videoFile" type="file" accept="video/mp4,.mp4,.m4v,.mov" hidden>
 		<input id="calibrationFile" type="file" accept=".zip" hidden>
 	</header>
+	<nav class="workflow-tabs" role="tablist" aria-label="Arbeitsbereich">
+		<button role="tab" aria-selected="true" data-workflow="calibration"><i data-lucide="scan-line"></i> Linsenkalibrierung</button>
+		<button role="tab" aria-selected="false" data-workflow="tracking"><i data-lucide="route"></i> Tracking</button>
+		<button role="tab" aria-selected="false" disabled title="Folgt in einem spaeteren Schritt"><i data-lucide="sun-medium"></i> Helligkeitskorrektur</button>
+	</nav>
+	<div id="message" role="status" hidden></div>
 	<div class="processing-bar" role="region" aria-label="Verarbeitungsfortschritt"><span id="processingStatus">Bereit</span><progress id="progress" value="0" max="1" aria-label="Fortschritt des aktuellen Rechenschritts"></progress><span id="pendingStatus">Keine ausstehenden Frames</span></div>
-	<details id="timeProfiles" class="fit-profile"><summary id="timeProfilesSummary">Zeitprofile</summary><div id="exportProfileSection" hidden><h2>Videoexport</h2><table><thead><tr><th>Rechenschritt</th><th>Dauer / Frame</th></tr></thead><tbody id="exportProfileRows"></tbody></table><p id="exportProfileNote"></p></div><div id="patchProfileSection" hidden><h2>Erkennung</h2><table><thead><tr><th>Rechenschritt</th><th>Dauer</th></tr></thead><tbody id="patchProfileRows"></tbody></table><p id="patchProfileNote"></p></div><div id="fitProfileSection" hidden><h2>Kalibrierungs-Fit</h2><table><thead><tr><th>Rechenschritt</th><th>Dauer</th></tr></thead><tbody id="fitProfileRows"></tbody></table><p id="fitProfileNote"></p></div></details>
-	<div class="workspace">
+	<details id="timeProfiles" class="fit-profile"><summary id="timeProfilesSummary">Zeitprofile</summary><div id="exportProfileSection" hidden><h2>Videoexport</h2><table><thead><tr><th>Rechenschritt</th><th>Dauer / Frame</th></tr></thead><tbody id="exportProfileRows"></tbody></table><p id="exportProfileNote"></p></div><div id="patchProfileSection" hidden><h2>Erkennung</h2><table><thead><tr><th>Rechenschritt</th><th>Dauer</th></tr></thead><tbody id="patchProfileRows"></tbody></table><p id="patchProfileNote"></p></div><div id="fitProfileSection" hidden><h2>Kalibrierungs-Fit</h2><table><thead><tr><th>Rechenschritt</th><th>Dauer</th></tr></thead><tbody id="fitProfileRows"></tbody></table><p id="fitProfileNote"></p></div><div id="trackingProfileSection" hidden><h2>Tracking</h2><table><thead><tr><th>Rechenschritt</th><th>Dauer / Frame</th></tr></thead><tbody id="trackingProfileRows"></tbody></table><p id="trackingProfileNote"></p></div></details>
+	<div class="workspace" data-workflow-panel="calibration">
 		<aside class="settings">
 			<section><div class="section-heading"><h2>01 / Muster</h2><span id="phaseOneState" class="tag">Ungepr&uuml;ft</span></div>
 				<label>Mustertyp<select id="pattern"><option value="lines">Linien-Karopapier</option><option value="chessboard">Schwarz-Wei&szlig;-Schachbrett</option><option value="patches">Image-Patches</option></select></label>
@@ -66,15 +78,9 @@
 		</aside>
 		<main>
 			<div class="video-strip"><div><strong id="videoName">Kein Video</strong><span id="videoMetadata">MP4</span></div><span id="frameTime">Frame &mdash; / PTS &mdash;</span></div>
-			<div id="message" role="status" hidden></div>
 			<div class="view-toolbar"><div class="tabs" role="tablist" aria-label="Feldansicht">
 				<button role="tab" aria-selected="true" data-view="field">R/B-Feld</button><button role="tab" aria-selected="false" data-view="field3d">3D-Feld</button><button role="tab" aria-selected="false" data-view="rectified">Entzerrt</button><button role="tab" aria-selected="false" data-view="data">Datenlage</button><button role="tab" aria-selected="false" data-view="coverage">Abdeckung</button><button role="tab" aria-selected="false" data-view="residual">Restfehler</button>
-			</div><div class="view-tools"><label class="check"><input id="overlay" type="checkbox" checked> Overlay</label><details class="image-adjustments"><summary title="Bildanpassung" aria-label="Bildanpassung"><i data-lucide="sliders-horizontal"></i></summary><div class="adjustment-panel" role="group" aria-label="Live-Bildanpassung">
-				<label>Helligkeit <input id="previewBrightness" type="range" min="-100" max="100" step="1" value="0"><span id="previewBrightnessValue">0</span></label>
-				<label>Kontrast <input id="previewContrast" type="range" min="0" max="300" step="1" value="100"><span id="previewContrastValue">100%</span></label>
-				<label>Gamma <input id="previewGamma" type="range" min="0.1" max="3" step="0.05" value="1"><span id="previewGammaValue">1.00</span></label>
-				<button id="resetPreviewAdjustments" title="Bildanpassung zur&uuml;cksetzen" aria-label="Bildanpassung zur&uuml;cksetzen"><i data-lucide="rotate-ccw"></i></button>
-			</div></details><button id="zoomOut" title="Verkleinern" aria-label="Verkleinern"><i data-lucide="zoom-out"></i></button><span id="zoomValue">100%</span><button id="zoomIn" title="Vergr&ouml;&szlig;ern" aria-label="Vergr&ouml;&szlig;ern"><i data-lucide="zoom-in"></i></button><button id="fitView" title="Ansicht einpassen" aria-label="Ansicht einpassen"><i data-lucide="maximize"></i></button></div></div>
+			</div><div class="view-tools"><label class="check"><input id="overlay" type="checkbox" checked> Overlay</label><button id="zoomOut" title="Verkleinern" aria-label="Verkleinern"><i data-lucide="zoom-out"></i></button><span id="zoomValue">100%</span><button id="zoomIn" title="Vergr&ouml;&szlig;ern" aria-label="Vergr&ouml;&szlig;ern"><i data-lucide="zoom-in"></i></button><button id="fitView" title="Ansicht einpassen" aria-label="Ansicht einpassen"><i data-lucide="maximize"></i></button></div></div>
 			<div class="view-grid">
 				<section class="image-pane"><div class="pane-heading"><h2>Rohbild</h2><span id="rawState">Kein Frame</span></div><div class="canvas-host"><canvas id="rawCanvas" aria-label="Rohbild mit erkannten Merkmalen"></canvas><div id="rawEmpty" class="empty-state"><i data-lucide="film"></i><span>Kein Video geladen</span></div></div></section>
 				<section class="image-pane"><div class="pane-heading"><h2 id="resultTitle">Dichtes Offsetfeld</h2><span id="resultState">Keine Kalibrierung</span></div><div class="canvas-host"><canvas id="resultCanvas" aria-label="Berechnetes Kalibrierfeld"></canvas><canvas id="field3dCanvas" aria-label="Dreidimensionale Darstellung des Verschiebungsfeldes" hidden></canvas><div id="resultEmpty" class="empty-state"><i data-lucide="grid-3x3"></i><span>Kein Feld berechnet</span></div></div></section>
@@ -95,9 +101,36 @@
 			<section class="observations"><div class="section-heading"><h2>Beobachtungen</h2><span id="observationSummary">0 verworfen / deaktiviert</span></div><div class="table-scroll"><table><thead><tr><th>Aktiv</th><th>Frame / PTS</th><th>Rolle</th><th>Punkte</th><th>Status</th></tr></thead><tbody id="frameTable"><tr><td colspan="5" class="muted">Keine Messframes</td></tr></tbody></table></div></section>
 		</main>
 	</div>
+	<div class="tracking-workspace" data-workflow-panel="tracking" hidden>
+		<aside class="tracking-settings">
+			<section><div class="section-heading"><h2>Tracking</h2><span id="trackingState" class="tag">Bereit</span></div>
+				<label>Verfahren<select id="trackingMode"><option value="patches">Patch Tracking</option><option value="window">Window Tracking</option></select></label>
+				<div id="trackingWindowControls" hidden><button id="trackingSelectWindow" class="wide" title="Fenster im entzerrten Bild aufziehen" aria-pressed="false"><i data-lucide="scan"></i> Fenster ausw&auml;hlen</button><div id="trackingWindowInfo" class="status-line">Kein Fenster ausgew&auml;hlt</div><label>Max. Rotation pro Frame, Grad<input id="trackingMaxRotation" type="number" min="1" max="10" step="1" value="5"></label><div id="trackingMatchQuality" class="status-line">Korrelation: -</div></div>
+				<div class="form-grid"><label>Startframe<input id="trackingStart" type="number" min="0" step="1" value="0"></label><label>Endframe<input id="trackingEnd" type="number" min="0" step="1" value="0"></label></div>
+				<label>Stabilisierungsfenster, Frames<input id="trackingWindow" type="number" min="1" max="240" step="1" value="15"></label>
+				<div class="form-grid"><label>Patchgr&ouml;&szlig;e, px<input id="trackingPatchSize" type="number" min="16" max="256" step="16" value="64"></label><label>Suchradius, px<input id="trackingSearchRadius" type="number" min="4" max="128" step="1" value="32"></label></div>
+				<label>Mindestkontrast<input id="trackingThreshold" type="number" min="1" max="200" step="1" value="16"></label>
+				<label class="check"><input id="trackingUseWebGpu" type="checkbox" checked> WebGPU-Beschleunigung</label>
+				<button id="trackingStartButton" class="primary wide" disabled><i data-lucide="play"></i> Tracking starten</button>
+				<div class="action-row"><button id="trackingPauseButton" disabled><i data-lucide="pause"></i> Pause</button><button id="trackingResumeButton" disabled><i data-lucide="play"></i> Fortsetzen</button></div>
+				<div class="action-row"><button id="trackingResetButton"><i data-lucide="rotate-ccw"></i> Zur&uuml;cksetzen</button><button id="trackingExportButton" disabled><i data-lucide="download"></i> CSV</button></div>
+				<div id="trackingStatus" class="status-line" aria-live="polite">Video und Kalibrierung laden.</div>
+			</section>
+		</aside>
+		<main class="tracking-main">
+			<div class="video-strip"><div><strong>Bewegungspfad</strong><span id="trackingVideoName">Kein Video</span></div><span id="trackingFrameState">Frame &mdash;</span></div>
+			<div class="tracking-metrics"><div><span>X</span><strong id="trackingX">&mdash;</strong></div><div><span>Y</span><strong id="trackingY">&mdash;</strong></div><div><span>Rotation</span><strong id="trackingRotation">&mdash;</strong></div><div><span>Patches</span><strong id="trackingPatchCount">0</strong></div><div><span>RMS</span><strong id="trackingRms">&mdash;</strong></div></div>
+			<div class="view-grid tracking-grid">
+				<section class="image-pane"><div class="pane-heading"><h2>Tracking-Frame</h2><div class="view-tools"><button id="trackingZoomOut" title="Verkleinern" aria-label="Verkleinern"><i data-lucide="zoom-out"></i></button><span id="trackingZoomValue">100%</span><button id="trackingZoomIn" title="Vergroe&szlig;ern" aria-label="Vergroe&szlig;ern"><i data-lucide="zoom-in"></i></button><button id="trackingFitView" title="Ansicht einpassen" aria-label="Ansicht einpassen"><i data-lucide="maximize"></i></button><span id="trackingPreviewState">Noch nicht gestartet</span></div></div><div class="canvas-host"><canvas id="trackingPreviewCanvas" aria-label="Aktueller Frame mit Tracking-Patches; Patch anklicken fuer Detailansicht"></canvas><div id="trackingPreviewEmpty" class="empty-state"><i data-lucide="focus"></i><span>Tracking starten</span></div></div></section>
+				<section class="image-pane"><div class="pane-heading"><h2>XY-Pfad</h2><span id="trackingPathState">0 Posen</span></div><div class="canvas-host"><canvas id="trackingPathCanvas" aria-label="Stabilisierter Kamerabewegungspfad"></canvas><div id="trackingPathEmpty" class="empty-state"><i data-lucide="route"></i><span>Noch kein Bewegungspfad</span></div></div></section>
+			</div>
+			<section class="observations tracking-observations"><div class="section-heading"><h2>Posen</h2><span id="trackingSummary">0 Frames</span></div><div class="table-scroll"><table><thead><tr><th>Frame / PTS</th><th>X, px</th><th>Y, px</th><th>Rotation</th><th>Patches / RMS</th></tr></thead><tbody id="trackingTable"><tr><td colspan="5" class="muted">Noch keine Posen</td></tr></tbody></table></div></section>
+		</main>
+	</div>
 	<footer id="memoryStats" class="memory-footer" aria-live="polite">RAM-Statistik wird ermittelt.</footer>
 	<video id="video" muted playsinline preload="metadata" hidden></video>
 	<svg class="filter-definitions" aria-hidden="true"><filter id="imageAdjustmentFilter" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB"><feComponentTransfer result="levels"><feFuncR id="previewRedLevel" type="linear" slope="1" intercept="0"></feFuncR><feFuncG id="previewGreenLevel" type="linear" slope="1" intercept="0"></feFuncG><feFuncB id="previewBlueLevel" type="linear" slope="1" intercept="0"></feFuncB></feComponentTransfer><feComponentTransfer in="levels"><feFuncR id="previewRedGamma" type="gamma" amplitude="1" exponent="1" offset="0"></feFuncR><feFuncG id="previewGreenGamma" type="gamma" amplitude="1" exponent="1" offset="0"></feFuncG><feFuncB id="previewBlueGamma" type="gamma" amplitude="1" exponent="1" offset="0"></feFuncB></feComponentTransfer></filter></svg>
 	<dialog id="infoDialog"><div class="section-heading"><h2>Kalibrierinformationen</h2><button id="closeInfo" title="Schlie&szlig;en" aria-label="Schlie&szlig;en"><i data-lucide="x"></i></button></div><p>G&uuml;ltig nur bei unver&auml;nderter Optik, Fokus, Zoom, Aufl&ouml;sung, Crop und Objektebene. Rasterweite und Papierplanlage begrenzen die Messgenauigkeit. Pixelaufl&ouml;sung ist keine Genauigkeitsgarantie.</p><p>Abdeckung z&auml;hlt unterschiedliche angenommene Messframes, keine statistische Konfidenz. Invertierbarkeit wird diskret gepr&uuml;ft, nicht analytisch bewiesen.</p><pre id="qualityDetails">Noch keine Kalibrierung.</pre></dialog>
+	<dialog id="trackingPatchDialog"><div class="section-heading"><h2>Patch-Detail</h2><button id="closeTrackingPatch" title="Schlie&szlig;en" aria-label="Schlie&szlig;en"><i data-lucide="x"></i></button></div><div class="patch-detail-host"><canvas id="trackingPatchCanvas" aria-label="Vergroesserte Ansicht des ausgewaehlten Tracking-Patches"></canvas></div><p id="trackingPatchInfo">Kein Patch ausgewaehlt</p></dialog>
 </body>
 </html>

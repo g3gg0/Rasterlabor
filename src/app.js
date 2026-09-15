@@ -8,6 +8,7 @@ import { VideoExporter } from './video-exporter.js';
 import { relativeCoverageScale } from './maps.js';
 import { createPatchMask, MASK_FORBIDDEN, MASK_NEUTRAL, MASK_SEARCH, paintPatchMask, patchAllowed, validatePointsAgainstMask } from './patch-mask.js';
 import { analyzeObservations, selectConsistentFrames } from './observation-diagnostics.js';
+import { fitCameraPose, stabilizePose } from './motion-tracking.js';
 
 createIcons({ icons });
 const element = id => document.getElementById(id);
@@ -26,6 +27,7 @@ const conversionCanvas = new OffscreenCanvas(1, 1);
 const conversionContext = conversionCanvas.getContext('2d', { willReadFrequently: true });
 let decoder = new WorkerClient('/decoder-worker.js', showProgress);
 const computer = new WorkerClient('/compute-worker.js', showProgress);
+let trackingComputer = new WorkerClient('/compute-worker.js', showProgress);
 let videoInfo = null;
 let expectedVideo = null;
 let videoUrl = null;
@@ -67,6 +69,26 @@ let maskImageRevision = -1;
 const maskImage = document.createElement('canvas');
 const transforms = new Map();
 const previewFilter = 'url(#imageAdjustmentFilter)';
+const trackingPreviewImage = document.createElement('canvas');
+let workflow = 'calibration';
+let trackingRunning = false;
+let trackingPaused = false;
+let trackingNextIndex = 0;
+let trackingPath = [];
+let trackingPreviewTransform = null;
+let trackingPreviewPoints = [];
+let trackingPreviewRequest = 0;
+let trackingPreviewTimer = null;
+let trackingProfile = null;
+let trackingZoom = 1;
+let trackingPan = { x: 0, y: 0 };
+let selectedTrackingPatch = null;
+let trackingRectangle = null;
+let selectingTrackingWindow = false;
+let trackingPreviewBusy = false;
+let trackingRunOptions = null;
+let trackingLost = false;
+const windowTracking = () => element('trackingMode').value === 'window';
 const number = (id, fallback) => element(id).value === '' ? fallback : Number(element(id).value);
 const text = (id, value) => { element(id).textContent = value; };
 const fixed = (value, digits = 2) => Number.isFinite(value) ? value.toFixed(digits) : '-';
@@ -129,10 +151,46 @@ function updateTimeProfiles() {
   const exportSection = element('exportProfileSection');
   const patchSection = element('patchProfileSection');
   const fitSection = element('fitProfileSection');
+  const trackingSection = element('trackingProfileSection');
   if (!exportSection.hidden) summaries.push(exportSection.dataset.summary);
   if (!patchSection.hidden) summaries.push(patchSection.dataset.summary);
   if (!fitSection.hidden) summaries.push(fitSection.dataset.summary);
+  if (!trackingSection.hidden) summaries.push(trackingSection.dataset.summary);
   text('timeProfilesSummary', summaries.length ? `Zeitprofile | ${summaries.join(' | ')}` : 'Zeitprofile');
+}
+
+function renderTrackingProfile(profile) {
+  const section = element('trackingProfileSection');
+  section.hidden = !profile?.frames;
+  if (!profile?.frames) { updateTimeProfiles(); return; }
+  const average = value => value / profile.frames;
+  const rows = [
+    ['Frame dekodieren', average(profile.decodeMs)], ['Bitmap nach RGBA', average(profile.rgbaMs)],
+    ['Entzerrung inkl. Transfer', average(profile.remapMs)],
+    ['Worker-Transfer / Warteschlange', average(profile.workerTransferMs)], ['Tracking im Worker', average(profile.trackMs)],
+    ['Pose / Stabilisierung', average(profile.poseMs)], ['Vorschau / Tabelle / Pfad', average(profile.renderMs)],
+    ['Gesamt', average(profile.totalMs)]
+  ];
+  const tracker = profile.tracker;
+  if (profile.mode === 'window') rows.splice(5, 0,
+    ['  Fenster / Grauwert / FFT', average(tracker.sampleMs)], ['  FFT-Translationssuche', average(tracker.matchMs)],
+    ['  Iterative X/Y- und Rotationssuche', average(tracker.refinementMs)]);
+  if (tracker.accelerator === 'WebGPU') rows.splice(4, 0,
+    ['  GPU Grauwert', average(tracker.grayscaleMs)], ['  GPU Kontext / Shader', average(tracker.contextMs)],
+    ['  GPU Upload', average(tracker.uploadMs)], ['  GPU Vorwaertssuche', average(tracker.forwardMs)],
+    ['  GPU Rueckwaertssuche', average(tracker.backwardMs)], ['  CPU Nachfilter / Wiedererkennung', average(tracker.postprocessMs)]);
+  const tbody = element('trackingProfileRows');
+  tbody.replaceChildren();
+  for (const [label, milliseconds] of rows) {
+    if (!Number.isFinite(milliseconds)) continue;
+    const row = tbody.insertRow();
+    row.insertCell().textContent = label;
+    row.insertCell().textContent = `${fixed(milliseconds, 2)} ms`;
+  }
+  const slowest = rows.slice(0, -1).reduce((largest, row) => row[1] > largest[1] ? row : largest);
+  section.dataset.summary = `Tracking ${fixed(1000 / average(profile.totalMs), 2)} fps`;
+  text('trackingProfileNote', `${profile.frames} Frames | ${[...profile.accelerators].join(' / ')} | langsamster Schritt: ${slowest[0].trim()} ${fixed(slowest[1], 2)} ms / Frame | letzte Frame ${fixed(profile.lastTotalMs, 2)} ms`);
+  updateTimeProfiles();
 }
 
 function renderExportProfile(profile) {
@@ -297,11 +355,11 @@ function revalidatePatchFrames(frameList, mask = patchMask) {
   for (const frame of frameList) {
     if (!frame.patchSize) continue;
     invalid += validatePointsAgainstMask(frame.points, mask, frame.patchSize);
-    frame.points = frame.points.filter(point => point.maskValid !== false);
+  const trackingSection = element('trackingProfileSection');
     if (frame.points.length < 6) {
       frame.enabled = false;
       frame.accepted = false;
-      frame.reason = 'Zu wenige Patches ausserhalb der verbotenen Maskenflaeche';
+  if (!trackingSection.hidden) summaries.push(trackingSection.dataset.summary);
     }
   }
   return invalid;
@@ -322,23 +380,23 @@ function commitMaskEdit() {
 
 function updateControls() {
   const hasVideo = Boolean(videoInfo);
-  for (const id of ['firstFrame', 'previousFrame', 'nextFrame', 'timeline']) element(id).disabled = !hasVideo || navigationBusy || rectifiedPlayback;
-  element('playButton').disabled = !hasVideo || (navigationBusy && !rectifiedPlayback);
-  element('detectButton').disabled = !hasVideo || taskBusy || continuous || rectifiedPlayback;
-  element('startButton').disabled = !hasVideo || !phaseChecked || taskBusy || phaseStarted || rectifiedPlayback;
+  for (const id of ['firstFrame', 'previousFrame', 'nextFrame', 'timeline']) element(id).disabled = !hasVideo || navigationBusy || rectifiedPlayback || trackingRunning;
+  element('playButton').disabled = !hasVideo || trackingRunning || (navigationBusy && !rectifiedPlayback);
+  element('detectButton').disabled = !hasVideo || taskBusy || continuous || rectifiedPlayback || trackingRunning;
+  element('startButton').disabled = !hasVideo || !phaseChecked || taskBusy || phaseStarted || rectifiedPlayback || trackingRunning;
   element('pauseButton').disabled = !continuous && !revalidating;
   element('pauseButton').querySelector('span').textContent = revalidating ? 'Abbrechen' : 'Pause';
   element('resumeButton').disabled = !hasVideo || !phaseStarted || continuous || taskBusy || nextProcessingIndex >= (videoInfo?.frameCount || 0);
-  element('evaluateButton').disabled = !hasVideo || !phaseChecked || taskBusy || continuous || rectifiedPlayback;
-  element('evaluateNextButton').disabled = !hasVideo || !phaseChecked || taskBusy || continuous || rectifiedPlayback || currentIndex >= (videoInfo?.frameCount || 0) - 1;
-  element('refitButton').disabled = taskBusy || continuous || rectifiedPlayback || [...frames.values()].filter(frame => frame.enabled && frame.role === 'train').length < 2 || (detectionsStale && !hasVideo);
-  element('exportButton').disabled = !calibration || taskBusy || continuous || rectifiedPlayback;
-  element('correctedVideoButton').disabled = !calibration || !hasVideo || taskBusy || continuous || rectifiedPlayback;
-  element('importButton').disabled = taskBusy || continuous || rectifiedPlayback;
-  element('openVideo').disabled = taskBusy || continuous || rectifiedPlayback;
-  element('resetButton').disabled = taskBusy || continuous || rectifiedPlayback;
+  element('evaluateButton').disabled = !hasVideo || !phaseChecked || taskBusy || continuous || rectifiedPlayback || trackingRunning;
+  element('evaluateNextButton').disabled = !hasVideo || !phaseChecked || taskBusy || continuous || rectifiedPlayback || trackingRunning || currentIndex >= (videoInfo?.frameCount || 0) - 1;
+  element('refitButton').disabled = taskBusy || continuous || rectifiedPlayback || trackingRunning || [...frames.values()].filter(frame => frame.enabled && frame.role === 'train').length < 2 || (detectionsStale && !hasVideo);
+  element('exportButton').disabled = !calibration || taskBusy || continuous || rectifiedPlayback || trackingRunning;
+  element('correctedVideoButton').disabled = !calibration || !hasVideo || taskBusy || continuous || rectifiedPlayback || trackingRunning;
+  element('importButton').disabled = taskBusy || continuous || rectifiedPlayback || trackingRunning;
+  element('openVideo').disabled = taskBusy || continuous || rectifiedPlayback || trackingRunning;
+  element('resetButton').disabled = taskBusy || continuous || rectifiedPlayback || trackingRunning;
   for (const control of document.querySelectorAll('.settings input, .settings select, .settings textarea')) {
-    if (control.id !== 'follow' && control.id !== 'opticalConfiguration') control.disabled = taskBusy || continuous;
+    if (control.id !== 'follow' && control.id !== 'opticalConfiguration') control.disabled = taskBusy || continuous || trackingRunning;
   }
   for (const control of element('frameTable').querySelectorAll('input, select')) {
     control.disabled = taskBusy || continuous || (control.type === 'checkbox' && !frames.get(Number(control.dataset.frameId))?.accepted);
@@ -349,6 +407,7 @@ function updateControls() {
   text('phaseOneState', phaseChecked ? 'Geprueft' : 'Ungeprueft');
   element('phaseOneState').className = `tag ${phaseChecked ? 'good' : ''}`;
   text('resultState', calibration ? `Feld v${calibration.version} | ${stale ? 'veraltet' : calibration.quality === 'validated' ? 'validiert' : 'vorlaeufig'}` : 'Keine Kalibrierung');
+  updateTrackingControls();
 }
 
 async function task(operation) {
@@ -383,6 +442,14 @@ function updateTime() {
   text('rawState', `${video.paused ? 'Framegenau' : 'Wiedergabe'} | #${currentIndex}`);
   element('timeline').value = currentIndex;
   text('elapsed', timeLabel((timestamp - videoInfo.firstTimestamp) / 1e6));
+}
+
+function renderVideoMetadata() {
+  if (!videoInfo) return;
+  const color = videoInfo.color;
+  const hdr = color?.transfer === 'smpteSt2084' || color?.transfer === 'hlg';
+  const colorLabel = color?.transfer ? ` | ${color.primaries || 'Farbraum'} / ${color.transfer}${hdr ? ' (HDR -> SDR-Canvas)' : ''}` : '';
+  text('videoMetadata', `${videoInfo.width} x ${videoInfo.height} | ${videoInfo.duration.toFixed(2)} s | ${videoInfo.frameCount} Frames | ${fixed(videoInfo.fps, 3)} fps${videoInfo.variableFrameRate ? ' (variabel, Mittel)' : ''} | ${videoInfo.codec}${colorLabel}`);
 }
 
 function imageFromBitmap(bitmap) {
@@ -970,6 +1037,428 @@ function draw() {
   text('zoomValue', `${Math.round(zoom * 100)}%`);
 }
 
+function updateTrackingControls() {
+  element('trackingSearchRadius').max = windowTracking() ? '1024' : '128';
+  const ready = Boolean(videoInfo && calibration && videoInfo.width === calibration.field.width && videoInfo.height === calibration.field.height && !taskBusy && !continuous && !rectifiedPlayback);
+  element('trackingStartButton').disabled = !ready || trackingRunning || trackingPreviewBusy || (windowTracking() && !trackingRectangle);
+  element('trackingPauseButton').disabled = !trackingRunning;
+  element('trackingResumeButton').disabled = !ready || trackingRunning || trackingPreviewBusy || trackingLost || !trackingPaused || trackingNextIndex > number('trackingEnd', 0);
+  element('trackingResetButton').disabled = trackingRunning || trackingPreviewBusy;
+  element('trackingExportButton').disabled = !trackingPath.some(entry => entry.pose);
+  for (const control of document.querySelectorAll('.tracking-settings input, .tracking-settings select')) control.disabled = trackingRunning || trackingPreviewBusy;
+  element('trackingSelectWindow').disabled = trackingRunning || trackingPreviewBusy || !trackingPreviewImage.width;
+  text('trackingState', trackingRunning ? 'Laeuft' : trackingPaused ? 'Pausiert' : trackingPath.length ? 'Erfasst' : 'Bereit');
+  element('trackingState').className = `tag ${trackingRunning || trackingPath.length ? 'good' : ''}`;
+  if (!videoInfo) text('trackingStatus', 'Video und Kalibrierung laden.');
+  else if (!calibration) text('trackingStatus', 'Zuerst eine Linsenkalibrierung laden oder erstellen.');
+  else if (videoInfo.width !== calibration.field.width || videoInfo.height !== calibration.field.height) text('trackingStatus', 'Videoaufloesung und Kalibrierung passen nicht zusammen.');
+  else text('trackingStatus', trackingRunning ? 'Tracking laeuft.' : ready ? 'Video und Kalibrierung bereit.' : 'Andere Verarbeitung aktiv.');
+}
+
+function resetTrackingWorker() {
+  trackingComputer.terminate();
+  trackingComputer = new WorkerClient('/compute-worker.js', showProgress);
+}
+
+function clearTrackingResults(preserveRectangle = false) {
+  trackingPreviewRequest++;
+  clearTimeout(trackingPreviewTimer);
+  trackingRunning = false;
+  trackingPaused = false;
+  trackingNextIndex = number('trackingStart', 0);
+  trackingPath = [];
+  trackingProfile = null;
+  trackingRunOptions = null;
+  trackingLost = false;
+  selectingTrackingWindow = false;
+  element('trackingSelectWindow').setAttribute('aria-pressed', 'false');
+  if (!preserveRectangle) trackingRectangle = null;
+  text('trackingWindowInfo', trackingRectangle ? `${trackingRectangle.width} x ${trackingRectangle.height} px` : 'Kein Fenster ausgewaehlt');
+  text('trackingMatchQuality', 'Korrelation: -');
+  trackingPreviewTransform = null;
+  trackingPreviewPoints = [];
+  trackingZoom = 1;
+  trackingPan = { x: 0, y: 0 };
+  selectedTrackingPatch = null;
+  trackingPreviewImage.width = 0;
+  trackingPreviewImage.height = 0;
+  resetTrackingWorker();
+  for (const id of ['trackingX', 'trackingY', 'trackingRotation', 'trackingRms']) text(id, '-');
+  text('trackingPatchCount', '0');
+  text('trackingFrameState', 'Frame -');
+  text('trackingPreviewState', 'Noch nicht gestartet');
+  text('trackingPathState', '0 Posen');
+  text('trackingSummary', '0 Frames');
+  renderTrackingProfile(null);
+  element('trackingPreviewEmpty').hidden = false;
+  element('trackingPathEmpty').hidden = false;
+  const row = document.createElement('tr');
+  const cell = row.insertCell(); cell.colSpan = 5; cell.className = 'muted'; cell.textContent = 'Noch keine Posen';
+  element('trackingTable').replaceChildren(row);
+  for (const id of ['trackingPreviewCanvas', 'trackingPathCanvas']) {
+    const canvas = element(id); canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+  }
+  updateTrackingControls();
+}
+
+function trackingCanvasContext(id) {
+  const canvas = element(id);
+  const bounds = canvas.getBoundingClientRect();
+  const ratio = Math.min(devicePixelRatio || 1, 2);
+  const width = Math.max(1, Math.round(bounds.width * ratio));
+  const height = Math.max(1, Math.round(bounds.height * ratio));
+  if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
+  const context = canvas.getContext('2d');
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  return { context, width: bounds.width, height: bounds.height };
+}
+
+function renderTrackingPreview() {
+  if (!trackingPreviewImage.width || !trackingPreviewImage.height) return;
+  const { context, width, height } = trackingCanvasContext('trackingPreviewCanvas');
+  context.clearRect(0, 0, width, height);
+  const scale = Math.min(width / trackingPreviewImage.width, height / trackingPreviewImage.height) * trackingZoom;
+  const left = (width - trackingPreviewImage.width * scale) / 2 + trackingPan.x * width;
+  const top = (height - trackingPreviewImage.height * scale) / 2 + trackingPan.y * height;
+  context.save();
+  context.filter = previewFilter;
+  context.drawImage(trackingPreviewImage, left, top, trackingPreviewImage.width * scale, trackingPreviewImage.height * scale);
+  context.restore();
+  trackingPreviewTransform = { scale, left, top };
+  element('trackingPreviewEmpty').hidden = true;
+  context.fillStyle = '#19d6a0'; context.strokeStyle = '#063d34'; context.lineWidth = 1;
+  for (const point of trackingPreviewPoints) {
+    const px = left + point.x * scale;
+    const py = top + point.y * scale;
+    const selected = point === selectedTrackingPatch;
+    context.beginPath(); context.arc(px, py, selected ? 5 : 2.5, 0, Math.PI * 2); context.fill(); context.stroke();
+    if (selected) { context.strokeStyle = '#ffd74b'; context.lineWidth = 2; context.beginPath(); context.arc(px, py, 8, 0, Math.PI * 2); context.stroke(); context.strokeStyle = '#063d34'; context.lineWidth = 1; }
+  }
+  if (windowTracking() && trackingRectangle) {
+    context.strokeStyle = '#ffd74b'; context.lineWidth = 2;
+    context.strokeRect(left + trackingRectangle.x * scale, top + trackingRectangle.y * scale,
+      trackingRectangle.width * scale, trackingRectangle.height * scale);
+  }
+  text('trackingZoomValue', `${Math.round(trackingZoom * 100)}%`);
+}
+
+async function rectifiedTrackingImage(bitmap, useWebGpu) {
+  let image;
+  try { image = imageFromBitmap(bitmap); } finally { bitmap.close(); }
+  return computer.call('remap', { image, useWebGpu }, [image.data.buffer]);
+}
+
+function drawTrackingImage(image) {
+  trackingPreviewImage.width = image.width; trackingPreviewImage.height = image.height;
+  trackingPreviewImage.getContext('2d').putImageData(new ImageData(image.data, image.width, image.height), 0, 0);
+  trackingPreviewPoints = [];
+  renderTrackingPreview();
+}
+
+function drawTrackingFrame(bitmap) {
+  trackingPreviewImage.width = bitmap.width;
+  trackingPreviewImage.height = bitmap.height;
+  trackingPreviewImage.getContext('2d').drawImage(bitmap, 0, 0);
+  trackingPreviewPoints = [];
+  renderTrackingPreview();
+}
+
+function drawTrackingPatches(points) {
+  trackingPreviewPoints = points;
+  if (!points.includes(selectedTrackingPatch)) selectedTrackingPatch = null;
+  renderTrackingPreview();
+}
+
+function renderTrackingPatchDetail() {
+  const point = selectedTrackingPatch;
+  if (!point || !trackingPreviewImage.width) return;
+  const patchSize = number('trackingPatchSize', 64);
+  const cropSize = Math.max(128, patchSize * 2);
+  const canvas = element('trackingPatchCanvas');
+  canvas.width = cropSize; canvas.height = cropSize;
+  const context = canvas.getContext('2d');
+  context.imageSmoothingEnabled = false;
+  context.save(); context.filter = previewFilter;
+  context.drawImage(trackingPreviewImage, point.x - cropSize / 2, point.y - cropSize / 2, cropSize, cropSize, 0, 0, cropSize, cropSize);
+  context.restore();
+  context.strokeStyle = '#ffd74b'; context.lineWidth = Math.max(1, cropSize / 192);
+  context.strokeRect(cropSize / 2 - patchSize / 2, cropSize / 2 - patchSize / 2, patchSize, patchSize);
+  context.strokeStyle = '#c6404a'; context.beginPath(); context.moveTo(cropSize / 2 - 7, cropSize / 2); context.lineTo(cropSize / 2 + 7, cropSize / 2); context.moveTo(cropSize / 2, cropSize / 2 - 7); context.lineTo(cropSize / 2, cropSize / 2 + 7); context.stroke();
+  text('trackingPatchInfo', `Frame-Patch bei (${fixed(point.x, 1)}, ${fixed(point.y, 1)}) | gelb: ${patchSize} x ${patchSize} px`);
+}
+
+function selectTrackingPatch(point) {
+  selectedTrackingPatch = point;
+  renderTrackingPreview(); renderTrackingPatchDetail();
+  element('trackingPatchDialog').showModal();
+}
+
+async function showTrackedFrame(entry) {
+  if (trackingRunning || trackingPreviewBusy || taskBusy) return;
+  const request = ++trackingPreviewRequest;
+  trackingPreviewBusy = true; updateTrackingControls();
+  try {
+    const decoded = await decoder.call('frame', { index: entry.frame });
+    if (request !== trackingPreviewRequest) { decoded.bitmap.close(); return; }
+    if (entry.mode === 'window') {
+      const image = await rectifiedTrackingImage(decoded.bitmap, element('trackingUseWebGpu').checked);
+      if (request !== trackingPreviewRequest) return;
+      trackingRectangle = entry.rectangle; drawTrackingImage(image);
+    } else { drawTrackingFrame(decoded.bitmap); decoded.bitmap.close(); drawTrackingPatches(entry.patchPoints); }
+    renderTrackingResults(entry);
+  } finally { trackingPreviewBusy = false; updateTrackingControls(); }
+}
+
+function installTrackingPreviewInteraction() {
+  const canvas = element('trackingPreviewCanvas');
+  let drag = null;
+  const pointAt = event => {
+    const transform = trackingPreviewTransform;
+    if (!transform) return null;
+    const bounds = canvas.getBoundingClientRect();
+    const x = (event.clientX - bounds.left - transform.left) / transform.scale;
+    const y = (event.clientY - bounds.top - transform.top) / transform.scale;
+    return x >= 0 && y >= 0 && x < trackingPreviewImage.width && y < trackingPreviewImage.height ? { x, y } : null;
+  };
+  canvas.addEventListener('pointerdown', event => {
+    if (event.button !== 0) return;
+    drag = { x: event.clientX, y: event.clientY, pan: { ...trackingPan }, moved: false,
+      selection: selectingTrackingWindow && !trackingRunning && !trackingPreviewBusy ? pointAt(event) : null };
+    canvas.setPointerCapture(event.pointerId);
+  });
+  canvas.addEventListener('pointermove', event => {
+    if (!drag) return;
+    if (drag.selection) {
+      const point = pointAt(event);
+      if (point) {
+        const x = Math.floor(Math.min(point.x, drag.selection.x)); const y = Math.floor(Math.min(point.y, drag.selection.y));
+        trackingRectangle = { x, y, width: Math.floor(Math.max(point.x, drag.selection.x)) - x, height: Math.floor(Math.max(point.y, drag.selection.y)) - y };
+        renderTrackingPreview();
+      }
+      return;
+    }
+    const deltaX = event.clientX - drag.x;
+    const deltaY = event.clientY - drag.y;
+    if (Math.hypot(deltaX, deltaY) > 4) drag.moved = true;
+    if (drag.moved) {
+      const bounds = canvas.getBoundingClientRect();
+      trackingPan = { x: drag.pan.x + deltaX / bounds.width, y: drag.pan.y + deltaY / bounds.height };
+      renderTrackingPreview();
+    }
+  });
+  canvas.addEventListener('pointerup', event => {
+    if (drag?.selection) {
+      if (!trackingRectangle || trackingRectangle.width < 32 || trackingRectangle.height < 32) trackingRectangle = null;
+      selectingTrackingWindow = false;
+      element('trackingSelectWindow').setAttribute('aria-pressed', 'false');
+      trackingPaused = false;
+      text('trackingWindowInfo', trackingRectangle ? `${trackingRectangle.width} x ${trackingRectangle.height} px | (${trackingRectangle.x}, ${trackingRectangle.y})` : 'Fenster mindestens 32 x 32 px');
+      updateTrackingControls(); renderTrackingPreview();
+    } else if (drag && !drag.moved) {
+      const sourcePoint = pointAt(event);
+      if (sourcePoint && trackingPreviewPoints.length) {
+        const closest = trackingPreviewPoints.reduce((nearest, point) =>
+          Math.hypot(point.x - sourcePoint.x, point.y - sourcePoint.y) < Math.hypot(nearest.x - sourcePoint.x, nearest.y - sourcePoint.y) ? point : nearest);
+        if (Math.hypot(closest.x - sourcePoint.x, closest.y - sourcePoint.y) <= 14 / trackingPreviewTransform.scale) selectTrackingPatch(closest);
+      }
+    }
+    drag = null;
+  });
+  canvas.addEventListener('pointercancel', () => { drag = null; });
+  canvas.addEventListener('wheel', event => {
+    event.preventDefault();
+    trackingZoom = Math.max(0.5, Math.min(20, trackingZoom * Math.exp(-event.deltaY * 0.001)));
+    renderTrackingPreview();
+  }, { passive: false });
+}
+
+async function previewTrackingStartFrame() {
+  if (!videoInfo || trackingRunning || trackingPreviewBusy || taskBusy || (windowTracking() && !calibration)) return;
+  const index = Math.max(0, Math.min(videoInfo.frameCount - 1, Math.round(number('trackingStart', 0))));
+  const request = ++trackingPreviewRequest;
+  trackingPreviewBusy = true; updateTrackingControls();
+  text('trackingPreviewState', `Lade Frame ${index}...`);
+  try {
+    const decoded = await decoder.call('frame', { index });
+    if (request !== trackingPreviewRequest || trackingRunning) { decoded.bitmap.close(); return; }
+    if (windowTracking()) {
+      const image = await rectifiedTrackingImage(decoded.bitmap, element('trackingUseWebGpu').checked);
+      if (request !== trackingPreviewRequest) return;
+      drawTrackingImage(image);
+    } else { drawTrackingFrame(decoded.bitmap); decoded.bitmap.close(); }
+    text('trackingFrameState', `Vorschau Frame ${index} / PTS ${(decoded.timestamp / 1e6).toFixed(6)} s`);
+    text('trackingPreviewState', windowTracking() ? 'Entzerrter Startframe' : 'Startframe-Vorschau');
+  } catch (error) {
+    if (request === trackingPreviewRequest) text('trackingPreviewState', `Vorschau fehlgeschlagen: ${error.message}`);
+  } finally { trackingPreviewBusy = false; updateTrackingControls(); }
+}
+
+function scheduleTrackingStartPreview() {
+  clearTimeout(trackingPreviewTimer);
+  trackingPreviewTimer = setTimeout(() => { void previewTrackingStartFrame(); }, 120);
+}
+
+function drawTrackingPath() {
+  const poses = trackingPath.filter(entry => entry.pose);
+  const { context, width, height } = trackingCanvasContext('trackingPathCanvas');
+  context.clearRect(0, 0, width, height);
+  if (!poses.length) { element('trackingPathEmpty').hidden = false; return; }
+  element('trackingPathEmpty').hidden = true;
+  const xs = poses.map(entry => entry.pose.x);
+  const ys = poses.map(entry => entry.pose.y);
+  const minimumX = Math.min(0, ...xs); const maximumX = Math.max(0, ...xs);
+  const minimumY = Math.min(0, ...ys); const maximumY = Math.max(0, ...ys);
+  const rangeX = Math.max(1, maximumX - minimumX);
+  const rangeY = Math.max(1, maximumY - minimumY);
+  const padding = 28;
+  const scale = Math.min((width - 2 * padding) / rangeX, (height - 2 * padding) / rangeY);
+  const project = pose => ({ x: padding + (pose.x - minimumX) * scale, y: height - padding - (pose.y - minimumY) * scale });
+  const origin = project({ x: 0, y: 0 });
+  context.strokeStyle = '#aebbb5'; context.lineWidth = 1; context.beginPath();
+  context.moveTo(padding, origin.y); context.lineTo(width - padding, origin.y);
+  context.moveTo(origin.x, padding); context.lineTo(origin.x, height - padding); context.stroke();
+  context.strokeStyle = '#067566'; context.lineWidth = 2; context.beginPath();
+  poses.forEach((entry, index) => { const point = project(entry.pose); index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y); });
+  context.stroke();
+  const latest = project(poses.at(-1).pose);
+  context.fillStyle = '#c6404a'; context.beginPath(); context.arc(latest.x, latest.y, 4, 0, Math.PI * 2); context.fill();
+}
+
+function renderTrackingResults(entry) {
+  const pose = entry.pose;
+  text('trackingFrameState', `Frame ${entry.frame} / PTS ${(entry.timestamp / 1e6).toFixed(6)} s`);
+  text('trackingPreviewState', entry.success ? `${entry.points} Patches | ${entry.rediscovered} wiedererkannt | ${entry.accelerator}` : entry.reason);
+  if (entry.mode === 'window') {
+    text('trackingPreviewState', entry.success ? `Window | ${entry.resolution} | ${entry.accelerator}` : entry.reason);
+    text('trackingMatchQuality', `Korrelation: ${fixed(entry.score, 3)} | Iterationen: ${entry.iterations ?? 0}`);
+  }
+  if (pose) {
+    text('trackingX', `${fixed(pose.x, 3)} px`); text('trackingY', `${fixed(pose.y, 3)} px`);
+    text('trackingRotation', `${fixed(pose.rotation * 180 / Math.PI, 4)} deg`);
+    text('trackingRms', `${fixed(entry.raw?.rms, 3)} px`);
+  } else {
+    for (const id of ['trackingX', 'trackingY', 'trackingRotation', 'trackingRms']) text(id, '-');
+  }
+  text('trackingPatchCount', String(entry.points));
+  text('trackingPathState', `${trackingPath.filter(item => item.pose).length} Posen`);
+  text('trackingSummary', `${trackingPath.length} Frames | Fenster ${number('trackingWindow', 15)}`);
+  const tbody = element('trackingTable'); tbody.replaceChildren();
+  for (const item of trackingPath.slice(-200).reverse()) {
+    const row = tbody.insertRow();
+    row.className = 'tracking-row'; row.tabIndex = 0;
+    row.insertCell().textContent = `#${item.frame} / ${(item.timestamp / 1e6).toFixed(3)} s`;
+    row.insertCell().textContent = item.pose ? fixed(item.pose.x, 3) : '-';
+    row.insertCell().textContent = item.pose ? fixed(item.pose.y, 3) : '-';
+    row.insertCell().textContent = item.pose ? `${fixed(item.pose.rotation * 180 / Math.PI, 4)} deg` : '-';
+    row.insertCell().textContent = item.mode === 'window' ? (item.success ? `NCC ${fixed(item.score, 3)}` : item.reason) : item.raw ? `${item.raw.points} / ${fixed(item.raw.rms, 3)} px` : item.reason;
+    row.onclick = () => void showTrackedFrame(item).catch(error => message(error.message, true));
+    row.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); void showTrackedFrame(item).catch(error => message(error.message, true)); } };
+  }
+  drawTrackingPath();
+}
+
+function trackingOptions() {
+  const patchSize = number('trackingPatchSize', 64);
+  const patchSearchRadius = number('trackingSearchRadius', 32);
+  const threshold = number('trackingThreshold', 16);
+  const windowSize = number('trackingWindow', 15);
+  const maximumSearchRadius = windowTracking() ? 1024 : 128;
+  if (!Number.isFinite(patchSearchRadius) || patchSearchRadius < 4 || patchSearchRadius > maximumSearchRadius) {
+    throw new Error(`Suchradius muss zwischen 4 und ${maximumSearchRadius} px liegen.`);
+  }
+  if (!(windowSize >= 1 && windowSize <= 240)) throw new Error('Stabilisierungsfenster muss zwischen 1 und 240 Frames liegen.');
+  if (!windowTracking() && !(patchSize >= 16 && patchSize <= 256 && Number.isFinite(threshold) && threshold > 0)) {
+    throw new Error('Patchgroesse muss zwischen 16 und 256 px liegen; Mindestkontrast muss positiv und endlich sein.');
+  }
+  const maxRotation = number('trackingMaxRotation', 5);
+  if (windowTracking() && (!trackingRectangle || !Number.isFinite(maxRotation) || maxRotation < 1 || maxRotation > 10)) throw new Error('Fenster auswaehlen und Rotationsgrenze zwischen 1 und 10 Grad setzen.');
+  return { mode: element('trackingMode').value, rectangle: trackingRectangle ? { ...trackingRectangle } : null, maxRotation,
+    pattern: 'patches', patchSize, patchSearchRadius, threshold, rediscoverPatches: true,
+    useWebGpu: element('trackingUseWebGpu').checked };
+}
+
+async function runTracking(restart = false) {
+  if (!videoInfo || !calibration) throw new Error('Video und passende Linsenkalibrierung werden fuer Tracking benoetigt.');
+  if (videoInfo.width !== calibration.field.width || videoInfo.height !== calibration.field.height) throw new Error('Videoaufloesung passt nicht zur Kalibrierung.');
+  const start = Math.max(0, Math.min(videoInfo.frameCount - 1, Math.round(number('trackingStart', 0))));
+  const end = Math.max(start, Math.min(videoInfo.frameCount - 1, Math.round(number('trackingEnd', videoInfo.frameCount - 1))));
+  if (trackingPreviewBusy) return;
+  const options = !restart && trackingRunOptions ? trackingRunOptions : trackingOptions();
+  message();
+  if (restart) {
+    clearTrackingResults(true); trackingNextIndex = start;
+    trackingRunOptions = options;
+    trackingProfile = { mode: options.mode, frames: 0, decodeMs: 0, rgbaMs: 0, remapMs: 0, workerTransferMs: 0, trackMs: 0, poseMs: 0,
+      renderMs: 0, totalMs: 0, lastTotalMs: 0, accelerators: new Set(), tracker: { accelerator: 'CPU',
+        grayscaleMs: 0, contextMs: 0, uploadMs: 0, forwardMs: 0, backwardMs: 0, postprocessMs: 0, sampleMs: 0, matchMs: 0, refinementMs: 0 } };
+  }
+  video.pause(); trackingRunning = true; trackingPaused = false; updateControls();
+  try {
+    while (trackingRunning && trackingNextIndex <= end) {
+      const frameStarted = performance.now();
+      const index = trackingNextIndex;
+      text('processingStatus', `Tracking Frame ${index}/${end}`);
+      element('progress').value = (index - start + 1) / (end - start + 1);
+      const decodeStarted = performance.now();
+      const decoded = await decoder.call('frame', { index });
+      const decodeMs = performance.now() - decodeStarted;
+      const rgbaStarted = performance.now();
+      let image;
+      try { image = imageFromBitmap(decoded.bitmap); } finally { decoded.bitmap.close(); }
+      const rgbaMs = performance.now() - rgbaStarted;
+      let remapMs = 0;
+      if (options.mode === 'window') {
+        const remapStarted = performance.now();
+        image = await computer.call('remap', { image, useWebGpu: options.useWebGpu }, [image.data.buffer]);
+        remapMs = performance.now() - remapStarted;
+      }
+      const renderStarted = performance.now();
+      trackingPreviewImage.width = image.width; trackingPreviewImage.height = image.height;
+      trackingPreviewImage.getContext('2d').putImageData(new ImageData(image.data, image.width, image.height), 0, 0);
+      let renderMs = performance.now() - renderStarted;
+      const workerStarted = performance.now();
+      const detection = await trackingComputer.call(options.mode === 'window' ? 'track-window' : 'detect', { image, index, options }, [image.data.buffer]);
+      const workerRoundtripMs = performance.now() - workerStarted;
+      const poseStarted = performance.now();
+      const raw = options.mode === 'window' ? detection.raw ?? null : detection.success && detection.points.length >= 3 ? fitCameraPose(detection.points, calibration.field) : null;
+      const entry = { frame: index, timestamp: videoInfo.timestamps[index], raw, pose: null,
+        mode: options.mode, rectangle: options.rectangle, score: detection.score, iterations: detection.iterations, resolution: detection.resolution,
+        points: options.mode === 'window' ? (detection.success ? 1 : 0) : detection.points.length, patchPoints: detection.points,
+        rediscovered: detection.rediscovered || 0,
+        success: detection.success && Boolean(raw), reason: detection.reason || (raw ? '' : 'Zu wenige gueltige Patch-Paare im Kalibrierbereich.'),
+        accelerator: detection.accelerator || 'CPU' };
+      trackingPath.push(entry);
+      entry.pose = stabilizePose(trackingPath, number('trackingWindow', 15));
+      const poseMs = performance.now() - poseStarted;
+      const overlayStarted = performance.now();
+      drawTrackingPatches(detection.points); renderTrackingResults(entry);
+      renderMs += performance.now() - overlayStarted;
+      const workerMs = detection.timing?.totalMs ?? workerRoundtripMs;
+      const profile = trackingProfile;
+      profile.frames++;
+      profile.decodeMs += decodeMs; profile.rgbaMs += rgbaMs; profile.remapMs += remapMs; profile.workerTransferMs += Math.max(0, workerRoundtripMs - workerMs);
+      profile.trackMs += workerMs; profile.poseMs += poseMs; profile.renderMs += Math.max(0, renderMs);
+      profile.lastTotalMs = performance.now() - frameStarted; profile.totalMs += profile.lastTotalMs;
+      profile.accelerators.add(detection.accelerator || 'CPU');
+      profile.tracker.accelerator = detection.accelerator || 'CPU';
+      for (const key of ['grayscaleMs', 'contextMs', 'uploadMs', 'forwardMs', 'backwardMs', 'postprocessMs', 'sampleMs', 'matchMs', 'refinementMs']) {
+        profile.tracker[key] += detection.timing?.[key] || 0;
+      }
+      renderTrackingProfile(profile);
+      trackingNextIndex = index + 1;
+      if (options.mode === 'window' && !detection.success) { trackingLost = true; message(detection.reason, true); break; }
+      text('pendingStatus', `${end - index} Tracking-Frames verbleiben`);
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  } finally {
+    const completed = trackingNextIndex > end;
+    trackingRunning = false; trackingPaused = !completed && !trackingLost;
+    text('processingStatus', 'Bereit');
+    text('pendingStatus', trackingLost ? 'Window Tracking verloren | Neustart erforderlich' : completed ? `Tracking abgeschlossen | ${trackingPath.length} Frames` : `Tracking pausiert vor Frame ${trackingNextIndex}`);
+    updateControls();
+  }
+}
+
 function canvasPoint(event, canvas) {
   const transform = transforms.get(canvas);
   if (!transform) return null;
@@ -1074,6 +1563,7 @@ video.addEventListener('error', () => message(`Videovorschau fehlgeschlagen (Med
 
 async function resetCalibration() {
   await computer.call('reset');
+  clearTrackingResults();
   calibration = null; frames = new Map(); snapshotFrames = []; snapshotParameters = null;
   observationDiagnostics = null; observationDiagnosticsDirty = true; geometrySelection = null;
   detections.clear(); currentDetection = null; phaseChecked = false; phaseStarted = false; stale = false; detectionsStale = false;
@@ -1101,11 +1591,15 @@ element('videoFile').onchange = () => void task(async () => {
   video.pause(); if (videoUrl) URL.revokeObjectURL(videoUrl);
   videoUrl = URL.createObjectURL(file); video.src = videoUrl;
   videoInfo = metadata; expectedVideo = { ...metadata, timestamps: undefined };
+  element('trackingStart').max = metadata.frameCount - 1; element('trackingEnd').max = metadata.frameCount - 1;
+  element('trackingEnd').value = metadata.frameCount - 1; text('trackingVideoName', metadata.name);
+  clearTrackingResults();
   rawReady = false; currentIndex = 0; zoom = 1; pan = { x: 0, y: 0 };
   element('timeline').max = metadata.frameCount - 1;
   text('videoName', metadata.name);
-  text('videoMetadata', `${metadata.width} x ${metadata.height} | ${metadata.duration.toFixed(2)} s | ${metadata.frameCount} Frames | ${fixed(metadata.fps, 3)} fps${metadata.variableFrameRate ? ' (variabel, Mittel)' : ''} | ${metadata.codec}`);
-  const first = await decoder.call('frame', { index: 0 }); setRaw(first.bitmap, 0); first.bitmap.close();
+  renderVideoMetadata();
+  const first = await decoder.call('frame', { index: 0 });
+  videoInfo.color = first.color; renderVideoMetadata(); setRaw(first.bitmap, 0); first.bitmap.close();
   if (frames.size) phaseChecked = [...frames.values()].some(frame => frame.accepted);
   updateTable(); text('processingStatus', videoNameMismatch ?
     'Video geladen; Dateiname weicht von der Kalibrierung ab, vorhandene Daten bleiben erhalten' :
@@ -1148,6 +1642,18 @@ element('playButton').onclick = async () => {
 };
 element('speed').onchange = () => { video.playbackRate = Number(element('speed').value); };
 element('overlay').onchange = draw;
+element('trackingStart').oninput = scheduleTrackingStartPreview;
+element('trackingStart').onchange = () => { clearTimeout(trackingPreviewTimer); void previewTrackingStartFrame(); };
+element('trackingMode').onchange = () => {
+  clearTrackingResults();
+  element('trackingWindowControls').hidden = !windowTracking();
+  for (const id of ['trackingPatchSize', 'trackingThreshold']) element(id).closest('label').hidden = windowTracking();
+  void previewTrackingStartFrame();
+};
+element('trackingSelectWindow').onclick = () => {
+  selectingTrackingWindow = !selectingTrackingWindow;
+  element('trackingSelectWindow').setAttribute('aria-pressed', String(selectingTrackingWindow));
+};
 function updatePreviewAdjustments() {
   const brightness = number('previewBrightness', 0) / 100;
   const contrast = number('previewContrast', 100) / 100;
@@ -1162,6 +1668,10 @@ function updatePreviewAdjustments() {
   text('previewContrastValue', `${element('previewContrast').value}%`);
   text('previewGammaValue', gamma.toFixed(2));
   draw();
+  renderTrackingPreview();
+  if (!trackingPreviewImage.width && videoInfo && !taskBusy && !continuous && !rectifiedPlayback && !trackingRunning) {
+    void previewTrackingStartFrame();
+  }
 }
 for (const id of ['previewBrightness', 'previewContrast', 'previewGamma']) element(id).oninput = updatePreviewAdjustments;
 element('resetPreviewAdjustments').onclick = () => {
@@ -1188,6 +1698,10 @@ element('clearPatchMask').onclick = () => {
 element('zoomIn').onclick = () => { zoom = Math.min(20, zoom * 1.25); draw(); };
 element('zoomOut').onclick = () => { zoom = Math.max(0.5, zoom / 1.25); draw(); };
 element('fitView').onclick = () => { zoom = 1; pan = { x: 0, y: 0 }; draw(); };
+element('trackingZoomIn').onclick = () => { trackingZoom = Math.min(20, trackingZoom * 1.25); renderTrackingPreview(); };
+element('trackingZoomOut').onclick = () => { trackingZoom = Math.max(0.5, trackingZoom / 1.25); renderTrackingPreview(); };
+element('trackingFitView').onclick = () => { trackingZoom = 1; trackingPan = { x: 0, y: 0 }; renderTrackingPreview(); };
+element('closeTrackingPatch').onclick = () => element('trackingPatchDialog').close();
 element('colorRange').oninput = element('hideRigid').onchange = () => { renderFieldImages(); draw(); };
 element('relativeCoverage').onchange = () => { renderCoverageImage(); draw(); };
 element('dataMode').onchange = () => { renderObservationDiagnostics(); draw(); };
@@ -1211,6 +1725,33 @@ element('enableAccepted').onclick = () => {
 };
 element('height3d').oninput = () => { text('height3dValue', Number(element('height3d').value).toFixed(1)); renderFieldImages(); draw(); };
 element('clearMeasurement').onclick = () => { measurements = []; text('measurement', 'Abstand -'); draw(); };
+for (const button of document.querySelectorAll('[data-workflow]')) button.onclick = () => {
+  workflow = button.dataset.workflow;
+  for (const tab of document.querySelectorAll('[data-workflow]')) tab.setAttribute('aria-selected', String(tab === button));
+  for (const panel of document.querySelectorAll('[data-workflow-panel]')) panel.hidden = panel.dataset.workflowPanel !== workflow;
+  element('timeProfiles').hidden = false;
+  if (workflow === 'tracking') {
+    drawTrackingPath(); updateTrackingControls();
+    if (!trackingPreviewImage.width) void previewTrackingStartFrame();
+  }
+};
+element('trackingStartButton').onclick = () => void runTracking(true).catch(error => {
+  message(error.message, true); trackingRunning = false; updateControls();
+});
+element('trackingPauseButton').onclick = () => { trackingRunning = false; trackingPaused = true; updateControls(); };
+element('trackingResumeButton').onclick = () => void runTracking(false).catch(error => {
+  message(error.message, true); trackingRunning = false; updateControls();
+});
+element('trackingResetButton').onclick = () => { clearTrackingResults(); void previewTrackingStartFrame(); };
+element('trackingExportButton').onclick = () => {
+  const header = 'frame,timestamp_us,x_px,y_px,rotation_deg,raw_x_px,raw_y_px,raw_rotation_deg,patches,rms_px';
+  const rows = trackingPath.filter(entry => entry.pose).map(entry => [entry.frame, entry.timestamp, entry.pose.x, entry.pose.y,
+    entry.pose.rotation * 180 / Math.PI, entry.raw.x, entry.raw.y, entry.raw.rotation * 180 / Math.PI, entry.raw.points, entry.raw.rms].join(','));
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(new Blob([[header, ...rows].join('\n')], { type: 'text/csv' }));
+  link.download = `${(videoInfo?.name || 'tracking').replace(/\.[^.]+$/, '')}-movement.csv`; link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 0);
+};
 for (const button of document.querySelectorAll('[data-view]')) button.onclick = () => {
   if (rectifiedPlayback && button.dataset.view !== 'rectified') rectifiedPlayback = false;
   view = button.dataset.view; displayRevision++;
@@ -1251,8 +1792,14 @@ for (const control of document.querySelectorAll('.settings input, .settings sele
 
 element('exportButton').onclick = () => void task(async () => {
   if (stale && !confirm(`Die aktuellen Eingaben sind noch nicht eingerechnet. Konsistente Feldversion ${calibration.version} mit ihren damaligen Parametern und Beobachtungen speichern?`)) return;
+  const tracking = trackingPath.length ? {
+    format: 'rasterlabor-xyr-tracking', model_version: 1, created_at: new Date().toISOString(),
+    video: videoInfo ? { name: videoInfo.name, width: videoInfo.width, height: videoInfo.height } : null,
+    options: trackingRunOptions, coordinate_system: 'rectified pixels; x right; y down; rotation radians; camera pose relative to first tracked frame',
+    path: trackingPath.map(({ patchPoints, ...entry }) => entry)
+  } : null;
   const bytes = await computer.call('export', { frames: snapshotFrames, video: expectedVideo, parameters: snapshotParameters,
-    opticalConfiguration: element('opticalConfiguration').value });
+    opticalConfiguration: element('opticalConfiguration').value, tracking });
   const url = URL.createObjectURL(new Blob([bytes], { type: 'application/zip' }));
   const anchor = document.createElement('a'); anchor.href = url; anchor.download = `kalibrierung-v${calibration.version}-${calibration.quality}.zip`; anchor.click();
   setTimeout(() => URL.revokeObjectURL(url), 10000);
@@ -1346,6 +1893,7 @@ element('calibrationFile').onchange = () => void task(async () => {
   const imported = await computer.call('import', { bytes }, [bytes.buffer]);
   const videoNameMismatch = videoInfo && imported.video?.name !== videoInfo.name;
   calibration = imported.calibration;
+  clearTrackingResults();
   applyParameters(imported.parameters);
   const invalidMaskPoints = revalidatePatchFrames(imported.observations, patchMask);
   frames = new Map(imported.observations.map(frame => [frame.id, frame]));
@@ -1363,8 +1911,10 @@ element('calibrationFile').onchange = () => void task(async () => {
 element('infoButton').onclick = () => element('infoDialog').showModal();
 element('closeInfo').onclick = () => element('infoDialog').close();
 installPan(rawCanvas); installPan(resultCanvas);
+installTrackingPreviewInteraction();
 new ResizeObserver(draw).observe(element('rawCanvas').parentElement);
 new ResizeObserver(draw).observe(element('resultCanvas').parentElement);
+new ResizeObserver(renderTrackingPreview).observe(element('trackingPreviewCanvas').parentElement);
 window.addEventListener('beforeunload', event => { if (frames.size && !calibration) { event.preventDefault(); event.returnValue = ''; } });
 updatePatternControls();
 updateControls(); updateMetrics(); draw();
