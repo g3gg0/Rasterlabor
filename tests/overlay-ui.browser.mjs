@@ -22,7 +22,7 @@ globalThis.overlaySmoke = {
     trackingPath = trackingPath.filter(e => e.frame >= 970 && e.frame < 982);
     ensureTrackingImageMask(calibration.maps.outputWidth, calibration.maps.outputHeight).data.fill(MASK_SEARCH);
     trackingMaskHasSelection = true;
-    element('trackingUseWebGpu').checked = true;
+    element('globalUseWebGpu').checked = true;
     drawTrackingPath();
     const pose = trackingPath[0].raw ?? trackingPath[0].pose;
     return {x:pose.x,y:pose.y};
@@ -59,7 +59,7 @@ globalThis.overlaySmoke = {
     for(let i=0;i<cpuPixels.data.length;i+=4*701)for(let k=0;k<4;k++)
       rawMaximum=Math.max(rawMaximum,Math.abs(cpuPixels.data[i+k]-gpuPixels.data[i+k]));
     await showFrame(970);
-    element('useWebGpu').checked=true;
+    element('globalUseWebGpu').checked=true;
     await updateRectified();
     const preview=[rectifiedImage.width,rectifiedImage.height];
     element('trackingMode').value='window';

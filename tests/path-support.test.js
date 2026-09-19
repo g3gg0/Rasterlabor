@@ -64,6 +64,14 @@ test('frame edge fade accepts zero and custom widths', () => {
   const alpha = (x, y) => wide[(y * 20 + x) * 4 + 3];
   assert.ok(alpha(2, 10) < 255);
   assert.equal(alpha(5, 10), 255);
+  const landscape = new Uint8ClampedArray(20 * 8 * 4).fill(255);
+  applyEdgeFeather(landscape, 20, 8, 0.5);
+  const landscapeAlpha = (x, y) => landscape[(y * 20 + x) * 4 + 3];
+  assert.equal(landscapeAlpha(10, 3), 255);
+  assert.equal(landscapeAlpha(10, 4), 255);
+  const landscapeMask = edgeFeatherMask(20, 8, () => true, 0.5);
+  assert.equal(landscapeMask[3 * 20 + 10], 255);
+  assert.equal(landscapeMask[4 * 20 + 10], 255);
 });
 
 test('frame edge fade follows internal validity boundaries', () => {

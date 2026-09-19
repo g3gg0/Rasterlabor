@@ -13,10 +13,17 @@ struct Orientation { axes: vec4f, translationSize: vec4f }
 @group(0) @binding(2) var map: texture_2d<f32>;
 @group(0) @binding(3) var<uniform> orientation: Orientation;
 @group(0) @binding(4) var edgeMask: texture_2d<f32>;
+@group(0) @binding(5) var gainMap: texture_2d<f32>;
 fn readSource(p: vec2f) -> vec3f {
   let v = p + vec2f(0.5) - orientation.translationSize.xy;
   let coded = vec2f(dot(orientation.axes.xy, v), dot(orientation.axes.zw, v));
   return textureSampleBaseClampToEdge(source, nearestSampler, coded / orientation.translationSize.zw).rgb;
+}
+fn toLinear(value: vec3f) -> vec3f {
+  return select(value / 12.92, pow((value + 0.055) / 1.055, vec3f(2.4)), value > vec3f(0.04045));
+}
+fn toSrgb(value: vec3f) -> vec3f {
+  return select(value * 12.92, 1.055 * pow(value, vec3f(1.0 / 2.4)) - 0.055, value > vec3f(0.0031308));
 }
 @fragment fn remap(@builtin(position) position: vec4f) -> @location(0) vec4f {
   let p = textureLoad(map, vec2i(position.xy), 0).xy;
@@ -25,12 +32,13 @@ fn readSource(p: vec2f) -> vec3f {
   let rgb = mix(mix(readSource(q), readSource(q + vec2f(1, 0)), f.x),
     mix(readSource(q + vec2f(0, 1)), readSource(q + vec2f(1, 1)), f.x), f.y);
   let edge = textureLoad(edgeMask, vec2i(position.xy), 0).r;
-  return vec4f(rgb * edge, edge);
+  let gain = textureLoad(gainMap, vec2i(position.xy), 0).r;
+  return vec4f(toSrgb(toLinear(rgb) * gain) * edge, edge);
 }`;
 
 // Shared native VideoFrame -> rectified full-resolution GPU surface.
 export class WebGpuRemapper {
-  static async create(maps) {
+  static async create(maps, brightness = null) {
     const adapter = await navigator.gpu?.requestAdapter();
     if (!adapter) throw new Error('Keine WebGPU-GPU verfuegbar.');
     if (Math.max(maps.outputWidth, maps.outputHeight) > adapter.limits.maxTextureDimension2D)
@@ -38,7 +46,7 @@ export class WebGpuRemapper {
     const device = await adapter.requestDevice({ requiredLimits: {
       maxTextureDimension2D: adapter.limits.maxTextureDimension2D, maxBufferSize: adapter.limits.maxBufferSize } });
     const result = new WebGpuRemapper(device);
-    try { await result.initializeRemap(maps); return result; }
+    try { await result.initializeRemap(maps, null, 0, brightness); return result; }
     catch (error) { result.destroy(); throw error; }
   }
   constructor(device) {
@@ -49,7 +57,7 @@ export class WebGpuRemapper {
   resource(value) { this.resources.push(value); return value; }
   buffer(size, usage) { return this.resource(this.device.createBuffer({ size, usage })); }
   check() { if (this.failure) throw new Error(this.failure.message); }
-  async initializeRemap(maps, allowed = null, edgeFeather = 0) {
+  async initializeRemap(maps, allowed = null, edgeFeather = 0, brightness = maps.brightness ?? null) {
     const d = this.device;
     this.width = maps.outputWidth; this.height = maps.outputHeight;
     const remapModule = d.createShaderModule({code: remapShader});
@@ -58,7 +66,8 @@ export class WebGpuRemapper {
       { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'non-filtering' } },
       { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } },
       { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
-      { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } }
+      { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+      { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } }
     ] });
     this.remapPipeline = await d.createRenderPipelineAsync({ layout: d.createPipelineLayout({ bindGroupLayouts: [remapLayout] }),
       vertex: { module: remapModule, entryPoint: 'vertex' }, fragment: { module: remapModule, entryPoint: 'remap', targets: [{ format: 'rgba8unorm' }] } });
@@ -85,6 +94,15 @@ export class WebGpuRemapper {
     for (let row = 0; row < maps.outputHeight; row++) upload.set(
       weights.subarray(row * maps.outputWidth, (row + 1) * maps.outputWidth), row * bytesPerRow);
     d.queue.writeTexture({ texture: this.edgeMask }, upload, { bytesPerRow }, [maps.outputWidth, maps.outputHeight]);
+    this.gainMap = this.resource(d.createTexture({ size: [maps.outputWidth, maps.outputHeight], format: 'r32float',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST }));
+    const gain = brightness?.gain?.length === maps.outputWidth * maps.outputHeight ? brightness.gain :
+      new Float32Array(maps.outputWidth * maps.outputHeight).fill(1);
+    const gainBytesPerRow = Math.ceil(maps.outputWidth * 4 / 256) * 256;
+    const gainUpload = new Float32Array(gainBytesPerRow / 4 * maps.outputHeight);
+    for (let row = 0; row < maps.outputHeight; row++) gainUpload.set(
+      gain.subarray(row * maps.outputWidth, (row + 1) * maps.outputWidth), row * gainBytesPerRow / 4);
+    d.queue.writeTexture({ texture: this.gainMap }, gainUpload, { bytesPerRow: gainBytesPerRow }, [maps.outputWidth, maps.outputHeight]);
     this.rectified = this.resource(d.createTexture({ size: [maps.outputWidth, maps.outputHeight], format: 'rgba8unorm',
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC }));
     this.orientationBuffer = this.buffer(32, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
@@ -101,7 +119,7 @@ export class WebGpuRemapper {
     const bindGroup = d.createBindGroup({ layout: this.remapPipeline.getBindGroupLayout(0), entries: [
       { binding: 0, resource: external }, { binding: 1, resource: this.nearestSampler },
       { binding: 2, resource: this.map.createView() }, { binding: 3, resource: { buffer: this.orientationBuffer } },
-      { binding: 4, resource: this.edgeMask.createView() }
+      { binding: 4, resource: this.edgeMask.createView() }, { binding: 5, resource: this.gainMap.createView() }
     ] });
     const remap = command.beginRenderPass({ colorAttachments: [{ view: this.rectified.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0] }] });
     remap.setPipeline(this.remapPipeline); remap.setBindGroup(0, bindGroup); remap.draw(3); remap.end();

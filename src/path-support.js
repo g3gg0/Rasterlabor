@@ -14,7 +14,7 @@ export function frameGeometry(entry, field, maps) {
     const dx = point.x - pose.x, dy = point.y - pose.y;
     return { x: c * dx + s * dy - offsetX, y: -s * dx + c * dy - offsetY };
   };
-  return { entry, width, height, c, s, world, local,
+  return { entry, width, height, c, s, world, local, valid: maps.valid,
     corners: [[0, 0], [width, 0], [width, height], [0, height]].map(([x, y]) => world(x, y)),
     supports(point, pixelAllowed = null) {
       const { x, y } = local(point);
@@ -77,13 +77,14 @@ export function sharpestFramesFirst(geometries) {
   });
 }
 
-export function approximateTopFrames(geometries, maxFrames, pixelAllowed = null, anchor = null, cellSize = null) {
+export function approximateTopFrames(geometries, maxFrames, pixelAllowed = null, anchor = null, cellSize = null, sampleBounds = null) {
   if (!geometries.length || maxFrames < 1) return [];
   const corners = geometries.flatMap(geometry => geometry.corners);
-  const minX = Math.floor(Math.min(...corners.map(point => point.x)));
-  const minY = Math.floor(Math.min(...corners.map(point => point.y)));
-  const maxX = Math.ceil(Math.max(...corners.map(point => point.x)));
-  const maxY = Math.ceil(Math.max(...corners.map(point => point.y)));
+  const minX = Math.floor(Math.max(Math.min(...corners.map(point => point.x)), sampleBounds?.minX ?? -Infinity));
+  const minY = Math.floor(Math.max(Math.min(...corners.map(point => point.y)), sampleBounds?.minY ?? -Infinity));
+  const maxX = Math.ceil(Math.min(Math.max(...corners.map(point => point.x)), sampleBounds?.maxX ?? Infinity));
+  const maxY = Math.ceil(Math.min(Math.max(...corners.map(point => point.y)), sampleBounds?.maxY ?? Infinity));
+  if (maxX <= minX || maxY <= minY) return [];
   const width = Math.max(1, maxX - minX), height = Math.max(1, maxY - minY);
   cellSize ??= Math.max(64, Math.ceil(geometries[0].width * 0.1));
   const columns = Math.ceil(width / cellSize), rows = Math.ceil(height / cellSize);
@@ -98,7 +99,10 @@ export function approximateTopFrames(geometries, maxFrames, pixelAllowed = null,
     const covered = [];
     let needed = Boolean(anchor && anchorCount < maxFrames && geometry.supports(anchor, pixelAllowed));
     for (let row = top; row <= bottom; row++) for (let col = left; col <= right; col++) {
-      const point = { x: minX + (col + 0.5) * cellSize, y: minY + (row + 0.5) * cellSize };
+      const point = sampleBounds ?
+        { x: (minX + col * cellSize + Math.min(maxX, minX + (col + 1) * cellSize)) / 2,
+          y: (minY + row * cellSize + Math.min(maxY, minY + (row + 1) * cellSize)) / 2 } :
+        { x: minX + (col + 0.5) * cellSize, y: minY + (row + 0.5) * cellSize };
       if (!geometry.supports(point, pixelAllowed)) continue;
       const index = row * columns + col;
       covered.push(index);
@@ -112,8 +116,12 @@ export function approximateTopFrames(geometries, maxFrames, pixelAllowed = null,
   return selected;
 }
 
+function edgeFeatherPixels(width, height, fraction) {
+  return Math.min(width * Math.max(0, fraction), Math.max(0, (Math.min(width, height) - 1) / 2));
+}
+
 export function edgeFeatherWeight(x, y, width, height, fraction = 0.1) {
-  const feather = width * fraction;
+  const feather = edgeFeatherPixels(width, height, fraction);
   if (!(feather > 0)) return 1;
   const distance = Math.min(x + 0.5, width - x - 0.5, y + 0.5, height - y - 0.5);
   const t = Math.max(0, Math.min(1, distance / feather));
@@ -141,7 +149,7 @@ export function edgeFeatherMask(width, height, allowed = () => true, fraction = 
     if (x + 1 < width && y + 1 < height) distance[index] = Math.min(distance[index], distance[index + width + 1] + 4);
     if (x && y + 1 < height) distance[index] = Math.min(distance[index], distance[index + width - 1] + 4);
   }
-  const feather = width * Math.max(0, fraction); const weights = new Uint8Array(distance.length);
+  const feather = edgeFeatherPixels(width, height, fraction); const weights = new Uint8Array(distance.length);
   for (let index = 0; index < weights.length; index++) {
     if (!distance[index]) continue;
     if (!feather) { weights[index] = 255; continue; }

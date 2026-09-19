@@ -15,6 +15,53 @@ test('queued requests never post to a decoder replaced during a video change', a
   await reader.dispose();
 });
 
+test('queued requests reject a brightness field replaced before decoding starts', async () => {
+  let brightness = { gain: new Float32Array([1]) }, calls = 0;
+  const decoder = { async call() { calls++; return { index: 0 }; } };
+  const reader = new FrameReader({ getDecoder: () => decoder, getMaps: () => null, getBrightness: () => brightness });
+  const pending = reader.read(0);
+  brightness = { gain: new Float32Array([1.1]) };
+  await assert.rejects(pending, /Helligkeitsfeld.*gewechselt/);
+  assert.equal(calls, 0);
+  await reader.dispose();
+});
+
+test('CPU calibration samples are rectified without applying the existing brightness field', async () => {
+  const maps = { outputWidth: 1, outputHeight: 1 };
+  const brightness = { gain: new Float32Array([2]) };
+  const source = { width: 2, height: 1, data: new Uint8ClampedArray([10, 20, 30, 255, 40, 50, 60, 255]) };
+  const flags = [];
+  const decoder = { async call() { return { bitmap: { close() {} } }; } };
+  const computer = { async call(type, options) {
+    assert.equal(type, 'remap');
+    assert.equal(options.image, source);
+    flags.push(options.brightness);
+    return { width: 1, height: 1, data: new Uint8ClampedArray([40, 50, 60, 255]) };
+  } };
+  const reader = new FrameReader({ getDecoder: () => decoder, getMaps: () => maps, getBrightness: () => brightness, computer });
+  reader.toRgba = () => source;
+  const sample = await reader.read(0, { gpu: false, rectified: true, output: 'rgba', brightness: false });
+  assert.equal(sample.width, maps.outputWidth);
+  await reader.read(1, { gpu: false, rectified: true, output: 'rgba' });
+  assert.deepEqual(flags, [false, true]);
+  await reader.dispose();
+});
+
+test('GPU calibration samples disable gain while normal rectified reads use the active field', async context => {
+  const maps = {}, brightness = { gain: new Float32Array([2]) }, fields = [];
+  const decoder = { async call() { return { frame: { close() {} }, orientation: {} }; } };
+  context.mock.method(WebGpuRemapper, 'create', async (receivedMaps, field) => {
+    assert.equal(receivedMaps, maps);
+    fields.push(field);
+    return { async render() { return { width: 1, height: 1, data: new Uint8ClampedArray(4) }; }, destroy() {} };
+  });
+  const reader = new FrameReader({ getDecoder: () => decoder, getMaps: () => maps, getBrightness: () => brightness });
+  await reader.read(0, { gpu: true, rectified: true, output: 'rgba', brightness: false });
+  await reader.read(1, { gpu: true, rectified: true, output: 'rgba' });
+  assert.deepEqual(fields, [null, brightness]);
+  await reader.dispose();
+});
+
 test('frame readers serialize decoder access and recover after a rejected read', async () => {
   let active=0, maximum=0;
   const decoder={async call(type,{index}) {

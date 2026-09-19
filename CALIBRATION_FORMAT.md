@@ -1,7 +1,8 @@
 # Kalibrierpaket Version 1
 
 ZIP mit `metadata.json` (UTF-8) und rohen Binaerarrays. Optional enthaelt es
-`tracking.json` mit einem zum Video gehoerenden XYR-Pfad. Keine Videodaten im
+`tracking.json` mit einem zum Video gehoerenden XYR-Pfad sowie ein aktives
+Helligkeitsfeld. Keine Videodaten im
 Standardexport. Kennung `format = "microscope-grid-calibration"`,
 `model_version = 1`. Alle Binaerzahlen sind **little-endian**, ohne Header oder
 Padding. Speicherordnung C/row-major: `[row, col, component]`; x laeuft am
@@ -107,6 +108,10 @@ Kontrollwerte auf ein anderes Gitter uebertragen.
   Roh-/stabilisierten Kameraposen. X/Y sind entzerrte Pixel relativ zum ersten
   Tracking-Frame, Rotation ist in Radiant angegeben. Patch-Bilddaten werden
   nicht eingebettet.
+- `brightness`: optionaler Metadatenblock fuer das aktive Helligkeitsfeld.
+  `brightness-gain.bin` enthaelt `output_width * output_height` positive
+  Float32-Gainwerte, `brightness-supported.bin` die gleich grosse Byte-Maske
+  mit den Werten 0 oder 255. Beide Arrays liegen in entzerrten Zielkoordinaten.
 
 Der Speichern-Button fuegt `tracking.json` nur bei einem nichtleeren Pfad hinzu.
 Import stellt den Pfad zur Anzeige und zum erneuten Export wieder her, auch ohne
@@ -120,10 +125,14 @@ die Roh- und geglaetteten Winkel von Grad nach Radiant konvertiert und Posen
 in die regulaere Struktur ueberfuehrt. Fehlende Fensterpositionen werden nicht
 erfunden; der XYR-Pfad bleibt auch ohne gueltiges Trackingrechteck verwendbar.
 
-Die Statuspunkte rechts neben Speichern zeigen vorhandene Linsen- und XYR-Daten
+Ein vorhandenes Helligkeitsfeld wird beim Speichern automatisch eingebettet und
+beim Import sofort wieder aktiviert. Pakete ohne Helligkeitsblock bleiben
+kompatibel und deaktivieren ein zuvor aktives Feld.
+
+Die Statuspunkte rechts neben Speichern zeigen vorhandene Linsen-, XYR- und
+Helligkeitsdaten
 gruen an. Grau bedeutet nicht vorhanden, nicht etwa ungueltig. Die Anzeige ist
-kein Qualitaetsurteil. Helligkeitskorrektur ist als spaetere Komponente vorgesehen;
-dieser Status bleibt vorerst aus. Globale Vorschau-Regler sind keine gespeicherte
+kein Qualitaetsurteil. Globale Vorschau-Regler sind keine gespeicherte
 Helligkeitskorrektur.
 
 Geometrisch veraltete UI-Einstellungen ersetzen beim Export nicht stillschweigend

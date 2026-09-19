@@ -22,6 +22,48 @@ function compare(a, b) {
   }
   return { maximum, mean: sum / (count || 1), alphaDifferences, comparedChannels: count };
 }
+function premultipliedDifference(a, b) {
+  let maximum = 0;
+  for (let i = 0; i < a.length; i += 4) for (let channel = 0; channel < 3; channel++) {
+    maximum = Math.max(maximum, Math.abs(a[i + channel] * a[i + 3] - b[i + channel] * b[i + 3]) / 255);
+  }
+  return maximum;
+}
+
+export async function runMergeOverlayChecks() {
+  const width = 4, height = 3;
+  const maps = { outputWidth: width, outputHeight: height,
+    inverseX: Float32Array.from({ length: width * height }, (_, index) => index % width),
+    inverseY: Float32Array.from({ length: width * height }, (_, index) => Math.floor(index / width)),
+    valid: new Uint8Array(width * height).fill(1) };
+  const orientation = orientationFromMatrix([65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824], width, height);
+  const geometries = [0, 1, 2].map(frame => ({ c: 1, s: 0, entry: { frame, sharpness: { score: frame * 10 } },
+    world: (x, y) => ({ x, y }), corners: [{ x: 0, y: 0 }, { x: width, y: 0 }, { x: width, y: height }, { x: 0, y: height }] }));
+  const frames = geometries.map(geometry => {
+    const canvas = new OffscreenCanvas(width, height), context = canvas.getContext('2d');
+    context.fillStyle = `rgb(${60 + geometry.entry.frame * 70}, 40, 90)`; context.fillRect(0, 0, width, height);
+    return new VideoFrame(canvas, { timestamp: geometry.entry.frame });
+  });
+  const results = [];
+  try {
+    for (const [blend, expectedRed] of [['average', 165], ['sharp-over', 200]]) {
+      const merged = await renderTiledOverlay({ maps, width, height, minX: 0, minY: 0,
+        geometries, tileSize: 2, maxFrames: 2, edgeFeather: 0, frameOrder: 'blurriest', blend,
+        decode: async index => ({ frame: frames[index].clone(), orientation }) });
+      try {
+        const canvas = new OffscreenCanvas(width, height), context = canvas.getContext('2d');
+        for (const tile of merged.tiles) context.drawImage(tile.bitmap, 0, 0, tile.width, tile.height,
+          tile.x, tile.y, tile.width, tile.height);
+        const actual = context.getImageData(0, 0, width, height).data;
+        assert(Math.abs(actual[0] - expectedRed) <= 1 && actual[3] === 255,
+          `Merge ${blend} expected red ${expectedRed}, received ${actual[0]}`);
+        assert(merged.framePasses === 12, `Merge ${blend} did not execute one pass per tile candidate`);
+        results.push({ blend, red: actual[0], framePasses: merged.framePasses });
+      } finally { closeOverlayTiles(merged); }
+    }
+    return results;
+  } finally { for (const frame of frames) frame.close(); }
+}
 
 export async function runTopNOverlayChecks() {
   const maps = { outputWidth: 4, outputHeight: 3, inverseX: Float32Array.from({ length: 12 }, (_, index) => index % 4),
@@ -66,6 +108,24 @@ export async function runTopNOverlayChecks() {
         results.push({ maxFrames, ...diff });
       } finally { closeOverlayTiles(tiled); }
     }
+    const mergeMaps = { ...maps, valid: new Uint8Array(12).fill(1) };
+    const mergeGeometries = geometries.map(geometry => ({ ...geometry, world: identity.world,
+      corners: [{ x: 0, y: 0 }, { x: 4, y: 0 }, { x: 4, y: 3 }, { x: 0, y: 3 }] }));
+    for (const [blend, expectedRed] of [['average', 165], ['sharp-over', 200]]) {
+      const merged = await renderTiledOverlay({ maps: mergeMaps, width: 4, height: 3, minX: 0, minY: 0,
+        geometries: mergeGeometries, tileSize: 2, maxFrames: 2, edgeFeather: 0, frameOrder: 'blurriest', blend,
+        decode: async index => ({ frame: frames[index].clone(), orientation }) });
+      try {
+        const canvas = new OffscreenCanvas(4, 3), context = canvas.getContext('2d');
+        for (const tile of merged.tiles) context.drawImage(tile.bitmap, 0, 0, tile.width, tile.height,
+          tile.x, tile.y, tile.width, tile.height);
+        const actual = context.getImageData(0, 0, 4, 3).data;
+        assert(Math.abs(actual[0] - expectedRed) <= 1 && actual[3] === 255,
+          `Merge ${blend} expected red ${expectedRed}, received ${actual[0]}`);
+        assert(merged.framePasses === 12, `Merge ${blend} did not execute one pass per tile candidate`);
+        results.push({ merge: blend, red: actual[0], framePasses: merged.framePasses });
+      } finally { closeOverlayTiles(merged); }
+    }
     const width = 20, height = 20;
     const featherMaps = { outputWidth: width, outputHeight: height,
       inverseX: Float32Array.from({ length: width * height }, (_, index) => index % width),
@@ -82,7 +142,7 @@ export async function runTopNOverlayChecks() {
       edgeFeatherMask(width, height, (x, y) => Boolean(featherMaps.valid[y * width + x]), featherFraction));
     const expectedSum = new Float32Array(feathered.length);
     accumulateFrame(expectedSum, feathered);
-    const featherExpected = averagedFrames(expectedSum);
+    const featherExpected = averagedFrames(expectedSum, true);
     const featherOrientation = orientationFromMatrix([65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824], width, height);
     const overlay = await WebGpuOverlay.create(featherMaps, width, height, 0, 0, null, 0, featherFraction);
     try {
@@ -90,9 +150,26 @@ export async function runTopNOverlayChecks() {
       const actual = await pixels(overlay);
       const diff = compare(actual, featherExpected);
       const maximumAlpha = Math.max(...actual.filter((_, index) => index % 4 === 3).map((value, index) => Math.abs(value - featherExpected[index * 4 + 3])));
-      assert(diff.maximum <= 3 && maximumAlpha <= 1, `Edge feather GPU parity: ${JSON.stringify({ diff, maximumAlpha })}`);
-      results.push({ edgeFeather: true, maximumAlpha, ...diff });
+      const maximumPremultiplied = premultipliedDifference(actual, featherExpected);
+      assert(maximumPremultiplied <= 2 && maximumAlpha <= 1,
+        `Edge feather GPU parity: ${JSON.stringify({ diff, maximumAlpha, maximumPremultiplied })}`);
+      results.push({ edgeFeather: true, maximumAlpha, maximumPremultiplied, ...diff });
     } finally { overlay.destroy(); frame.close(); }
+    const coverageCanvas = new OffscreenCanvas(width, height), coverageContext = coverageCanvas.getContext('2d');
+    coverageContext.fillStyle = 'rgb(220, 20, 20)'; coverageContext.fillRect(0, 0, width, height);
+    const edgeFrame = new VideoFrame(coverageCanvas, { timestamp: 0 });
+    coverageContext.fillStyle = 'rgb(20, 20, 220)'; coverageContext.fillRect(0, 0, width, height);
+    const opaqueFrame = new VideoFrame(coverageCanvas, { timestamp: 1 });
+    const coverageMaps = { ...featherMaps, valid: new Uint8Array(width * height).fill(1) };
+    const coverageOverlay = await WebGpuOverlay.create(coverageMaps, width, height, 0, 0, null, 3, 0.5);
+    const shifted = offset => ({ c: 1, s: 0, world: (x, y) => ({ x: x + offset, y }) });
+    try {
+      for (const offset of [9, 8, 7]) await coverageOverlay.addFrame(edgeFrame, featherOrientation, shifted(offset), 4);
+      await coverageOverlay.addFrame(opaqueFrame, featherOrientation, shifted(0), 4);
+      const actual = await pixels(coverageOverlay), index = (10 * width + 10) * 4;
+      assert(actual[index + 2] > actual[index], `Weak feather edges blocked opaque frame: ${actual.slice(index, index + 4)}`);
+      results.push({ featherCoverage: true, red: actual[index], blue: actual[index + 2] });
+    } finally { coverageOverlay.destroy(); edgeFrame.close(); opaqueFrame.close(); }
     return results;
   } finally { for (const frame of frames) frame.close(); }
 }

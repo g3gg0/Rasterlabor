@@ -17,7 +17,7 @@ function bytesFor(array) {
   return bytes;
 }
 
-export function exportCalibration(calibration, observations, video, parameters, opticalConfiguration, tracking = null) {
+export function exportCalibration(calibration, observations, video, parameters, opticalConfiguration, tracking = null, brightness = null) {
   tracking = validateTracking(tracking);
   if (!calibration?.maps) throw new Error('Keine konsistente Kalibrierung zum Speichern vorhanden.');
   const { field, maps } = calibration;
@@ -48,6 +48,21 @@ export function exportCalibration(calibration, observations, video, parameters, 
     files['patch-mask.bin'] = [patchMask.data.slice(), { level: 1 }];
     metadata.patch_mask = { file: 'patch-mask.bin', width: patchMask.width, height: patchMask.height,
       cell_size: patchMask.cellSize, source_width: patchMask.sourceWidth, source_height: patchMask.sourceHeight };
+  }
+  if (brightness) {
+    const pixels = maps.outputWidth * maps.outputHeight;
+    if (!(brightness.gain instanceof Float32Array) || !(brightness.supported instanceof Uint8Array) ||
+      brightness.width !== maps.outputWidth || brightness.height !== maps.outputHeight ||
+      brightness.gain.length !== pixels || brightness.supported.length !== pixels ||
+      brightness.gain.some(value => !Number.isFinite(value) || value <= 0) ||
+      brightness.supported.some(value => value !== 0 && value !== 255)) throw new Error('Ungueltiges Helligkeitsfeld fuer das Kalibrierpaket.');
+    metadata.brightness = { version: brightness.version, width: brightness.width, height: brightness.height,
+      gain: { file: 'brightness-gain.bin', dtype: 'float32', length: pixels },
+      supported: { file: 'brightness-supported.bin', dtype: 'uint8', length: pixels },
+      model: brightness.model, metrics: brightness.metrics, normalization: 'geometric-mean-1',
+      color_space: 'srgb-decoded-linear-light' };
+    files['brightness-gain.bin'] = [bytesFor(brightness.gain), { level: 0 }];
+    files['brightness-supported.bin'] = [brightness.supported.slice(), { level: 1 }];
   }
   for (const [name, array] of Object.entries(arrays)) {
     const filename = `${name}.bin`;
@@ -137,6 +152,26 @@ export function importCalibration(bytes) {
     patchMask = { width: description.width, height: description.height, cellSize: description.cell_size,
       sourceWidth: description.source_width, sourceHeight: description.source_height, data: raw.slice(), revision: 0 };
   }
+  let brightness = null;
+  if (metadata.brightness) {
+    const description = metadata.brightness, pixels = metadata.output_width * metadata.output_height;
+    const gainBytes = files[description.gain?.file], supported = files[description.supported?.file];
+    if (!Number.isSafeInteger(description.version) || description.version < 1 ||
+      description.width !== metadata.output_width || description.height !== metadata.output_height ||
+      description.gain?.dtype !== 'float32' || description.gain.length !== pixels || gainBytes?.length !== pixels * 4 ||
+      description.supported?.dtype !== 'uint8' || description.supported.length !== pixels || supported?.length !== pixels ||
+      description.normalization !== 'geometric-mean-1' || description.color_space !== 'srgb-decoded-linear-light') {
+      throw new Error('Ungueltiges Helligkeitsfeld im Kalibrierpaket.');
+    }
+    const gainCopy = gainBytes.slice();
+    if (!littleEndian) for (let offset = 0; offset < gainCopy.length; offset += 4) gainCopy.subarray(offset, offset + 4).reverse();
+    const gain = new Float32Array(gainCopy.buffer);
+    if (gain.some(value => !Number.isFinite(value) || value <= 0) || supported.some(value => value !== 0 && value !== 255)) {
+      throw new Error('Ungueltige Helligkeitswerte im Kalibrierpaket.');
+    }
+    brightness = { version: description.version, width: description.width, height: description.height,
+      gain, supported: supported.slice(), model: description.model, metrics: description.metrics };
+  }
   const calibration = { field: { width: metadata.source_width, height: metadata.source_height, spacing,
     nx: metadata.spline.nx, ny: metadata.spline.ny, coefficients: arrays.coefficients },
     step: metadata.pixels_per_grid_step, referenceId: metadata.reference_frame_id, version: metadata.version,
@@ -151,5 +186,5 @@ export function importCalibration(bytes) {
   calibration.parameters = parameters;
   const tracking = files['tracking.json'] ? validateTracking(JSON.parse(strFromU8(files['tracking.json'])), metadata.video) : null;
   return { calibration, observations, video: metadata.video, parameters,
-    opticalConfiguration: metadata.optical_configuration, tracking, metadata };
+    opticalConfiguration: metadata.optical_configuration, tracking, brightness, metadata };
 }

@@ -13,6 +13,7 @@
 		<div class="identity"><span class="brand-mark"><i data-lucide="scan-line"></i></span><div><h1>Rasterlabor</h1><span>Mikroskopkalibrierung</span></div></div>
 		<div class="header-actions"><span class="local-state"><i data-lucide="hard-drive"></i> Lokal</span>
 			<details class="image-adjustments"><summary title="Globale Bildoptionen" aria-label="Globale Bildoptionen"><i data-lucide="sliders-horizontal"></i></summary><div class="adjustment-panel" role="group" aria-label="Globale Bildoptionen">
+				<label class="check" title="Verwendet WebGPU in allen unterstuetzten Arbeitsschritten; bei Problemen wird automatisch die CPU verwendet."><input id="globalUseWebGpu" type="checkbox" checked> WebGPU-Beschleunigung</label>
 				<label>Helligkeit <input id="previewBrightness" type="range" min="-100" max="100" step="1" value="0"><span id="previewBrightnessValue">0</span></label>
 				<label>Kontrast <input id="previewContrast" type="range" min="0" max="300" step="1" value="100"><span id="previewContrastValue">100%</span></label>
 				<label>Gamma <input id="previewGamma" type="range" min="0.1" max="3" step="0.05" value="1"><span id="previewGammaValue">1.00</span></label>
@@ -37,11 +38,13 @@
 		</div>
 		<input id="videoFile" type="file" accept="video/mp4,.mp4,.m4v,.mov" hidden>
 		<input id="calibrationFile" type="file" accept=".zip" hidden>
+		<input id="brightnessFile" type="file" accept=".rbright" hidden>
 	</header>
 	<nav class="workflow-tabs" role="tablist" aria-label="Arbeitsbereich">
 		<button role="tab" aria-selected="true" data-workflow="calibration"><i data-lucide="scan-line"></i> Linsenkalibrierung</button>
 		<button role="tab" aria-selected="false" data-workflow="tracking"><i data-lucide="route"></i> Tracking</button>
-		<button role="tab" aria-selected="false" disabled title="Folgt in einem spaeteren Schritt"><i data-lucide="sun-medium"></i> Helligkeitskorrektur</button>
+		<button id="brightnessWorkflow" role="tab" aria-selected="false" data-workflow="brightness"><i data-lucide="sun-medium"></i> Helligkeitskorrektur</button>
+		<button id="mergeWorkflow" role="tab" aria-selected="false" data-workflow="merge"><i data-lucide="layers-3"></i> Merge</button>
 	</nav>
 	<div id="message" role="status" hidden></div>
 	<div class="processing-bar" role="region" aria-label="Verarbeitungsfortschritt"><span id="processingStatus">Bereit</span><progress id="progress" value="0" max="1" aria-label="Fortschritt des aktuellen Rechenschritts"></progress><span id="pendingStatus">Keine ausstehenden Frames</span></div>
@@ -80,7 +83,6 @@
 					<div class="form-grid"><label>Messunsicherheit, px<input id="sigma" type="number" min="0.01" step="0.1" value="1"></label><label>Huber-Delta<input id="delta" type="number" min="0.1" step="0.1" value="1.5"></label></div>
 					<div class="form-grid"><label>Min. sing. Wert<input id="tau" type="number" min="0.001" step="0.01" value="0.12"></label><label>Abnahme P95, px<input id="acceptance" type="number" min="0.01" step="0.1" value="1"></label></div>
 					<div class="form-grid"><label>Fit-Iterationen<input id="iterations" type="number" min="5" max="300" value="35"></label><label>Update alle Frames<input id="updateEvery" type="number" min="2" max="100" value="4"></label></div>
-					<label class="check" title="Beschleunigt Patch-Tracking und linearen Fit mit Float32-Compute; bei Problemen wird automatisch die CPU verwendet."><input id="useWebGpu" type="checkbox"> WebGPU-Beschleunigung</label>
 				</details>
 				<div class="action-row"><button id="refitButton" disabled><i data-lucide="refresh-cw"></i> Neu fitten</button><button id="resetButton" title="Kalibrierung zur&uuml;cksetzen" aria-label="Kalibrierung zur&uuml;cksetzen"><i data-lucide="trash-2"></i></button></div>
 				<label class="check"><input id="follow" type="checkbox" checked> Verarbeitetem Frame folgen</label>
@@ -125,7 +127,6 @@
 				<label>Stabilisierungsfenster, Frames<input id="trackingWindow" type="number" min="1" max="240" step="1" value="1"></label>
 				<div class="form-grid"><label>Patchgr&ouml;&szlig;e, px<input id="trackingPatchSize" type="number" min="16" max="256" step="16" value="64"></label><label>Suchradius, px<input id="trackingSearchRadius" type="number" min="4" max="128" step="1" value="32"></label></div>
 				<label>Mindestkontrast<input id="trackingThreshold" type="number" min="1" max="200" step="1" value="16"></label>
-				<label class="check"><input id="trackingUseWebGpu" type="checkbox" checked> WebGPU-Beschleunigung</label>
 				<button id="trackingStartButton" class="primary wide" disabled><i data-lucide="play"></i> Tracking starten</button>
 				<div class="action-row"><button id="trackingPauseButton" disabled><i data-lucide="pause"></i> Pause</button><button id="trackingResumeButton" disabled><i data-lucide="play"></i> Fortsetzen</button></div>
 				<div class="action-row"><button id="trackingResetButton"><i data-lucide="rotate-ccw"></i> Zur&uuml;cksetzen</button><button id="trackingExportButton" disabled><i data-lucide="download"></i> CSV</button></div>
@@ -149,6 +150,40 @@
 				<p class="path-info">Mausrad: Zoom am Mauszeiger &middot; Ziehen: Verschieben &middot; Einzelbild ausw&auml;hlen und &bdquo;Pr&uuml;fen&ldquo; &ouml;ffnet dessen Referenzmatches &middot; Die Ansicht verwendet die gemessenen Posen ohne erneute Bildregistrierung.</p>
             </section>
 			<section class="observations tracking-observations"><div class="section-heading"><h2>Posen</h2><span id="trackingSummary">0 Frames</span></div><div class="table-scroll"><table><thead><tr><th>Frame / PTS</th><th>X, px</th><th>Y, px</th><th>Rotation</th><th>Patches / RMS</th><th>Sch&auml;rfe</th><th title="Wie viele andere Frames diesen Frame als Umfeldreferenz angefordert haben, inklusive verworfener Matches">Als Referenz</th><th title="Anzahl selbst angeforderter Umfeldreferenzen, inklusive verworfener Matches; ohne den inkrementellen Fenstermatch">Eigene Referenzen</th></tr></thead><tbody id="trackingTable"><tr><td colspan="8" class="muted">Noch keine Posen</td></tr></tbody></table></div></section>
+		</main>
+	</div>
+	<div class="workspace" data-workflow-panel="brightness" hidden>
+		<aside class="settings">
+			<section><div class="section-heading"><h2>Helligkeitsfeld</h2><span id="brightnessState" class="tag">Kein Feld</span></div>
+				<label>Von Frame<input id="brightnessFrom" type="number" min="0" step="1" value="0"></label>
+				<label>Bis Frame<input id="brightnessTo" type="number" min="0" step="1" placeholder="Letzter Checkerboard-Frame"></label>
+				<label>Ziel-Frames<input id="brightnessPasses" type="number" min="16" max="128" step="8" value="64" title="Gleichmaessig verteilte Auswahl akzeptierter Checkerboard-Frames"></label>
+				<label>Max. Verst&auml;rkung<input id="brightnessMaxGain" type="number" min="1.05" max="3" step="0.05" value="1.6"></label>
+				<button id="brightnessFit" class="primary wide" disabled><i data-lucide="play"></i> Starten</button>
+				<div class="action-row"><button id="brightnessPause" disabled><i data-lucide="pause"></i> Pause</button><button id="brightnessResume" disabled><i data-lucide="play"></i> Fortsetzen</button></div>
+				<button id="brightnessReset" class="wide" disabled><i data-lucide="rotate-ccw"></i> Zur&uuml;cksetzen</button>
+				<div class="action-row"><button id="brightnessSave" disabled title="Helligkeitsfeld speichern" aria-label="Helligkeitsfeld speichern"><i data-lucide="download"></i></button><button id="brightnessLoad" title="Helligkeitsfeld laden" aria-label="Helligkeitsfeld laden"><i data-lucide="upload"></i></button><button id="brightnessDisable" disabled><i data-lucide="power"></i> Deaktivieren</button></div>
+				<div id="brightnessStatus" class="status-line" aria-live="polite">Tracking mit mehreren &Uuml;berlappungen erforderlich.</div>
+			</section>
+		</aside>
+		<main><div class="video-strip"><div><strong>Relative Helligkeitsverteilung</strong><span>Nach geometrischer Entzerrung</span></div><span id="brightnessMetrics">Keine Messung</span></div>
+			<section class="image-pane"><div class="pane-heading"><h2>Durchl&auml;ssigkeit V(x)</h2><span id="brightnessLegend">Schwarz: -40% | Grau: 0% | Wei&szlig;: +40%</span></div><div class="canvas-host"><canvas id="brightnessCanvas" aria-label="Relative Helligkeitsverteilung in Graustufen innerhalb der Bilddatenmaske"></canvas><div id="brightnessEmpty" class="empty-state"><i data-lucide="sun-medium"></i><span>Kein Helligkeitsfeld berechnet</span></div></div></section>
+		</main>
+	</div>
+	<div class="workspace" data-workflow-panel="merge" hidden>
+		<aside class="settings">
+			<section><div class="section-heading"><h2>Gro&szlig;bild</h2><span id="mergeState" class="tag">Bereit</span></div>
+				<label>Mischverfahren<select id="mergeBlend"><option value="sharp-over">Scharfe Frames dar&uuml;ber</option><option value="average">Top-Frames mitteln</option></select></label>
+				<label>Scharfe Frames je Pixel<input id="mergeMaxFrames" type="number" min="1" max="64" step="1" value="3"></label>
+				<label>Rand&uuml;berblendung, %<input id="mergeEdgeFeather" type="number" min="0" max="50" step="1" value="10"></label>
+				<button id="mergeStart" class="primary wide" disabled><i data-lucide="download"></i> BigTIFF erstellen</button>
+				<button id="mergeCancel" class="wide" disabled><i data-lucide="square"></i> Abbrechen</button>
+				<div id="mergeStatus" class="status-line" aria-live="polite">Tracking und zugeh&ouml;riges Video erforderlich.</div>
+			</section>
+		</aside>
+		<main>
+			<div class="video-strip"><div><strong>PCB-Gro&szlig;bild</strong><span>Entzerrt, maskiert und helligkeitskorrigiert</span></div><span id="mergeMetrics">Keine Ausgabe geplant</span></div>
+			<section class="image-pane"><div class="pane-heading"><h2>Kachelvorschau</h2><div class="overlay-controls"><span id="mergePreviewState">Noch nicht erstellt</span><button id="mergeZoomOut" title="Verkleinern" aria-label="Verkleinern"><i data-lucide="zoom-out"></i></button><span id="mergeZoomValue">100%</span><button id="mergeZoomIn" title="Vergr&ouml;&szlig;ern" aria-label="Vergr&ouml;&szlig;ern"><i data-lucide="zoom-in"></i></button><button id="mergeFitView" title="Ansicht einpassen" aria-label="Ansicht einpassen"><i data-lucide="maximize"></i></button></div></div><div class="canvas-host"><canvas id="mergeCanvas" aria-label="Vorschau des zusammengef&uuml;gten Gro&szlig;bildes"></canvas><div id="mergeEmpty" class="empty-state"><i data-lucide="layers-3"></i><span>Noch kein Merge erstellt</span></div></div></section>
 		</main>
 	</div>
 	<footer id="memoryStats" class="memory-footer" aria-live="polite">RAM-Statistik wird ermittelt.</footer>

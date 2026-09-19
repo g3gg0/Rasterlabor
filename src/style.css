@@ -148,9 +148,13 @@ main { padding: 20px 24px 28px; min-width: 0; }
 .canvas-host { position: relative; width: 100%; height: min(49vh, 520px); min-height: 270px; background-color: #e2e7e4; background-image: linear-gradient(45deg, #dce2de 25%, transparent 25%), linear-gradient(-45deg, #dce2de 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #dce2de 75%), linear-gradient(-45deg, transparent 75%, #dce2de 75%); background-size: 16px 16px; background-position: 0 0, 0 8px, 8px -8px, -8px 0; border: 1px solid #ccd6d0; overflow: hidden; }
 canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
 canvas[hidden] { display: none; }
+#brightnessCanvas { object-fit: contain; }
 .path-info { font-size: 11px; overflow-wrap: anywhere; max-height: 100px; overflow: auto; }
 #trackingOverlayCanvas { cursor: grab; }
 #trackingOverlayCanvas:active { cursor: grabbing; }
+#mergeCanvas { cursor: grab; }
+#mergeCanvas:active { cursor: grabbing; }
+#mergeZoomValue { min-width: 42px; text-align: center; font-variant-numeric: tabular-nums; }
 .tracking-mask-block { grid-column: 1 / -1; margin: 4px 0; padding-top: 10px; border-top: 1px solid var(--line); }
 .tracking-mask-block h3 { margin: 0; font-size: 12px; }
 .tracking-mask-block .section-heading button { width: auto; min-height: 25px; padding: 3px 7px; font-size: 9px; }

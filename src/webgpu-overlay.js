@@ -14,7 +14,10 @@ struct Params { sizeOffset: vec4u, rotationOrigin: vec4f, worldOrigin: vec4f }
 fn accumulate(@builtin(global_invocation_id) id: vec3u) {
   if (id.x >= params.sizeOffset.x || id.y >= params.sizeOffset.y) { return; }
   let index = id.y * params.sizeOffset.x + id.x;
-  if (params.sizeOffset.w > 0u && sum[index].a >= f32(params.sizeOffset.w)) { return; }
+  let operation = u32(params.worldOrigin.z);
+  if (operation == 0u && params.sizeOffset.w > 0u && sum[index].a >= f32(params.sizeOffset.w)) { return; }
+  if (operation == 4u && params.sizeOffset.w > 0u && counts[index] >= params.sizeOffset.w && sum[index].a >= 0.999) { return; }
+  if (operation == 5u && params.sizeOffset.w > 0u && sum[index].a >= f32(params.sizeOffset.w)) { return; }
   let world = vec2f(f32(id.x) + 0.5, f32(id.y + params.sizeOffset.z) + 0.5) + params.worldOrigin.xy;
   let v = world - params.rotationOrigin.zw;
   let c = params.rotationOrigin.x; let s = params.rotationOrigin.y;
@@ -31,8 +34,26 @@ fn accumulate(@builtin(global_invocation_id) id: vec3u) {
     }
   }}
   if (value.a > 0.0) {
-    if (params.sizeOffset.w > 0u) { value *= min(1.0, (f32(params.sizeOffset.w) - sum[index].a) / value.a); }
-    sum[index] += value; counts[index] += 1u;
+    if (operation == 1u) { counts[index] += 1u; return; }
+    if (operation >= 2u && operation <= 3u && params.sizeOffset.w > 0u) {
+      let remaining = counts[index];
+      if (remaining > 0u) { counts[index] = remaining - 1u; }
+      if (remaining > params.sizeOffset.w) { return; }
+    }
+    if (operation == 3u) {
+      sum[index] = vec4f(value.rgb + sum[index].rgb * (1.0 - value.a), value.a + sum[index].a * (1.0 - value.a));
+    } else if (operation == 4u) {
+      sum[index] = vec4f(sum[index].rgb + value.rgb * (1.0 - sum[index].a), sum[index].a + value.a * (1.0 - sum[index].a));
+      counts[index] += 1u;
+    } else if (operation == 5u) {
+      if (params.sizeOffset.w > 0u) { value *= min(1.0, (f32(params.sizeOffset.w) - sum[index].a) / value.a); }
+      sum[index] += value;
+      counts[index] += 1u;
+    } else {
+      if (operation == 0u && params.sizeOffset.w > 0u) { value *= min(1.0, (f32(params.sizeOffset.w) - sum[index].a) / value.a); }
+      sum[index] += value;
+    }
+    if (operation == 0u) { counts[index] += 1u; }
   }
 }`;
 const finishShader = vertex + /* wgsl */ `
@@ -42,7 +63,8 @@ const finishShader = vertex + /* wgsl */ `
   let index = (u32(p.y) - dimensions.z) * dimensions.x + u32(p.x);
   let value = sum[index];
   if (value.a <= 0) { return vec4f(0); }
-  return vec4f(value.rgb / value.a, 1);
+  let coverage = min(1.0, value.a);
+  return vec4f(value.rgb / value.a * coverage, coverage);
 }`;
 
 export class WebGpuOverlay extends WebGpuRemapper {
@@ -50,9 +72,9 @@ export class WebGpuOverlay extends WebGpuRemapper {
     const adapter = await navigator.gpu?.requestAdapter();
     if (!adapter) throw new Error('Keine WebGPU-GPU verfuegbar.');
     return Math.max(width, height) > adapter.limits.maxTextureDimension2D ||
-      width * height * 24 + maps.outputWidth * maps.outputHeight * 13 > 1536 * 1024 * 1024;
+        width * height * 24 + maps.outputWidth * maps.outputHeight * 17 > 1536 * 1024 * 1024;
   }
-  static async create(maps, width, height, minX, minY, pixelAllowed = null, maxFrames = 0, edgeFeather = 0.1) {
+      static async create(maps, width, height, minX, minY, pixelAllowed = null, maxFrames = 0, edgeFeather = 0.1, brightness = null) {
     if (!Number.isSafeInteger(maxFrames) || maxFrames < 0 || maxFrames > 65535) throw new Error('Ungueltige Framegrenze fuer die Ueberlagerung.');
     if (!navigator.gpu) throw new Error('WebGPU ist nicht verfuegbar.');
     const adapter = await navigator.gpu.requestAdapter();
@@ -62,7 +84,7 @@ export class WebGpuOverlay extends WebGpuRemapper {
       throw new Error(`Vollaufloesung ${width} x ${height} ueberschreitet das GPU-Texturlimit ${maximum}. Kleineren Bildbereich auswaehlen.`);
     }
     // Bound allocations before creating resources; never silently downscale.
-    if (width * height * 24 + maps.outputWidth * maps.outputHeight * 13 > 1536 * 1024 * 1024) {
+    if (width * height * 24 + maps.outputWidth * maps.outputHeight * 17 > 1536 * 1024 * 1024) {
       throw new Error('Vollaufloesende Ueberlagerung ueberschreitet das GPU-Bildbudget von 1,5 GiB. Kleineren Bildbereich auswaehlen.');
     }
     const device = await adapter.requestDevice({ requiredLimits: { maxTextureDimension2D: maximum,
@@ -70,7 +92,7 @@ export class WebGpuOverlay extends WebGpuRemapper {
     const result = new WebGpuOverlay(device, width, height, minX, minY);
     result.maxFrames = maxFrames;
     result.edgeFeather = Math.max(0, Math.min(0.5, edgeFeather));
-    try { await result.initialize(maps, pixelAllowed); return result; }
+    try { await result.initialize(maps, pixelAllowed, brightness); return result; }
     catch (error) { result.destroy(); throw new Error(error.message || String(error)); }
   }
 
@@ -79,12 +101,12 @@ export class WebGpuOverlay extends WebGpuRemapper {
     Object.assign(this, { width, height, minX, minY, chunks: [] });
   }
 
-  async initialize(maps, allowed) {
+  async initialize(maps, allowed, brightness) {
     const d = this.device;
     const module = code => d.createShaderModule({ code });
     const finishModule = module(finishShader);
     const {width, height} = this;
-    await this.initializeRemap(maps, allowed, this.edgeFeather);
+    await this.initializeRemap(maps, allowed, this.edgeFeather, brightness);
     this.width = width; this.height = height;
     this.accumulatePipeline = await d.createComputePipelineAsync({ layout: 'auto', compute: { module: module(accumulateShader), entryPoint: 'accumulate' } });
     this.format = navigator.gpu.getPreferredCanvasFormat();
@@ -124,7 +146,7 @@ export class WebGpuOverlay extends WebGpuRemapper {
     await this.device.queue.onSubmittedWorkDone(); this.check();
   }
 
-  async addFrame(frame, orientation, geometry) {
+  async addFrame(frame, orientation, geometry, operation = 0) {
     this.check();
     const d = this.device;
     const origin = geometry.world(0, 0);
@@ -134,7 +156,7 @@ export class WebGpuOverlay extends WebGpuRemapper {
     for (const chunk of this.chunks) {
       const params = new ArrayBuffer(48);
       new Uint32Array(params).set([this.width, chunk.rows, chunk.row, this.maxFrames]);
-      new Float32Array(params).set([geometry.c, geometry.s, origin.x, origin.y, this.minX, this.minY, this.edgeFeather, 0], 4);
+      new Float32Array(params).set([geometry.c, geometry.s, origin.x, origin.y, this.minX, this.minY, operation, 0], 4);
       d.queue.writeBuffer(chunk.params, 0, params);
       pass.setBindGroup(0, chunk.accumulate);
       pass.dispatchWorkgroups(Math.ceil(this.width / 16), Math.ceil(chunk.rows / 16));
@@ -143,6 +165,8 @@ export class WebGpuOverlay extends WebGpuRemapper {
     // One fence per frame, no GPU readback. Keeps decoded surfaces and queue bounded.
     await d.queue.onSubmittedWorkDone(); this.check();
   }
+
+  async countFrame(frame, orientation, geometry) { return this.addFrame(frame, orientation, geometry, 1); }
 
   async finish() {
     this.check();

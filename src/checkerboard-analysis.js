@@ -15,7 +15,7 @@ export function checkerboardCells(points) {
     const area = Math.abs(corners.reduce((sum, corner, index) => {
       const next = corners[(index + 1) % 4]; return sum + corner.x * next.y - next.x * corner.y;
     }, 0)) / 2;
-    cells.push({ corners: corners.map(({ x, y }) => ({ x, y })), area,
+    cells.push({ col: point.col, row: point.row, corners: corners.map(({ x, y }) => ({ x, y })), area,
       x: corners.reduce((sum, corner) => sum + corner.x, 0) / 4,
       y: corners.reduce((sum, corner) => sum + corner.y, 0) / 4 });
   }

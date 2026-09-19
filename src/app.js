@@ -14,10 +14,16 @@ import { frameGeometry, localSelectionMask, localSelectionDistance, localSelecti
 import { FrameReader } from './frame-reader.js';
 import { installTrackingInspector } from './tracking-inspector.js';
 import { installCheckerboardView } from './checkerboard-view.js';
+import { checkerboardCells } from './checkerboard-analysis.js';
 import { WebGpuOverlay } from './webgpu-overlay.js';
-import { renderTiledOverlay, closeOverlayTiles } from './overlay-tiles.js';
+import { renderTiledOverlay, closeOverlayTiles, overlayTiles, overlayTileSize } from './overlay-tiles.js';
 import { applyPoseCorrection, buildPoseGraph, localRefitGroups, searchLocalRefit } from './pose-graph-refit.js';
 import { refitColorMatrix } from './refit-preprocess.js';
+import { brightnessDisplayRange, brightnessFieldPixels, decodeBrightnessCalibration, encodeBrightnessCalibration } from './brightness-calibration.js';
+import { pixelBrightnessSample, planPixelBrightnessPairs } from './pixel-brightness.js';
+import { fitCheckerboardBrightness, sampleCheckerboardBrightness } from './uniform-brightness.js';
+import { mergeBounds, mergeEstimate, selectMergeFrames } from './merge-plan.js';
+import { beginBigTiff } from './bigtiff-writer.js';
 
 createIcons({ icons });
 const element = id => document.getElementById(id);
@@ -41,10 +47,12 @@ let videoUrl = null;
 let currentIndex = 0;
 let currentSharpness = null;
 let calibration = null;
-const frameReader = new FrameReader({ getDecoder: () => decoder, getMaps: () => calibration?.maps, computer,
+let brightnessCalibration = null;
+const frameReader = new FrameReader({ getDecoder: () => decoder, getMaps: () => calibration?.maps, getBrightness: () => brightnessCalibration, computer,
   onFallback: error => console.warn('FrameReader: CPU-Fallback:', error.message) });
-const readFrame = (index, options = {}) => frameReader.read(index, { gpu: element('useWebGpu').checked, ...options });
-const readTrackingFrame = (index, options = {}) => frameReader.read(index, { gpu: element('trackingUseWebGpu').checked, ...options });
+const useWebGpu = () => element('globalUseWebGpu').checked;
+const readFrame = (index, options = {}) => frameReader.read(index, { gpu: useWebGpu(), ...options });
+const readTrackingFrame = (index, options = {}) => frameReader.read(index, { gpu: useWebGpu(), ...options });
 let snapshotFrames = [];
 let snapshotParameters = null;
 let frames = new Map();
@@ -125,6 +133,9 @@ const trackingPreviewImage = document.createElement('canvas');
 let workflow = 'calibration';
 let trackingRunning = false;
 let trackingPaused = false;
+let brightnessRunning = false;
+let brightnessPaused = false;
+let brightnessSession = null;
 let trackingNextIndex = 0;
 let trackingPath = [];
 let trackingFailures = [];
@@ -167,6 +178,9 @@ function clearPathOverlay() {
 }
 let overlayZoom = 1;
 let overlayPan = { x: 0, y: 0 };
+const mergePreviewImage = document.createElement('canvas');
+let mergeZoom = 1;
+let mergePan = { x: 0, y: 0 };
 let pathRefitProposal = null;
 let pathRefitBusy = false;
 let trackingImageMask = null;
@@ -176,6 +190,9 @@ let trackingMaskPreviewRequest = 0;
 const trackingMaskPreview = document.createElement('canvas');
 const trackingMaskPaintLayer = document.createElement('canvas');
 let trackingMaskTransform = null;
+let mergeRunning = false;
+let mergeCancelled = false;
+let mergeTilePlan = null;
 const windowTracking = () => element('trackingMode').value === 'window';
 const checkerboardView = installCheckerboardView({ canvas: resultCanvas, redraw: () => draw(),
   getState: () => ({ visible: view === 'rectified', ready: rectifiedReady && Boolean(calibration) && video.paused && !rectifiedPlayback && !taskBusy && !navigationBusy && !trackingRunning,
@@ -269,16 +286,48 @@ function message(value = '', error = false) {
   element('message').className = error ? 'error' : '';
 }
 
+let operationTiming = null;
+
+function etaLabel(seconds) {
+  const rounded = Math.max(1, Math.round(seconds));
+  if (rounded < 60) return `${rounded} s`;
+  if (rounded < 3600) return `${Math.floor(rounded / 60)} min ${rounded % 60} s`;
+  return `${Math.floor(rounded / 3600)} h ${Math.floor(rounded % 3600 / 60)} min`;
+}
+
+function operationProgress(status, value, key = status) {
+  const now = performance.now(), fraction = Math.max(0, Math.min(1, value));
+  if (!operationTiming || operationTiming.key !== key || fraction < operationTiming.value) {
+    operationTiming = { key, started: now, value: fraction, sampled: now, rate: 0 };
+  } else if (fraction > operationTiming.value && now > operationTiming.sampled) {
+    const rate = (fraction - operationTiming.value) / ((now - operationTiming.sampled) / 1000);
+    operationTiming.rate = operationTiming.rate ? operationTiming.rate * 0.8 + rate * 0.2 : rate;
+    operationTiming.value = fraction; operationTiming.sampled = now;
+  }
+  const elapsed = (now - operationTiming.started) / 1000;
+  const remaining = operationTiming.rate > 0 ? (1 - fraction) / operationTiming.rate : NaN;
+  const eta = elapsed >= 3 && remaining >= 2 && Number.isFinite(remaining) ? ` | ETA ${etaLabel(remaining)}` : '';
+  text('processingStatus', `${status}${eta}`);
+  element('progress').value = fraction;
+}
+
 function showProgress(progress) {
+  if (progress.operation === 'brightness-fit') {
+    const status = `Helligkeitssolver | Frame ${progress.frame + 1}/${progress.frames} | Bildpaare ${progress.pairs}/${progress.totalPairs} | Training ${progress.trainingEquations} | Validierung ${progress.validationEquations}`;
+    text('brightnessStatus', status);
+    operationProgress(status, (progress.frame + 1) / progress.frames, 'brightness-fit');
+    return;
+  }
   const names = { index: 'MP4-Index', forward: 'Dichte Vorwaertsmap', inverse: 'Inverse Map', fit: 'Gemeinsamer Fit' };
   const accelerator = progress.accelerator ? ` | ${progress.accelerator}` : '';
   const speed = Number.isFinite(progress.iterationsPerSecond) && Number.isFinite(progress.iterationSeconds) ?
     ` | Mittel ${progress.iterationsPerSecond.toPrecision(3)} Iter./s | letzte ${fixed(progress.iterationSeconds, 2)} s` : '';
   const indexing = progress.stage === 'index' && Number.isFinite(progress.done) && Number.isFinite(progress.total) ?
     ` ${fixed(100 * progress.done / Math.max(1, progress.total), 1)}% | ${megabytes(progress.done)} / ${megabytes(progress.total)}` : '';
-  text('processingStatus', progress.stage === 'fit' ? `Fit ${progress.iteration}/${progress.iterations} | RMS ${fixed(progress.rms)} px${accelerator}${speed}` :
-    `${names[progress.stage] || progress.stage}${indexing}${accelerator}`);
-  element('progress').value = progress.stage === 'fit' ? progress.iteration / progress.iterations : (progress.done || 0) / (progress.total || 1);
+  const status = progress.stage === 'fit' ? `Fit ${progress.iteration}/${progress.iterations} | RMS ${fixed(progress.rms)} px${accelerator}${speed}` :
+    `${names[progress.stage] || progress.stage}${indexing}${accelerator}`;
+  operationProgress(status, progress.stage === 'fit' ? progress.iteration / progress.iterations : (progress.done || 0) / (progress.total || 1),
+    `worker-${progress.stage}`);
   if (progress.stage === 'fit') renderFitProfile(progress.profile);
 }
 
@@ -461,7 +510,7 @@ function parameters() {
     threshold: number('threshold', 16), lineRadius: number('lineRadius', 0), spacing: number('spacing', Math.round(Math.max(width || 640, height || 480) / 4)),
     patchSize: number('patchSize', 32), patchSearchRadius: number('patchSearchRadius', 16),
     lambda: number('lambda', 0.01), sigma: number('sigma', 1), delta: number('delta', 1.5), tau: number('tau', 0.12),
-    iterations: number('iterations', 35), acceptance: number('acceptance', 1), useWebGpu: element('useWebGpu').checked, interval: 0,
+    iterations: number('iterations', 35), acceptance: number('acceptance', 1), useWebGpu: useWebGpu(), interval: 0,
     minMotion: number('minMotion', 0), updateEvery: number('updateEvery', 4), validationFrom: number('validationFrom', 80),
     startPercent: number('startPercent', 0), endPercent: number('endPercent', 100) };
   if (settings.pattern === 'patches') {
@@ -543,7 +592,7 @@ function updateCorrectionDataStatus() {
   for (const [id, label, present] of [
     ['lensDataStatus', 'Linsenkalibrierung', Boolean(calibration?.maps)],
     ['trackingDataStatus', 'XYR-Tracking', trackingPath.length > 0],
-    ['brightnessDataStatus', 'Helligkeitskorrektur', false]
+    ['brightnessDataStatus', 'Helligkeitskorrektur', Boolean(brightnessCalibration)]
   ]) {
     const indicator = element(id);
     indicator.classList.toggle('present', present);
@@ -598,6 +647,7 @@ function updateControls() {
   checkerboardView.refresh();
   updateCorrectionDataStatus();
   const hasVideo = Boolean(videoInfo);
+  element('globalUseWebGpu').disabled = taskBusy || continuous || rectifiedPlayback || trackingRunning;
   for (const id of ['firstFrame', 'previousFrame', 'nextFrame', 'timeline']) element(id).disabled = !hasVideo || navigationBusy || rectifiedPlayback || trackingRunning;
   element('playButton').disabled = !hasVideo || trackingRunning || (navigationBusy && !rectifiedPlayback);
   element('detectButton').disabled = !hasVideo || taskBusy || continuous || rectifiedPlayback || trackingRunning;
@@ -613,8 +663,19 @@ function updateControls() {
   element('importButton').disabled = taskBusy || continuous || rectifiedPlayback || trackingRunning;
   element('openVideo').disabled = taskBusy || continuous || rectifiedPlayback || trackingRunning;
   element('resetButton').disabled = taskBusy || continuous || rectifiedPlayback || trackingRunning;
+  const brightnessReady = Boolean(calibration && trackingPath.some(entry => entry.pose) && !trackingRunning);
+  element('brightnessFit').disabled = !brightnessReady || taskBusy || brightnessRunning;
+  element('brightnessPause').disabled = !brightnessRunning;
+  element('brightnessResume').disabled = !brightnessReady || taskBusy || brightnessRunning || !brightnessPaused || !brightnessSession;
+  element('brightnessReset').disabled = taskBusy || brightnessRunning || (!brightnessSession && !brightnessCalibration);
+  element('brightnessDisable').disabled = !brightnessCalibration || taskBusy || trackingRunning || brightnessRunning;
+  element('brightnessSave').disabled = !brightnessCalibration || taskBusy || trackingRunning || brightnessRunning;
+  element('brightnessLoad').disabled = !calibration || taskBusy || trackingRunning || brightnessRunning;
+  element('brightnessPasses').disabled = taskBusy || Boolean(brightnessSession);
+  element('brightnessMaxGain').disabled = taskBusy || Boolean(brightnessSession);
   for (const control of document.querySelectorAll('.settings input, .settings select, .settings textarea')) {
-    if (control.id !== 'follow' && control.id !== 'opticalConfiguration') control.disabled = taskBusy || continuous || trackingRunning;
+    if (control.id !== 'follow' && control.id !== 'opticalConfiguration') control.disabled = taskBusy || continuous || trackingRunning ||
+      (Boolean(brightnessSession) && ['brightnessPasses', 'brightnessMaxGain'].includes(control.id));
   }
   for (const control of element('frameTable').querySelectorAll('input, select')) {
     control.disabled = taskBusy || continuous || (control.type === 'checkbox' && !frames.get(Number(control.dataset.frameId))?.accepted);
@@ -625,6 +686,7 @@ function updateControls() {
   text('phaseOneState', phaseChecked ? 'Geprueft' : 'Ungeprueft');
   element('phaseOneState').className = `tag ${phaseChecked ? 'good' : ''}`;
   text('resultState', calibration ? `Feld v${calibration.version} | ${stale ? 'veraltet' : calibration.quality === 'validated' ? 'validiert' : 'vorlaeufig'}` : 'Keine Kalibrierung');
+  updateMergeControls();
   updateTrackingControls();
 }
 
@@ -634,7 +696,7 @@ async function task(operation) {
   updateControls();
   try { await operation(); }
   catch (error) { message(error.message, true); continuous = false; }
-  finally { taskBusy = false; updateControls(); if (!continuous) text('processingStatus', 'Bereit'); }
+  finally { taskBusy = false; operationTiming = null; updateControls(); if (!continuous) text('processingStatus', 'Bereit'); }
 }
 
 function closestFrame(timestamp) {
@@ -1643,6 +1705,158 @@ function trackingGeometry(entry) {
   return frameGeometry(proposed ? { ...entry, pose: proposed } : entry, calibration?.field, calibration?.maps);
 }
 
+function mergePlan() {
+  const geometries = trackingPath.map(trackingGeometry).filter(Boolean);
+  const bounds = mergeBounds(geometries);
+  return { geometries, bounds, estimate: mergeEstimate(bounds) };
+}
+
+function updateMergeControls() {
+  const ready = Boolean(videoInfo && calibration && trackingPath.some(entry => entry.pose) &&
+    (!trackingDataset?.video || trackingDataset.video.name === videoInfo.name));
+  element('mergeStart').disabled = !ready || taskBusy || mergeRunning;
+  element('mergeCancel').disabled = !mergeRunning;
+  text('mergeState', mergeRunning ? 'Laeuft' : ready ? 'Bereit' : 'Nicht bereit');
+  element('mergeState').className = `tag ${ready ? 'good' : ''}`;
+  if (workflow !== 'merge' || mergeRunning) return;
+  const plan = mergePlan();
+  if (!plan.bounds) {
+    text('mergeMetrics', 'Keine Ausgabe geplant');
+    text('mergeStatus', 'Tracking und zugehoeriges Video erforderlich.');
+    return;
+  }
+  const key = `${calibration.maps.outputWidth}x${calibration.maps.outputHeight}`;
+  const tileSize = mergeTilePlan?.key === key ? mergeTilePlan.tileSize : 2048;
+  const estimate = mergeEstimate(plan.bounds, tileSize);
+  text('mergeMetrics', `${plan.bounds.width} x ${plan.bounds.height} px | ${plan.geometries.length} Frames | ` +
+    `${trackingMaskHasSelection ? 'Rohmaske aktiv' : 'gesamter Bildbereich'}`);
+  text('mergeStatus', `${estimate.tiles} Kacheln bei ${tileSize} px | BigTIFF bis ca. ${megabytes(estimate.tiles * tileSize * tileSize * 4)}`);
+}
+
+async function updateMergeTilePlan() {
+  if (!calibration?.maps || !navigator.gpu) return;
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) return;
+  mergeTilePlan = { key: `${calibration.maps.outputWidth}x${calibration.maps.outputHeight}`,
+    tileSize: overlayTileSize(calibration.maps, adapter.limits.maxTextureDimension2D) };
+  updateMergeControls();
+}
+
+function prepareMergePreview(bounds) {
+  const scale = Math.min(1, 2048 / Math.max(bounds.width, bounds.height));
+  mergePreviewImage.width = Math.max(1, Math.ceil(bounds.width * scale));
+  mergePreviewImage.height = Math.max(1, Math.ceil(bounds.height * scale));
+  const context = mergePreviewImage.getContext('2d');
+  context.clearRect(0, 0, mergePreviewImage.width, mergePreviewImage.height);
+  context.imageSmoothingEnabled = true;
+  mergeZoom = 1; mergePan = { x: 0, y: 0 };
+  element('mergeEmpty').hidden = true;
+  renderMergePreview();
+  return { context, scale };
+}
+
+function renderMergePreview() {
+  const { context, width, height } = trackingCanvasContext('mergeCanvas');
+  context.clearRect(0, 0, width, height);
+  if (!mergePreviewImage.width || !mergePreviewImage.height) return;
+  const scale = Math.min(width / mergePreviewImage.width, height / mergePreviewImage.height) * mergeZoom;
+  const left = (width - mergePreviewImage.width * scale) / 2 + mergePan.x;
+  const top = (height - mergePreviewImage.height * scale) / 2 + mergePan.y;
+  context.imageSmoothingEnabled = mergeZoom < 2;
+  context.drawImage(mergePreviewImage, left, top, mergePreviewImage.width * scale, mergePreviewImage.height * scale);
+  text('mergeZoomValue', `${Math.round(mergeZoom * 100)}%`);
+}
+
+function installMergePreviewInteraction() {
+  const canvas = element('mergeCanvas');
+  let drag = null;
+  canvas.addEventListener('pointerdown', event => {
+    if (event.button !== 0 || !mergePreviewImage.width) return;
+    drag = { x: event.clientX, y: event.clientY, pan: { ...mergePan } };
+    canvas.setPointerCapture(event.pointerId);
+  });
+  canvas.addEventListener('pointermove', event => {
+    if (!drag) return;
+    mergePan = { x: drag.pan.x + event.clientX - drag.x, y: drag.pan.y + event.clientY - drag.y };
+    renderMergePreview();
+  });
+  for (const name of ['pointerup', 'pointercancel', 'lostpointercapture']) canvas.addEventListener(name, () => { drag = null; });
+  canvas.addEventListener('wheel', event => {
+    event.preventDefault();
+    const bounds = canvas.getBoundingClientRect();
+    const next = Math.max(0.25, Math.min(64, mergeZoom * Math.exp(-event.deltaY * 0.001)));
+    const factor = next / mergeZoom;
+    const x = event.clientX - bounds.left - bounds.width / 2, y = event.clientY - bounds.top - bounds.height / 2;
+    mergePan = { x: x - (x - mergePan.x) * factor, y: y - (y - mergePan.y) * factor };
+    mergeZoom = next; renderMergePreview();
+  }, { passive: false });
+  element('mergeZoomIn').onclick = () => { mergeZoom = Math.min(64, mergeZoom * 1.25); renderMergePreview(); };
+  element('mergeZoomOut').onclick = () => { mergeZoom = Math.max(0.25, mergeZoom / 1.25); renderMergePreview(); };
+  element('mergeFitView').onclick = () => { mergeZoom = 1; mergePan = { x: 0, y: 0 }; renderMergePreview(); };
+  new ResizeObserver(renderMergePreview).observe(canvas.parentElement);
+}
+
+async function renderMergeToBigTiff(handle) {
+  const maxFrames = number('mergeMaxFrames', 3);
+  const edgeFeather = number('mergeEdgeFeather', 10) / 100;
+  if (!Number.isInteger(maxFrames) || maxFrames < 1 || maxFrames > 64) throw new Error('Scharfe Frames je Pixel muss zwischen 1 und 64 liegen.');
+  if (!Number.isFinite(edgeFeather) || edgeFeather < 0 || edgeFeather > 0.5) throw new Error('Randueberblendung muss zwischen 0 und 50 Prozent liegen.');
+  const { geometries, bounds } = mergePlan();
+  if (!bounds || !geometries.length) throw new Error('Keine gueltigen Tracking-Posen fuer den Merge.');
+  const selectedGeometries = selectMergeFrames(geometries, maxFrames, trackingPixelAllowed, edgeFeather);
+  if (!selectedGeometries.length) throw new Error('Die Trackingmaske enthaelt keine verwendbaren Merge-Bereiche.');
+  const adapter = await navigator.gpu?.requestAdapter();
+  if (!adapter) throw new Error('Merge benoetigt WebGPU.');
+  const tileSize = overlayTileSize(calibration.maps, adapter.limits.maxTextureDimension2D);
+  mergeTilePlan = { key: `${calibration.maps.outputWidth}x${calibration.maps.outputHeight}`, tileSize };
+  const tiles = overlayTiles(bounds.width, bounds.height, bounds.minX, bounds.minY, selectedGeometries, tileSize,
+    { maxFrames, pixelAllowed: trackingPixelAllowed, edgeFeather });
+  const writable = await handle.createWritable();
+  mergeRunning = true; mergeCancelled = false; updateMergeControls();
+  const preview = prepareMergePreview(bounds);
+  try {
+    const writer = await beginBigTiff(writable, { ...bounds, tileSize, tiles }, state => {
+      text('mergePreviewState', `Schreibe Kachel ${state.completed}/${state.total} | ${megabytes(state.bytes)} / ${megabytes(state.fileBytes)}`);
+    });
+    await frameReader.dispose();
+    const result = await renderTiledOverlay({ maps: calibration.maps, ...bounds, geometries: selectedGeometries, pixelAllowed: trackingPixelAllowed,
+      maxFrames, edgeFeather, brightness: brightnessCalibration, frameOrder: 'blurriest', blend: element('mergeBlend').value,
+      tileSize, retainTiles: false, decode: index => readTrackingFrame(index, { output: 'native' }),
+      cancelled: () => mergeCancelled,
+      progress: state => {
+        const status = `${state.stage === 'coverage' ? 'Abdeckung' : 'Mischen'} | Kachel ${state.tileIndex + 1}/${state.tileCount} | Frame ${state.frameIndex + 1}/${state.frameCount} (#${state.frame}) | GPU-Durchlauf ${state.framePass}/${state.plannedFramePasses}`;
+        text('mergeStatus', status);
+        operationProgress(status, state.framePass / state.plannedFramePasses, 'merge');
+      },
+      tileReady: async tile => {
+        await writer.writeTile(tile);
+        preview.context.drawImage(tile.bitmap, 0, 0, tile.width, tile.height,
+          tile.x * preview.scale, tile.y * preview.scale, tile.width * preview.scale, tile.height * preview.scale);
+        renderMergePreview();
+      } });
+    if (!result || mergeCancelled) { await writable.abort(); text('mergeStatus', 'Merge abgebrochen. Unvollstaendige Datei verworfen.'); return; }
+    const layout = await writer.finish();
+    await writable.close();
+    text('mergeStatus', `Fertig: ${bounds.width} x ${bounds.height} px | ${tiles.length} Kacheln | ${megabytes(layout.fileBytes)} BigTIFF | ` +
+      `${selectedGeometries.length}/${geometries.length} Frames nach Pose-, Masken- und Schaerfeauswahl.`);
+    text('mergePreviewState', 'BigTIFF gespeichert');
+  } catch (error) {
+    try { await writable.abort(); } catch {}
+    throw error;
+  } finally { mergeRunning = false; updateMergeControls(); }
+}
+
+async function startMerge() {
+  if (!globalThis.showSaveFilePicker) throw new Error('BigTIFF-Ausgabe benoetigt die File System Access API in Edge oder Chrome.');
+  const baseName = (videoInfo?.name || 'mosaic').replace(/\.[^.]+$/, '');
+  let handle;
+  try {
+    handle = await showSaveFilePicker({ suggestedName: `${baseName}-merge.tif`,
+      types: [{ description: 'BigTIFF-Bild', accept: { 'image/tiff': ['.tif', '.tiff'] } }] });
+  } catch (error) { if (error.name === 'AbortError') return; else throw error; }
+  await task(() => renderMergeToBigTiff(handle));
+}
+
 function localRefitFailure(matches, conditionalLimit) {
   const usable = match => match?.accepted || match?.conditionallyAccepted;
   const forward = matches.filter(match => usable(match.forward)).length;
@@ -1659,6 +1873,278 @@ function localRefitFailure(matches, conditionalLimit) {
   }
   const breakdown = [...reasons].sort((first, second) => second[1] - first[1]).map(([reason, count]) => `${reason}: ${count}`).join(', ');
   return `${matches.length} Paare versucht; vorwaerts ${forward}, rueckwaerts ${backward}, innerhalb Zyklusgrenze ${cycle}. ${breakdown}`;
+}
+
+function drawBrightnessCalibration() {
+  const canvas = element('brightnessCanvas');
+  const empty = element('brightnessEmpty');
+  if (!brightnessCalibration) { canvas.width = canvas.height = 0; empty.hidden = false; return; }
+  const scale = Math.max(1, Math.ceil(Math.max(brightnessCalibration.width, brightnessCalibration.height) / 640));
+  canvas.width = Math.ceil(brightnessCalibration.width / scale); canvas.height = Math.ceil(brightnessCalibration.height / scale);
+  const range = brightnessDisplayRange(brightnessCalibration, trackingPixelAllowed);
+  const image = new ImageData(brightnessFieldPixels(brightnessCalibration, canvas.width, canvas.height, trackingPixelAllowed, range),
+    canvas.width, canvas.height);
+  canvas.getContext('2d').putImageData(image, 0, 0); empty.hidden = true;
+  text('brightnessLegend', `Schwarz: ${Math.round((range.low - 1) * 100)}% | Grau: 0% | Weiss: +${Math.round((range.high - 1) * 100)}%`);
+  text('brightnessState', `v${brightnessCalibration.version}`); element('brightnessState').className = 'tag good';
+  const metrics = brightnessCalibration.metrics;
+  const frameRange = Number.isSafeInteger(metrics.firstFrame) && Number.isSafeInteger(metrics.lastFrame) ?
+    `${metrics.frames} Frames #${metrics.firstFrame} bis #${metrics.lastFrame} | ` : '';
+  text('brightnessMetrics', `${metrics.accelerator ?? 'CPU'} | ` + frameRange + `${metrics.trainingFrames} Training / ${metrics.validationFrames} Validierung | ` +
+    `${metrics.framePairs ?? '-'} Bildpaare / ${metrics.equations} Ueberlappungen | Validierung ${fixed(metrics.baselineValidationRms, 3)} -> ${fixed(metrics.validationRms, 3)} log | ` +
+    `${(metrics.covered * 100).toFixed(0)}% gestuetzt` +
+    (brightnessCalibration.model?.completion === 'regularized-cubic-b-spline' ? ' | Rest kubisch ergaenzt' : ''));
+}
+
+function brightnessGeometryDescriptor(geometry) {
+  return { c: geometry.c, s: geometry.s, origin: geometry.world(0, 0) };
+}
+
+async function discardBrightnessSession() {
+  if (brightnessSession?.backend === 'pixel') await computer.call('brightness-pixel-discard');
+  brightnessSession = null;
+  brightnessRunning = false;
+  brightnessPaused = false;
+}
+
+async function startBrightnessBackend(session) {
+  const backend = await computer.call('brightness-pixel-start', { options: { width: session.width, height: session.height,
+    passes: session.passes, maxGain: session.maxGain, useWebGpu: session.useWebGpu } });
+  session.accelerator = backend?.accelerator || 'CPU';
+  session.fallbackReason ||= backend?.fallbackReason || '';
+}
+
+function addBrightnessFrames(session, selected) {
+  const additions = [];
+  for (const entry of selected) if (!session.geometries.has(entry.frame)) {
+    const geometry = frameGeometry(entry, calibration.field, calibration.maps);
+    session.geometries.set(entry.frame, geometry);
+    additions.push(entry.frame);
+  }
+  if (!session.validationFrames.size) {
+    const geometries = [...session.geometries.values()].sort((first, second) => first.entry.frame - second.entry.frame);
+    const initial = planPixelBrightnessPairs(geometries, trackingPixelAllowed);
+    for (const index of initial.heldOut) session.validationFrames.add(geometries[index].entry.frame);
+  } else {
+    for (const frame of additions) if (frame % 5 === 4) session.validationFrames.add(frame);
+  }
+  return additions.length;
+}
+
+async function processBrightnessPair(session, geometries, pair, pass, validation = false) {
+  const current = geometries[pair.current], reference = geometries[pair.reference];
+  const currentFrame = current.entry.frame, referenceFrame = reference.entry.frame;
+  const invoke = async (type, data, transfer) => {
+    const started = performance.now();
+    try { return await computer.call(type, data, transfer); }
+    finally { session.timings.workerMs += performance.now() - started; }
+  };
+  const missing = await invoke('brightness-pixel-prepare', { indices: [currentFrame, referenceFrame] });
+  for (const frame of missing) {
+    const geometry = session.geometries.get(frame);
+    let started = performance.now();
+    const image = await readTrackingFrame(frame, { gpu: false, rectified: true, output: 'rgba', brightness: false });
+    session.timings.readMs += performance.now() - started;
+    if (image.width !== session.width || image.height !== session.height) throw new Error('Abweichende entzerrte Bildgroesse.');
+    started = performance.now();
+    const gray = pixelBrightnessSample(image, trackingPixelAllowed);
+    session.timings.sampleMs += performance.now() - started;
+    await invoke('brightness-pixel-frame', { index: frame, gray }, [gray.buffer]);
+    if (!geometry) throw new Error(`Keine Geometrie fuer Frame #${frame}.`);
+  }
+  return invoke('brightness-pixel-pair', { current: currentFrame, reference: referenceFrame,
+    currentGeometry: brightnessGeometryDescriptor(current), referenceGeometry: brightnessGeometryDescriptor(reference), pass, validation });
+}
+
+async function continueBrightnessSession(session) {
+  const geometries = [...session.geometries.values()].sort((first, second) => first.entry.frame - second.entry.frame);
+  const heldOut = new Set(geometries.map((geometry, index) => session.validationFrames.has(geometry.entry.frame) ? index : -1).filter(index => index >= 0));
+  const plan = planPixelBrightnessPairs(geometries, trackingPixelAllowed, 6, heldOut);
+  const training = plan.pairs.filter(pair => !pair.validation), validation = plan.pairs.filter(pair => pair.validation);
+  if (!training.length || !validation.length) throw new Error('Keine ausreichenden Tracking-Ueberlappungen fuer Training und Validierung.');
+  const pending = [];
+  for (let pass = 0; pass < session.passes; pass++) {
+    const pairs = pass % 2 ? [...training].reverse() : training;
+    for (const pair of pairs) {
+      const current = geometries[pair.current].entry.frame, reference = geometries[pair.reference].entry.frame;
+      const key = `${pass}:${current}:${reference}`;
+      if (!session.processed.has(key)) pending.push({ pair, pass, key });
+    }
+  }
+  let completed = 0;
+  for (let pass = 0; pass < session.passes; pass++) {
+    const work = pending.filter(item => item.pass === pass);
+    let changed = false, paused = false;
+    try {
+      for (const item of work) {
+        const current = geometries[item.pair.current].entry.frame, reference = geometries[item.pair.reference].entry.frame;
+        text('brightnessStatus', `${session.accelerator} | Pixel-Ausgleich ${pass + 1}/${session.passes} | Paar #${current} / #${reference}`);
+        operationProgress('Pixel-Helligkeitsausgleich', pending.length ? completed / pending.length : 1, 'brightness-pixel');
+        await processBrightnessPair(session, geometries, item.pair, pass);
+        session.processed.add(item.key);
+        completed++;
+        changed = true;
+        if (!brightnessRunning) { paused = true; break; }
+      }
+    } finally {
+      if (changed) await computer.call('brightness-pixel-normalize');
+    }
+    if (paused) {
+      text('brightnessStatus', `Pausiert | ${session.geometries.size} Frames gespeichert | ${session.processed.size} Paar-Durchlaeufe verarbeitet.`);
+      return null;
+    }
+  }
+  await computer.call('brightness-pixel-validation-reset');
+  for (let index = 0; index < validation.length; index++) {
+    const pair = validation[index], current = geometries[pair.current].entry.frame, reference = geometries[pair.reference].entry.frame;
+    text('brightnessStatus', `${session.accelerator} | Pixel-Validierung | Paar #${current} / #${reference}`);
+    operationProgress('Pixel-Helligkeitsvalidierung', validation.length ? index / validation.length : 1, 'brightness-pixel');
+    await processBrightnessPair(session, geometries, pair, session.passes, true);
+  }
+  const frames = geometries.map(geometry => geometry.entry.frame);
+  const result = await computer.call('brightness-pixel-snapshot', { metrics: { frames: frames.length,
+    fallbackReason: session.fallbackReason, firstFrame: Math.min(...frames), lastFrame: Math.max(...frames),
+    trainingFrames: plan.trainingFrames, validationFrames: plan.validationFrames } });
+  result.metrics.timings = { ...session.timings, totalMs: session.timings.totalMs + performance.now() - session.runStarted };
+  operationProgress('Pixelweise Helligkeitskarte berechnet', 1, 'brightness-pixel');
+  return result;
+}
+
+async function fitBrightnessCalibration(restart = false) {
+  const from = element('brightnessFrom'), to = element('brightnessTo');
+  if (!from.validity.valid || !to.validity.valid) throw new Error('Bitte gueltige ganze Frame-Nummern ab 0 eingeben.');
+  if (!element('brightnessPasses').validity.valid || !element('brightnessMaxGain').validity.valid) {
+    throw new Error('Bitte eine gueltige Zielzahl an Frames und maximale Verstaerkung eingeben.');
+  }
+  const maximumFrame = to.value === '' ? Infinity : to.valueAsNumber;
+  const available = [...frames.values()].filter(frame => frame.accepted && frame.enabled && !frame.patchSize &&
+    frame.points.length >= 4 && frame.id >= from.valueAsNumber && frame.id <= maximumFrame).sort((first, second) => first.id - second.id);
+  if (available.length < 5) throw new Error(`Im gewaehlten Bereich sind nur ${available.length} akzeptierte Checkerboard-Frames vorhanden. Mindestens fuenf werden benoetigt.`);
+  if (restart) await discardBrightnessSession();
+  if (brightnessSession && brightnessSession.backend !== 'checkerboard-white') await discardBrightnessSession();
+  const target = Math.min(available.length, element('brightnessPasses').valueAsNumber);
+  const selected = Array.from({ length: target }, (_, index) => available[Math.round(index * (available.length - 1) / (target - 1))]);
+  if (!brightnessSession) brightnessSession = { backend: 'checkerboard-white', width: calibration.maps.outputWidth,
+    height: calibration.maps.outputHeight, maxGain: element('brightnessMaxGain').valueAsNumber,
+    observations: new Map(), samples: new Map(), timings: { readMs: 0, sampleMs: 0, totalMs: 0 } };
+  const session = brightnessSession;
+  session.observations = new Map(selected.map(frame => [frame.id, frame]));
+  for (const frame of session.samples.keys()) if (!session.observations.has(frame)) session.samples.delete(frame);
+  const runStarted = performance.now();
+  brightnessRunning = true;
+  brightnessPaused = false;
+  updateControls();
+  try {
+    for (let index = 0; index < selected.length; index++) {
+      const observation = selected[index];
+      if (session.samples.has(observation.id)) continue;
+      text('brightnessStatus', `Weisse Checkerboard-Flaechen extrahieren | Frame #${observation.id} | ${index + 1}/${selected.length}`);
+      operationProgress('Checkerboard-Helligkeitsflaechen', index / selected.length, 'brightness-checkerboard');
+      let started = performance.now();
+      const image = await readTrackingFrame(observation.id, { gpu: false, rectified: true, output: 'rgba', brightness: false });
+      session.timings.readMs += performance.now() - started;
+      started = performance.now();
+      const mappedCells = checkerboardCells(observation.points).map(cell => {
+        const corners = cell.corners.map(point => {
+          const x = Math.max(0, Math.min(calibration.field.width - 1, point.x));
+          const y = Math.max(0, Math.min(calibration.field.height - 1, point.y));
+          const left = Math.min(calibration.field.width - 2, Math.floor(x)), top = Math.min(calibration.field.height - 2, Math.floor(y));
+          const across = x - left, down = y - top, width = calibration.field.width, forward = calibration.maps.forward;
+          const component = axis => (1 - down) * ((1 - across) * forward[(top * width + left) * 2 + axis] +
+            across * forward[(top * width + left + 1) * 2 + axis]) + down * ((1 - across) * forward[((top + 1) * width + left) * 2 + axis] +
+            across * forward[((top + 1) * width + left + 1) * 2 + axis]);
+          return { x: component(0) - calibration.maps.origin[0], y: component(1) - calibration.maps.origin[1] };
+        });
+        return { col: cell.col, row: cell.row, corners,
+          x: corners.reduce((sum, point) => sum + point.x, 0) / 4,
+          y: corners.reduce((sum, point) => sum + point.y, 0) / 4 };
+      });
+      session.samples.set(observation.id, sampleCheckerboardBrightness(image, mappedCells, observation.id, 8, trackingPixelAllowed));
+      session.timings.sampleMs += performance.now() - started;
+      if (!brightnessRunning) {
+        brightnessPaused = true;
+        text('brightnessStatus', `Pausiert | ${session.samples.size}/${selected.length} Checkerboard-Frames analysiert.`);
+        return;
+      }
+    }
+    const sampledFrames = selected.map(observation => session.samples.get(observation.id));
+    const heldOut = new Set(sampledFrames.map((_, index) => index % 5 === 4 ? index : -1).filter(index => index >= 0));
+    text('brightnessStatus', `${sampledFrames.length} Checkerboard-Frames | direkte Weißreferenz | lokales Modell`);
+    const result = fitCheckerboardBrightness(sampledFrames, heldOut, { outputWidth: session.width, outputHeight: session.height,
+      maxGain: session.maxGain, allowed: trackingPixelAllowed });
+    const frameNumbers = selected.map(frame => frame.id);
+    result.metrics.frames = sampledFrames.length; result.metrics.firstFrame = Math.min(...frameNumbers); result.metrics.lastFrame = Math.max(...frameNumbers);
+    result.metrics.acceptedBlocks = sampledFrames.reduce((sum, frame) => sum + frame.uniform.reduce((count, value) => count + Number(Boolean(value)), 0), 0);
+    result.metrics.acceptedCells = sampledFrames.reduce((sum, frame) => sum + frame.cells, 0);
+    const totalMs = session.timings.totalMs + performance.now() - runStarted;
+    result.metrics.timings = { ...session.timings, totalMs };
+    if (!(result.metrics.validationRms < result.metrics.baselineValidationRms * 0.9)) {
+      brightnessPaused = true;
+      throw new Error(`Helligkeitsfeld nicht aktiviert: Validierung verbessert sich nicht ausreichend (${fixed(result.metrics.baselineValidationRms, 3)} -> ${fixed(result.metrics.validationRms, 3)} log).`);
+    }
+    brightnessCalibration = result;
+    const workerCalibration = { ...result, gain: result.gain.slice(), supported: result.supported.slice() };
+    await computer.call('brightness-set', { calibration: workerCalibration }, [workerCalibration.gain.buffer, workerCalibration.supported.buffer]);
+    await frameReader.dispose(); trackingComputer.nativeMaps = null;
+    text('brightnessStatus', `Weisses Checkerboard-Papier: ${result.metrics.acceptedCells.toLocaleString('de-DE')} Zellen / ` +
+      `${result.metrics.acceptedBlocks.toLocaleString('de-DE')} Bloecke | ${sampledFrames.length} Frames | ` +
+      `Validierung ${fixed(result.metrics.baselineValidationRms, 3)} -> ${fixed(result.metrics.validationRms, 3)} log | ` +
+      `Lesen/Entzerren ${fixed(session.timings.readMs / 1000, 1)} s, Analyse und Fit ${fixed((totalMs - session.timings.readMs) / 1000, 1)} s.`);
+    operationProgress('Helligkeitskarte aus weissen Checkerboard-Flaechen berechnet', 1, 'brightness-checkerboard');
+    drawBrightnessCalibration();
+  } finally {
+    session.timings.totalMs += performance.now() - runStarted;
+    brightnessRunning = false;
+    brightnessPaused = Boolean(brightnessSession);
+    updateControls();
+  }
+}
+
+async function resetBrightnessCalibration() {
+  await discardBrightnessSession();
+  await disableBrightnessCalibration();
+  text('brightnessStatus', 'Helligkeitssitzung zurueckgesetzt.');
+}
+
+async function disableBrightnessCalibration() {
+  brightnessCalibration = null;
+  await computer.call('brightness-set', { calibration: null });
+  await frameReader.dispose(); trackingComputer.nativeMaps = null;
+  text('brightnessStatus', 'Helligkeitskorrektur deaktiviert.');
+  text('brightnessState', 'Kein Feld'); element('brightnessState').className = 'tag';
+  text('brightnessMetrics', 'Keine Messung'); drawBrightnessCalibration(); updateControls();
+}
+
+async function brightnessGeometryIdentity() {
+  if (!calibration) throw new Error('Keine geometrische Kalibrierung geladen.');
+  const description = JSON.stringify({ version: calibration.version, sourceWidth: calibration.field.width,
+    sourceHeight: calibration.field.height, spacing: calibration.field.spacing, nx: calibration.field.nx,
+    ny: calibration.field.ny, coefficients: Array.from(calibration.field.coefficients),
+    outputWidth: calibration.maps.outputWidth, outputHeight: calibration.maps.outputHeight,
+    origin: calibration.maps.origin, opticalConfiguration: element('opticalConfiguration').value.trim() });
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(description));
+  return Array.from(new Uint8Array(digest), value => value.toString(16).padStart(2, '0')).join('');
+}
+
+async function downloadBrightnessCalibration() {
+  if (!brightnessCalibration) return;
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(new Blob([encodeBrightnessCalibration(brightnessCalibration,
+    await brightnessGeometryIdentity())], { type: 'application/octet-stream' }));
+  link.download = `${(videoInfo?.name || 'brightness').replace(/\.[^.]+$/, '')}-brightness.rbright`; link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 0);
+}
+
+async function loadBrightnessCalibration(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const loaded = decodeBrightnessCalibration(bytes, { width: calibration.maps.outputWidth,
+    height: calibration.maps.outputHeight, geometryIdentity: await brightnessGeometryIdentity() });
+  await discardBrightnessSession();
+  brightnessCalibration = loaded;
+  const workerCalibration = { ...brightnessCalibration, gain: brightnessCalibration.gain.slice(), supported: brightnessCalibration.supported.slice() };
+  await computer.call('brightness-set', { calibration: workerCalibration }, [workerCalibration.gain.buffer, workerCalibration.supported.buffer]);
+  await frameReader.dispose(); trackingComputer.nativeMaps = null; drawBrightnessCalibration();
+  text('brightnessStatus', 'Geladenes Helligkeitsfeld ist aktiv.'); updateControls();
 }
 
 async function localGroupComposite(entries, bounds, maxFrames, edgeFeather, featherMask, baseMask, region) {
@@ -1759,10 +2245,29 @@ async function refitTrackingPath() {
   if (localEntries.length < 2) { text('trackingPathRefitInfo', 'Die Auswahl enthaelt zu wenige auswertbare Frames.'); return; }
   pathRefitBusy = true; pathRefitProposal = null; updatePathRefitControls();
   let searchProgress = { pass: 1, round: 1, attempted: 0, limit: 512 };
+  const refitStarted = performance.now();
+  let refitActivity = 'Lokaler Refit wird vorbereitet';
+  const showRefitActivity = activity => {
+    refitActivity = activity;
+    const elapsed = Math.floor((performance.now() - refitStarted) / 1000);
+    text('trackingPathRefitInfo', `${refitActivity} | aktiv seit ${elapsed} s`);
+    text('processingStatus', `${refitActivity} | ${elapsed} s`);
+  };
+  const refitHeartbeat = setInterval(() => showRefitActivity(refitActivity), 1000);
   const worker = new WorkerClient('/compute-worker.js', status => {
-    if (status.operation === 'local-refit') text('trackingPathRefitInfo', searchProgress.stage === 'group' ?
-      `Gruppenmatch ${status.pair}/${status.pairs}: Gruppe ${status.current} gegen ${status.reference}...` :
-      `Refit-Iteration ${searchProgress.pass}, Suchrunde ${searchProgress.round}, Paar ${searchProgress.attempted + status.pair}/${searchProgress.limit}: #${status.current} gegen #${status.reference}...`);
+    if (status.operation !== 'local-refit') return;
+    const scope = searchProgress.stage === 'group' ? 'Gruppenmatch' : `Refit-Iteration ${searchProgress.pass}, Suchrunde ${searchProgress.round}`;
+    const pair = searchProgress.stage === 'group' ? `${status.pair}/${status.pairs}` : `${searchProgress.attempted + (status.pair || 0)}/${searchProgress.limit}`;
+    const activity = status.stage === 'prepare' ? `${scope}: bereite Matcherbild ${status.image}/${status.images} vor${Number.isFinite(status.frame) ? ` (#${status.frame})` : ''}` :
+      status.stage === 'forward' ? `${scope} ${pair}: Vorwaertssuche ${status.attempt}/${status.attempts}, Radius ${status.radius} px` :
+      status.stage === 'feature-forward' ? `${scope} ${pair}: Feature-Fallback vorwaerts` :
+      status.stage === 'backward' ? `${scope} ${pair}: Rueckpruefung, Radius ${status.radius} px` :
+      status.stage === 'feature-backward' ? `${scope} ${pair}: Feature-Fallback rueckwaerts` :
+      `${scope} ${pair}: #${status.current} gegen #${status.reference}`;
+    showRefitActivity(activity);
+    const fraction = status.stage === 'prepare' ? 0.05 * status.image / status.images :
+      ((status.pair || 1) - 1 + (status.stage === 'backward' || status.stage === 'feature-backward' ? 0.8 : 0.3)) / Math.max(1, status.pairs || 1);
+    element('progress').value = Math.min(0.99, fraction);
   });
   try {
     const limits = { radius: Math.min(256, Math.max(64, number('trackingContextRadius', 32) * 4)),
@@ -1817,7 +2322,11 @@ async function refitTrackingPath() {
     pathRefitProposal.overlayReady = true;
     text('trackingPathRefitInfo', `${groupSeed.accepted}/${groupSeed.attempts} Gruppenmatches | ${completedPasses} Refit-Iterationen, ${totalMatches} Paarversuche | ${result.nodes} Frames, ${result.edges} Kanten (${result.localEdges} lokal, ${result.spatialEdges} raeumlich) | Lokal RMS ${fixed(result.localBeforeRms, 2)} -> ${fixed(result.localAfterRms, 2)} px | Netz RMS ${fixed(result.beforeRms, 2)} -> ${fixed(result.afterRms, 2)} px | Mischbild zeigt die Refit-Vorschau.`);
   } catch (error) { text('trackingPathRefitInfo', `Refit fehlgeschlagen: ${error.message}`); }
-  finally { worker.terminate(); pathRefitBusy = false; updatePathRefitControls(); }
+  finally {
+    clearInterval(refitHeartbeat);
+    worker.terminate(); pathRefitBusy = false; updatePathRefitControls();
+    text('processingStatus', 'Bereit');
+  }
 }
 
 async function discardTrackingPathRefit() {
@@ -1939,15 +2448,15 @@ async function loadPathOverlay(point) {
   if (trackingRunning || taskBusy) { text('trackingOverlayInfo', 'Verarbeitung pausieren und die Position erneut anklicken.'); return; }
   const previewFrames = pathRefitProposal?.overlayFrames ? new Set(pathRefitProposal.overlayFrames) : null;
   const candidates = sharpestFramesFirst(trackingPath.filter(item => !previewFrames || previewFrames.has(item.frame))
-    .map(item => trackingGeometry(item)).filter(geometry => geometry && (previewFrames || geometry.supports(point, trackingPixelAllowed))));
+    .map(item => trackingGeometry(item)).filter(geometry => geometry?.supports(point, trackingPixelAllowed)));
   if (!candidates.length) { text('trackingOverlayInfo', 'Keine Bilddaten an dieser Position.'); return; }
-  const supporting = previewFrames ? candidates : approximateTopFrames(candidates, maxFrames, trackingPixelAllowed, point);
+  const supporting = approximateTopFrames(candidates, maxFrames, trackingPixelAllowed, point);
   const corners = supporting.flatMap(geometry => geometry.corners);
   const minX = Math.floor(Math.min(...corners.map(p => p.x))), minY = Math.floor(Math.min(...corners.map(p => p.y)));
   const width = Math.ceil(Math.max(...corners.map(p => p.x))) - minX;
   const height = Math.ceil(Math.max(...corners.map(p => p.y))) - minY;
   const bounds = { minX, minY, width, height };
-  if (element('trackingUseWebGpu').checked && navigator.gpu) {
+  if (useWebGpu() && navigator.gpu) {
     const previous = overlayGpuIdle;
     let release;
     overlayGpuIdle = new Promise(resolve => { release = resolve; });
@@ -1961,6 +2470,7 @@ async function loadPathOverlay(point) {
       if (await WebGpuOverlay.needsTiles(calibration.maps, width, height)) {
         const tiled = await renderTiledOverlay({ maps: calibration.maps, width, height, minX, minY,
           geometries: supporting, pixelAllowed: trackingPixelAllowed, maxFrames, edgeFeather,
+          brightness: brightnessCalibration,
           decode: index => readTrackingFrame(index, { output: 'native' }), cancelled: () => request !== overlayRequest,
           progress: p => text('trackingOverlayInfo', `${positionLabel} | Kachel ${p.tileIndex + 1}/${p.tileCount} bis ${p.tileSize} px | Kandidat ${p.frameIndex + 1}/${p.frameCount}: #${p.frame} | Durchlauf ${p.framePass}/${p.plannedFramePasses} | WebGPU, Vollaufloesung`) });
         if (!tiled) return;
@@ -1972,7 +2482,8 @@ async function loadPathOverlay(point) {
         renderPathOverlay();
         return;
       }
-      overlay = await WebGpuOverlay.create(calibration.maps, width, height, minX, minY, trackingPixelAllowed, maxFrames, edgeFeather);
+      overlay = await WebGpuOverlay.create(calibration.maps, width, height, minX, minY, trackingPixelAllowed,
+        maxFrames, edgeFeather, brightnessCalibration);
       if (request !== overlayRequest) return;
       const setupMs = performance.now() - started;
       let frameMs = 0, decodeMs = 0, gpuMs = 0;
@@ -2230,7 +2741,7 @@ function trackingOptions() {
     sourceImageMask, imageMask: imageMask ? { ...imageMask, data: Array.from(imageMask.data) } : null,
     patchMask: !windowTracking() ? sourceImageMask : null,
     pattern: 'patches', patchSize, patchSearchRadius, threshold, rediscoverPatches: true,
-    useWebGpu: element('trackingUseWebGpu').checked };
+    useWebGpu: useWebGpu() };
 }
 
 async function runTracking(restart = false) {
@@ -2249,6 +2760,7 @@ async function runTracking(restart = false) {
   }
   message();
   if (restart) {
+    await discardBrightnessSession();
     clearTrackingResults(true); trackingNextIndex = start;
     trackingRunOptions = options;
     trackingProfile = { mode: options.mode, frames: 0, decodeMs: 0, sharpnessMs: 0, rgbaMs: 0, remapMs: 0, referenceMs: 0, workerTransferMs: 0, trackMs: 0, poseMs: 0,
@@ -2261,7 +2773,9 @@ async function runTracking(restart = false) {
     const nativeTracking = options.mode === 'window' && options.useWebGpu && (options.contextRecent > 0 || options.contextSpatial > 0);
     if (nativeTracking && trackingComputer.nativeMaps !== calibration.maps) {
       const { outputWidth, outputHeight, inverseX, inverseY, valid } = calibration.maps;
-      await trackingComputer.call('tracking-maps', { maps: { outputWidth, outputHeight, inverseX, inverseY, valid } });
+      await trackingComputer.call('tracking-maps', { maps: { outputWidth, outputHeight, inverseX, inverseY, valid,
+        brightness: brightnessCalibration ? { width: brightnessCalibration.width, height: brightnessCalibration.height,
+          gain: brightnessCalibration.gain } : null } });
       trackingComputer.nativeMaps = calibration.maps;
     }
     while (trackingRunning && trackingNextIndex <= end) {
@@ -2476,6 +2990,7 @@ video.addEventListener('error', () => message(`Videovorschau fehlgeschlagen (Med
 
 async function resetCalibration() {
   await computer.call('reset');
+  brightnessSession = null; brightnessRunning = false; brightnessPaused = false; brightnessCalibration = null;
   clearTrackingResults();
   calibration = null; frames = new Map(); snapshotFrames = []; snapshotParameters = null;
   observationDiagnostics = null; observationDiagnosticsDirty = true; geometrySelection = null;
@@ -2503,6 +3018,7 @@ element('videoFile').onchange = () => void task(async () => {
   if (calibration && (metadata.width !== calibration.field.width || metadata.height !== calibration.field.height)) {
     candidate.terminate(); throw new Error('Videoaufloesung passt nicht zur geladenen Kalibrierung.');
   }
+  await discardBrightnessSession();
   decoder.terminate(); decoder = candidate;
   video.pause(); if (videoUrl) URL.revokeObjectURL(videoUrl);
   videoUrl = URL.createObjectURL(file); video.src = videoUrl;
@@ -2603,6 +3119,10 @@ function updatePreviewAdjustments(save = true) {
   if (save) saveVideoOptions();
 }
 for (const id of ['previewBrightness', 'previewContrast', 'previewGamma']) element(id).oninput = updatePreviewAdjustments;
+element('globalUseWebGpu').onchange = async () => {
+  await frameReader.dispose();
+  trackingComputer.nativeMaps = null;
+};
 element('resetPreviewAdjustments').onclick = () => {
   element('previewBrightness').value = 0;
   element('previewContrast').value = 100;
@@ -2664,6 +3184,23 @@ for (const button of document.querySelectorAll('[data-workflow]')) button.onclic
     if (!trackingPreviewImage.width) void previewTrackingStartFrame();
     if (!trackingMaskPreview.width) void loadTrackingMaskPreview();
   }
+  if (workflow === 'brightness') drawBrightnessCalibration();
+  if (workflow === 'merge') { updateMergeControls(); void updateMergeTilePlan(); }
+};
+element('mergeStart').onclick = () => void startMerge().catch(error => message(error.message, true));
+element('mergeCancel').onclick = () => { mergeCancelled = true; text('mergeStatus', 'Breche nach dem laufenden GPU-Durchlauf ab...'); };
+for (const id of ['mergeBlend', 'mergeMaxFrames', 'mergeEdgeFeather']) element(id).onchange = updateMergeControls;
+element('brightnessFit').onclick = () => void task(() => fitBrightnessCalibration(true)).catch(error => message(error.message, true));
+element('brightnessPause').onclick = () => { brightnessRunning = false; brightnessPaused = true; updateControls(); };
+element('brightnessResume').onclick = () => void task(() => fitBrightnessCalibration(false)).catch(error => message(error.message, true));
+element('brightnessReset').onclick = () => void task(resetBrightnessCalibration).catch(error => message(error.message, true));
+element('brightnessDisable').onclick = () => void task(disableBrightnessCalibration).catch(error => message(error.message, true));
+element('brightnessSave').onclick = () => void task(downloadBrightnessCalibration).catch(error => message(error.message, true));
+element('brightnessLoad').onclick = () => element('brightnessFile').click();
+element('brightnessFile').onchange = event => {
+  const [file] = event.target.files;
+  if (file) void task(() => loadBrightnessCalibration(file)).catch(error => message(error.message, true));
+  event.target.value = '';
 };
 element('trackingStartButton').onclick = () => void runTracking(true).catch(error => {
   message(error.message, true); trackingRunning = false; updateControls();
@@ -2672,7 +3209,12 @@ element('trackingPauseButton').onclick = () => { trackingRunning = false; tracki
 element('trackingResumeButton').onclick = () => void runTracking(false).catch(error => {
   message(error.message, true); trackingRunning = false; updateControls();
 });
-element('trackingResetButton').onclick = () => { clearTrackingResults(); void previewTrackingStartFrame(); void loadTrackingMaskPreview(); };
+element('trackingResetButton').onclick = () => void (async () => {
+  await discardBrightnessSession();
+  clearTrackingResults();
+  void previewTrackingStartFrame();
+  void loadTrackingMaskPreview();
+})().catch(error => message(error.message, true));
 element('trackingExportButton').onclick = () => {
   const header = 'frame,timestamp_us,x_px,y_px,rotation_deg,raw_x_px,raw_y_px,raw_rotation_deg,patches,rms_px';
   const rows = trackingPath.filter(entry => entry.pose).map(entry => [entry.frame, entry.timestamp, entry.pose.x, entry.pose.y,
@@ -2808,11 +3350,14 @@ element('importButton').onclick = () => {
 element('calibrationFile').onchange = () => void task(async () => {
   const file = element('calibrationFile').files[0]; if (!file) return;
   if (calibration && !confirm('Aktuelle Kalibrierung durch das ausgewaehlte Paket ersetzen?')) return;
+  await discardBrightnessSession();
   if (file.size > 768 * 1024 * 1024) throw new Error('Paket groesser als 768 MiB.');
   const bytes = new Uint8Array(await file.arrayBuffer());
   const imported = await computer.call('import', { bytes }, [bytes.buffer]);
   const videoNameMismatch = videoInfo && imported.video?.name !== videoInfo.name;
   calibration = imported.calibration;
+  brightnessCalibration = imported.brightness;
+  await frameReader.dispose(); trackingComputer.nativeMaps = null;
   clearTrackingResults();
   restoreTracking(imported.tracking);
   applyParameters(imported.parameters);
@@ -2824,15 +3369,22 @@ element('calibrationFile').onchange = () => void task(async () => {
   phaseStarted = true; phaseChecked = [...frames.values()].some(frame => frame.accepted);
   stale = invalidMaskPoints > 0; detectionsStale = false; rectifiedReady = false; detections.clear(); currentDetection = null;
   nextProcessingIndex = 0; measurements = [];
+  if (brightnessCalibration) drawBrightnessCalibration();
+  else {
+    text('brightnessState', 'Kein Feld'); element('brightnessState').className = 'tag';
+    text('brightnessMetrics', 'Keine Messung'); drawBrightnessCalibration();
+  }
   renderFieldImages(); updateTable(); updateMetrics(); updateControls(); draw();
   message(invalidMaskPoints ? `Kalibrierung geladen. ${invalidMaskPoints} gespeicherte Patch-Vektoren beruehrten die rote Maske und wurden verworfen; neu fitten erforderlich.` :
     videoNameMismatch ? 'Kalibrierung geladen. Der Videodateiname weicht ab; Video und Kalibrierungsdaten bleiben erhalten.' :
+    brightnessCalibration ? 'Kalibrierung geladen. Geometrie und Helligkeitskorrektur sind aktiv.' :
     'Kalibrierung geladen. Feld und Metadaten sind lokal verfuegbar.');
   setTimeout(() => { void loadTrackingMaskPreview(); }, 0);
 });
 element('infoButton').onclick = () => element('infoDialog').showModal();
 element('closeInfo').onclick = () => element('infoDialog').close();
 installPan(rawCanvas); installPan(resultCanvas);
+installMergePreviewInteraction();
 installTrackingPreviewInteraction();
 installPathInteraction();
 installTrackingMaskInteraction();

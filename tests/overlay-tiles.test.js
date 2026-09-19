@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { overlayTiles, overlayTileSize } from '../src/overlay-tiles.js';
+import { frameGeometry } from '../src/path-support.js';
 
 test('tile size uses larger power-of-two tiles within texture and memory limits', () => {
   assert.equal(overlayTileSize({ outputWidth: 4096, outputHeight: 3072 }, 8192), 4096);
@@ -24,4 +25,15 @@ test('tile selection includes bilinear edge footprints and skips distant frames'
   const tiles=overlayTiles(8,4,0,0,[near,far],4);
   assert.equal(tiles.length,2);
   for(const tile of tiles)assert.deepEqual(tile.geometries,[near]);
+});
+
+test('merge tile selection keeps only locally useful sharp frames', () => {
+  const maps = { outputWidth: 256, outputHeight: 256, valid: new Uint8Array(256 * 256).fill(255) };
+  const geometry = (frame, score, left) => frameGeometry({ frame, mode: 'window', sharpness: { score },
+    pose: { x: left + 128, y: 128, rotation: 0 } }, {}, maps);
+  const geometries = [geometry(0, 50, 0), geometry(1, 40, 0), geometry(2, 30, 0),
+    geometry(3, 20, 0), geometry(4, 10, 300)];
+  const tiles = overlayTiles(512, 64, 64, 64, geometries, 64, { maxFrames: 2, edgeFeather: 0 });
+  const interior = tiles.filter(tile => tile.x === 0 || tile.x === 320);
+  assert.deepEqual(interior.map(tile => tile.geometries.map(item => item.entry.frame)), [[0, 1, 2], [4]]);
 });

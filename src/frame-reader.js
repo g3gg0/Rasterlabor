@@ -3,17 +3,17 @@ import { WebGpuRemapper } from './webgpu-native-remapper.js';
 // One entry point for decoded frames. Returned frames/bitmaps belong to the caller;
 // intermediate native surfaces and GPU allocations belong to this reader.
 export class FrameReader {
-  constructor({ getDecoder, getMaps, computer, onFallback = () => {} }) {
-    Object.assign(this, { getDecoder, getMaps, computer, onFallback });
+  constructor({ getDecoder, getMaps, getBrightness = () => null, computer, onFallback = () => {} }) {
+    Object.assign(this, { getDecoder, getMaps, getBrightness, computer, onFallback });
     this.pending = Promise.resolve();
   }
 
   read(index, options = {}) {
     // Serialize access to the decoder and reusable render/readback surfaces.
-    const decoder = this.getDecoder(), maps = this.getMaps();
+    const decoder = this.getDecoder(), maps = this.getMaps(), brightness = options.brightness === false ? null : this.getBrightness();
     const run = this.pending.then(() => {
-      if (decoder !== this.getDecoder() || maps !== this.getMaps()) throw new Error('Video oder Kalibrierung wurde waehrend des Frameabrufs gewechselt.');
-      return this.readFrame(decoder, maps, index, options);
+      if (decoder !== this.getDecoder() || maps !== this.getMaps() || brightness !== (options.brightness === false ? null : this.getBrightness())) throw new Error('Video, Kalibrierung oder Helligkeitsfeld wurde waehrend des Frameabrufs gewechselt.');
+      return this.readFrame(decoder, maps, brightness, index, options);
     });
     this.pending = run.catch(() => {});
     return run;
@@ -29,12 +29,12 @@ export class FrameReader {
     return context.getImageData(0, 0, bitmap.width, bitmap.height);
   }
 
-  async readFrame(decoder, maps, index, { gpu = false, rectified = false, output = 'bitmap' } = {}) {
+  async readFrame(decoder, maps, brightness, index, { gpu = false, rectified = false, output = 'bitmap', brightness: applyBrightness = true } = {}) {
     if (!['bitmap', 'rgba', 'native'].includes(output)) throw new Error(`Unbekanntes Frameformat: ${output}`);
     if (rectified && (!maps || output === 'native')) throw new Error('Entzerrte Frames benoetigen Maps und Bitmap- oder RGBA-Ausgabe.');
-    if (this.decoder !== decoder || this.maps !== maps) {
+    if (this.decoder !== decoder || this.maps !== maps || this.brightness !== brightness) {
       this.renderer?.destroy(); this.renderer = null; this.gpuFailed = false;
-      this.decoder = decoder; this.maps = maps;
+      this.decoder = decoder; this.maps = maps; this.brightness = brightness;
     }
     if (!gpu || output === 'native') {
       this.renderer?.destroy(); this.renderer = null;
@@ -84,7 +84,7 @@ export class FrameReader {
     }
     if (gpu && rectified && !this.gpuFailed) {
       try {
-        this.renderer ??= await WebGpuRemapper.create(maps);
+        this.renderer ??= await WebGpuRemapper.create(maps, brightness);
       } catch (error) {
         this.gpuFailed = true; this.onFallback(error);
       }
@@ -115,7 +115,7 @@ export class FrameReader {
     timing.rgbaMs = performance.now() - started;
     if (rectified) {
       started = performance.now();
-      image = await this.computer.call('remap', { image, useWebGpu: false }, [image.data.buffer]);
+      image = await this.computer.call('remap', { image, useWebGpu: false, brightness: applyBrightness }, [image.data.buffer]);
       timing.remapMs += performance.now() - started;
     }
     const metadata = { index, timestamp: decoded.timestamp, color: decoded.color,

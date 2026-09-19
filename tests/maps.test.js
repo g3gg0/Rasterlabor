@@ -51,7 +51,11 @@ test('dense inverse, coverage mask, signed forward coordinates and lossless ZIP 
   assert.ok(rectified.data.some(value => value === 200));
   const tracking = { format: 'rasterlabor-xyr-tracking', model_version: 1,
     path: [{ frame: 12, timestamp: 400000, pose: { x: 1.25, y: -2.5, rotation: 0.01 } }] };
-  const packed = exportCalibration(calibration, frames, { name: 'test.mp4' }, { gridMm: null }, 'synthetic', tracking);
+  const brightness = { version: 2, width: calibration.maps.outputWidth, height: calibration.maps.outputHeight,
+    gain: new Float32Array(calibration.maps.outputWidth * calibration.maps.outputHeight).fill(1.125),
+    supported: new Uint8Array(calibration.maps.outputWidth * calibration.maps.outputHeight).fill(255),
+    model: { representation: 'checkerboard-white-field' }, metrics: { validationRms: 0.03 } };
+  const packed = exportCalibration(calibration, frames, { name: 'test.mp4' }, { gridMm: null }, 'synthetic', tracking, brightness);
   const restored = importCalibration(packed);
   assert.equal(restored.metadata.mm_per_pixel, null);
   assert.equal(restored.metadata.dpi, null);
@@ -62,16 +66,26 @@ test('dense inverse, coverage mask, signed forward coordinates and lossless ZIP 
     { cols: calibration.maps.coverageGrid.cols, rows: calibration.maps.coverageGrid.rows });
   assert.deepEqual(restored.observations, frames);
   assert.deepEqual(restored.tracking, tracking);
+  assert.deepEqual(restored.brightness.gain, brightness.gain);
+  assert.deepEqual(restored.brightness.supported, brightness.supported);
+  assert.deepEqual(restored.brightness.model, brightness.model);
+  assert.deepEqual(restored.brightness.metrics, brightness.metrics);
   const savedAgain = importCalibration(exportCalibration(restored.calibration, restored.observations,
     restored.video, restored.parameters, restored.opticalConfiguration, restored.tracking));
   assert.deepEqual(savedAgain.tracking, tracking);
   const withoutTracking = exportCalibration(calibration, frames, {}, { gridMm: null }, '');
   assert.equal(unzipSync(withoutTracking)['tracking.json'], undefined);
+  assert.equal(unzipSync(withoutTracking)['brightness-gain.bin'], undefined);
   const emptyTracking = exportCalibration(calibration, frames, {}, { gridMm: null }, '', { ...tracking, path: [] });
   assert.equal(unzipSync(emptyTracking)['tracking.json'], undefined);
   const damaged = unzipSync(packed);
   damaged['tracking.json'] = strToU8(JSON.stringify({ ...tracking, path: [tracking.path[0], tracking.path[0]] }));
   assert.throws(() => importCalibration(zipSync(damaged)), /Trackingframe/);
+  const damagedBrightness = unzipSync(packed);
+  const damagedMetadata = JSON.parse(new TextDecoder().decode(damagedBrightness['metadata.json']));
+  damagedMetadata.brightness.width++;
+  damagedBrightness['metadata.json'] = strToU8(JSON.stringify(damagedMetadata));
+  assert.throws(() => importCalibration(zipSync(damagedBrightness)), /Helligkeitsfeld/);
   for (let index = 0; index < calibration.maps.valid.length; index += 19) {
     if (!calibration.maps.valid[index]) continue;
     const point = evaluate(field, calibration.maps.inverseX[index], calibration.maps.inverseY[index]);

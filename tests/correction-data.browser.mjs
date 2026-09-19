@@ -45,21 +45,29 @@ try {
     rectangle: { x: null, y: null, width: 10, height: 10 },
     path: [{ frame: 12, timestamp_us: 400000, x_px: 1.25, y_px: -2.5, rotation_deg: 90,
       raw_x_px: 2, raw_y_px: -3, raw_rotation_deg: 45, patches: 1, rms_px: null }] };
-  for (const dataset of [tracking, legacy, null]) {
-    const files = unzipSync(exportCalibration(calibration, frames, { name: 'test.mp4' }, { gridMm: null, approxStep: 7 }, ''));
+  const brightness = { version: 1, width: calibration.maps.outputWidth, height: calibration.maps.outputHeight,
+    gain: new Float32Array(calibration.maps.outputWidth * calibration.maps.outputHeight).fill(1.05),
+    supported: new Uint8Array(calibration.maps.outputWidth * calibration.maps.outputHeight).fill(255),
+    model: { representation: 'checkerboard-white-field' }, metrics: { accelerator: 'CPU', trainingFrames: 1,
+      validationFrames: 1, framePairs: 1, equations: 1, baselineValidationRms: 0.1, validationRms: 0.05, covered: 1 } };
+  for (const [dataset, embeddedBrightness] of [[tracking, brightness], [legacy, null], [null, null]]) {
+    const files = unzipSync(exportCalibration(calibration, frames, { name: 'test.mp4' }, { gridMm: null, approxStep: 7 }, '', null,
+      embeddedBrightness));
     if (dataset) files['tracking.json'] = strToU8(JSON.stringify(dataset));
     const bytes = zipSync(files);
     await page.locator('#calibrationFile').setInputFiles({ name: 'test.zip', mimeType: 'application/zip', buffer: Buffer.from(bytes) });
     await page.waitForFunction(() => document.querySelector('#exportButton').disabled === false);
     assert.equal(await page.locator('#lensDataStatus').evaluate(el => el.classList.contains('present')), true);
     assert.equal(await page.locator('#trackingDataStatus').evaluate(el => el.classList.contains('present')), Boolean(dataset));
-    assert.equal(await page.locator('#brightnessDataStatus').evaluate(el => el.classList.contains('present')), false);
+    assert.equal(await page.locator('#brightnessDataStatus').evaluate(el => el.classList.contains('present')), Boolean(embeddedBrightness));
     const downloadPromise = page.waitForEvent('download');
     await page.locator('#exportButton').click();
     const download = await downloadPromise;
     const restored = importCalibration(new Uint8Array(await readFile(await download.path())));
     assert.deepEqual(restored.observations[0].sharpness, sharpness);
     assert.deepEqual(restored.tracking?.path ?? null, validateTracking(dataset)?.path ?? null);
+    assert.deepEqual(restored.brightness?.gain ?? null, embeddedBrightness?.gain ?? null);
+    assert.deepEqual(restored.brightness?.supported ?? null, embeddedBrightness?.supported ?? null);
   }
   await page.setViewportSize({ width: 390, height: 844 });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);

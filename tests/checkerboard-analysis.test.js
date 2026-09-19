@@ -55,6 +55,7 @@ test('checkerboard area uses measured quadrilaterals and maximum-relative statis
   const points = [0, 1].flatMap(row => [0, 1, 2].map(col => ({ col, row, x: col === 2 ? 25 : col * 10, y: row * 10 })));
   const cells = checkerboardCells(points); const summary = summarizeCheckerboard(cells);
   assert.deepEqual(cells.map(cell => cell.area), [100, 150]);
+  assert.deepEqual(cells.map(cell => [cell.col, cell.row]), [[0, 0], [1, 0]]);
   assert.equal(summary.mean, 125); assert.equal(summary.deviation, 25);
   assert.equal(cells[0].relativeDeviation, 1 / 3); assert.equal(cells[1].relativeDeviation, 0);
   assert.equal(checkerboardCells(points.slice(1)).length, 1);

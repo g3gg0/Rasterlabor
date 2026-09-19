@@ -14,8 +14,12 @@ import { buildInverseMapsGpu, mapBuilderGpuStatus } from './webgpu-map-builder.j
 import { createSpline } from './spline.js';
 import { optimizePoseGraph } from './pose-graph-refit.js';
 import { registerFeatureOverlap } from './feature-overlap.js';
+import { applyBrightnessCalibration, fitBrightnessCalibration } from './brightness-calibration.js';
+import { createPixelBrightnessJob } from './webgpu-pixel-brightness.js';
 
 let calibration = null;
+let brightnessCalibration = null;
+let brightnessJob = null;
 let cancelled = false;
 let active = false;
 const patchTracker = new PatchTracker();
@@ -76,20 +80,26 @@ self.onmessage = async ({ data }) => {
     else if (data.type === 'local-refit-register') {
       const images = new Map();
       try {
-        for (const item of data.images) images.set(item.frame, {
-          ...item, image: contextImage(imageFromBitmap(item.bitmap), item.mask ?? data.mask, data.preprocessing)
-        });
+        for (const [index, item] of data.images.entries()) {
+          progress({ operation: 'local-refit', stage: 'prepare', image: index + 1, images: data.images.length, frame: item.frame });
+          images.set(item.frame, {
+            ...item, image: contextImage(imageFromBitmap(item.bitmap), item.mask ?? data.mask, data.preprocessing)
+          });
+        }
         result = [];
         for (const [index, pair] of data.pairs.entries()) {
           if (cancelled) throw new Error('Lokaler Refit abgebrochen.');
           const current = images.get(pair.current); const reference = images.get(pair.reference);
           if (!current || !reference) continue;
-          progress({ operation: 'local-refit', pair: index + 1, pairs: data.pairs.length,
+          progress({ operation: 'local-refit', stage: 'pair', pair: index + 1, pairs: data.pairs.length,
             current: current.frame, reference: reference.frame });
           let forward;
           let forwardSeed = current.pose;
           const attempts = [];
-          for (const radius of contextSearchRadii(data.limits.radius, current.image.width, current.image.height, 'spatial', 1.05)) {
+          const radii = contextSearchRadii(data.limits.radius, current.image.width, current.image.height, 'spatial', 1.05);
+          for (const [attempt, radius] of radii.entries()) {
+            progress({ operation: 'local-refit', stage: 'forward', pair: index + 1, pairs: data.pairs.length,
+              current: current.frame, reference: reference.frame, attempt: attempt + 1, attempts: radii.length, radius });
             forward = registerOverlap(current.image, reference.image, forwardSeed, reference.pose,
               { ...data.limits, radius, coarseStep: radius > data.limits.radius ? data.limits.radius : 0,
                 coarseRadiusFactor: 1.05, partial: true });
@@ -104,18 +114,24 @@ self.onmessage = async ({ data }) => {
               forward.pose && [forward.pose.x, forward.pose.y, forward.pose.rotation].every(Number.isFinite)) forwardSeed = forward.pose;
           }
           if (!forward.accepted) {
+            progress({ operation: 'local-refit', stage: 'feature-forward', pair: index + 1, pairs: data.pairs.length,
+              current: current.frame, reference: reference.frame });
             const feature = boundedFeatureMatch(registerFeatureOverlap(current.image, reference.image, reference.pose),
               current.pose, data.limits, current.image.width, current.image.height);
             if (feature.accepted) forward = { ...feature, attempts, fallbackFor: forward };
             else forward.featureFallback = feature;
           }
           const reverseRadius = Math.min(32, data.limits.reverseRadius ?? data.limits.radius);
+          if (usableLocalMatch(forward)) progress({ operation: 'local-refit', stage: 'backward', pair: index + 1, pairs: data.pairs.length,
+            current: current.frame, reference: reference.frame, radius: reverseRadius });
           let backward = usableLocalMatch(forward) ? registerOverlap(reference.image, current.image, reference.pose, forward.pose,
             { radius: reverseRadius, angle: data.limits.angle, coarseStep: 0, partial: true }) : null;
           if (!backward?.accepted && backward?.reason === 'Mehrdeutig' && backward.score >= 0.93) {
             backward = { ...backward, conditionallyAccepted: true };
           }
           if (usableLocalMatch(forward) && !backward?.accepted) {
+            progress({ operation: 'local-refit', stage: 'feature-backward', pair: index + 1, pairs: data.pairs.length,
+              current: current.frame, reference: reference.frame });
             const feature = boundedFeatureMatch(registerFeatureOverlap(reference.image, current.image, forward.pose),
               reference.pose, data.limits, current.image.width, current.image.height);
             if (feature.accepted) backward = { ...feature, fallbackFor: backward };
@@ -287,10 +303,45 @@ self.onmessage = async ({ data }) => {
       }
       if (result) result.accelerator = 'WebGPU';
       else { result = remapRGBA(data.image, calibration.maps); result.accelerator = 'CPU'; }
+      if (data.brightness !== false && brightnessCalibration) applyBrightnessCalibration(result, brightnessCalibration);
       result.processingMs = performance.now() - started;
       transfer = [result.data.buffer];
+    } else if (data.type === 'brightness-pixel-start') {
+      brightnessJob?.dispose();
+      brightnessJob = null;
+      brightnessJob = await createPixelBrightnessJob(data.options);
+      result = { accelerator: brightnessJob.accelerator, fallbackReason: brightnessJob.fallbackReason };
+    } else if (data.type === 'brightness-pixel-discard') {
+      brightnessJob?.dispose();
+      brightnessJob = null;
+      result = true;
+    } else if (data.type.startsWith('brightness-pixel-')) {
+      if (!brightnessJob) throw new Error('Kein aktiver pixelweiser Helligkeitslauf.');
+      if (data.type === 'brightness-pixel-prepare') result = brightnessJob.prepare(data.indices);
+      else if (data.type === 'brightness-pixel-frame') { brightnessJob.store(data.index, data.gray); result = true; }
+      else if (data.type === 'brightness-pixel-pair') result = await brightnessJob.addPair(data);
+      else if (data.type === 'brightness-pixel-normalize') result = await brightnessJob.normalize();
+      else if (data.type === 'brightness-pixel-validation-reset') { brightnessJob.resetValidation(); result = true; }
+      else if (data.type === 'brightness-pixel-snapshot') {
+        result = await brightnessJob.finish(data.metrics);
+        transfer = [result.gain.buffer, result.supported.buffer];
+      }
+      else if (data.type === 'brightness-pixel-finish') {
+        result = await brightnessJob.finish(data.metrics);
+        transfer = [result.gain.buffer, result.supported.buffer];
+        brightnessJob.dispose();
+        brightnessJob = null;
+      } else throw new Error(`Unbekannter Helligkeitsauftrag: ${data.type}`);
+    } else if (data.type === 'brightness-fit') {
+      result = fitBrightnessCalibration(data.frames, data.options, progress);
+      brightnessCalibration = null;
+      transfer = [result.gain.buffer, result.supported.buffer];
+    } else if (data.type === 'brightness-set') {
+      brightnessCalibration = data.calibration ?? null;
+      result = true;
     } else if (data.type === 'export') {
-      result = exportCalibration(calibration, data.frames, data.video, data.parameters, data.opticalConfiguration, data.tracking);
+      result = exportCalibration(calibration, data.frames, data.video, data.parameters, data.opticalConfiguration,
+        data.tracking, brightnessCalibration);
       transfer = [result.buffer];
     } else if (data.type === 'import') {
       const imported = importCalibration(data.bytes);
@@ -298,12 +349,20 @@ self.onmessage = async ({ data }) => {
       if (!geometry.valid) throw new Error(`Geladenes Feld ungueltig: ${geometry.reason}`);
       patchTracker.reset();
       calibration = imported.calibration;
+      brightnessCalibration = imported.brightness;
       const response = calibrationTransferCopy(calibration);
-      result = { ...imported, calibration: response.value };
+      const brightness = brightnessCalibration ? { ...brightnessCalibration,
+        gain: brightnessCalibration.gain.slice(), supported: brightnessCalibration.supported.slice() } : null;
+      result = { ...imported, calibration: response.value, brightness };
       transfer = response.transfer;
-    } else if (data.type === 'reset') { calibration = null; trackingMaps = null; patchTracker.reset(); windowTracker.reset(); contextTracker.reset(); contextDetection = null; gpuRemapper.reset(); result = true; }
+      if (brightness) transfer.push(brightness.gain.buffer, brightness.supported.buffer);
+    } else if (data.type === 'reset') { calibration = null; brightnessCalibration = null; brightnessJob?.dispose(); brightnessJob = null; trackingMaps = null; patchTracker.reset(); windowTracker.reset(); contextTracker.reset(); contextDetection = null; gpuRemapper.reset(); result = true; }
     else throw new Error(`Unbekannter Workerauftrag: ${data.type}`);
     self.postMessage({ id: data.id, result }, transfer);
-  } catch (error) { self.postMessage({ id: data.id, error: error.message }); }
+  } catch (error) {
+    const gpuBrightness = data.type.startsWith('brightness-pixel-') && brightnessJob?.accelerator === 'WebGPU';
+    const message = gpuBrightness && !error.message.startsWith('WebGPU-Helligkeit:') ? `WebGPU-Helligkeit: ${error.message}` : error.message;
+    self.postMessage({ id: data.id, error: message });
+  }
   finally { data.native?.frame?.close(); active = false; }
 };
