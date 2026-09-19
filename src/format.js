@@ -1,4 +1,6 @@
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate';
+import { validateTracking } from './tracking-data.js';
+import { validSharpness } from './sharpness.js';
 
 const limit = 768 * 1024 * 1024;
 const littleEndian = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
@@ -16,6 +18,7 @@ function bytesFor(array) {
 }
 
 export function exportCalibration(calibration, observations, video, parameters, opticalConfiguration, tracking = null) {
+  tracking = validateTracking(tracking);
   if (!calibration?.maps) throw new Error('Keine konsistente Kalibrierung zum Speichern vorhanden.');
   const { field, maps } = calibration;
   const arrays = { coefficients: field.coefficients, forward: maps.forward, inverseX: maps.inverseX, inverseY: maps.inverseY,
@@ -100,6 +103,7 @@ export function importCalibration(bytes) {
     if (!Number.isSafeInteger(frame.id) || !Number.isFinite(frame.timestamp) || !['train', 'validation'].includes(frame.role) || !Array.isArray(frame.points)) {
       throw new Error('Ungueltiger Beobachtungsframe.');
     }
+    if (frame.sharpness != null && !validSharpness(frame.sharpness)) throw new Error('Ungueltige Schaerfemessung im Beobachtungsframe.');
     for (const point of frame.points) {
       if (!(Number.isFinite(point.x) && Number.isFinite(point.y) && point.x >= 0 && point.y >= 0 &&
         point.x < metadata.source_width && point.y < metadata.source_height && Number.isFinite(point.col) && Number.isFinite(point.row) &&
@@ -145,7 +149,7 @@ export function importCalibration(bytes) {
       roundtrip: metadata.roundtrip } };
   const parameters = { ...metadata.parameters, ...(patchMask ? { patchMask } : {}) };
   calibration.parameters = parameters;
-  const tracking = files['tracking.json'] ? JSON.parse(strFromU8(files['tracking.json'])) : null;
+  const tracking = files['tracking.json'] ? validateTracking(JSON.parse(strFromU8(files['tracking.json'])), metadata.video) : null;
   return { calibration, observations, video: metadata.video, parameters,
     opticalConfiguration: metadata.optical_configuration, tracking, metadata };
 }

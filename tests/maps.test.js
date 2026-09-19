@@ -20,7 +20,20 @@ test('relative coverage stretches observed counts without coloring unknown areas
   }
 });
 import { exportCalibration, importCalibration } from '../src/format.js';
-import { createPatchMask, MASK_FORBIDDEN, MASK_SEARCH, paintPatchMask } from '../src/patch-mask.js';
+import { unzipSync, zipSync, strToU8 } from 'fflate';
+import { createPatchMask, MASK_FORBIDDEN, MASK_SEARCH, paintPatchMask, remapInclusionMask } from '../src/patch-mask.js';
+
+test('raw-frame inclusion masks follow inverse maps into rectified coordinates', () => {
+  const source = createPatchMask(8, 4, 1);
+  source.data[1 * source.width + 5] = MASK_SEARCH;
+  source.revision = 7;
+  const maps = { outputWidth: 2, outputHeight: 2,
+    inverseX: new Float32Array([5, 1, 5, 5]), inverseY: new Float32Array([1, 1, 1, 1]),
+    valid: new Uint8Array([1, 1, 0, 1]) };
+  const target = remapInclusionMask(source, maps);
+  assert.deepEqual([...target.data], [MASK_SEARCH, 0, 0, MASK_SEARCH]);
+  assert.deepEqual([target.sourceWidth, target.sourceHeight, target.cellSize, target.revision], [2, 2, 1, 7]);
+});
 
 test('dense inverse, coverage mask, signed forward coordinates and lossless ZIP roundtrip', async () => {
   const field = createSpline(48, 40, 24, [1, 0.04, 0, 1, -10, -8]);
@@ -49,6 +62,16 @@ test('dense inverse, coverage mask, signed forward coordinates and lossless ZIP 
     { cols: calibration.maps.coverageGrid.cols, rows: calibration.maps.coverageGrid.rows });
   assert.deepEqual(restored.observations, frames);
   assert.deepEqual(restored.tracking, tracking);
+  const savedAgain = importCalibration(exportCalibration(restored.calibration, restored.observations,
+    restored.video, restored.parameters, restored.opticalConfiguration, restored.tracking));
+  assert.deepEqual(savedAgain.tracking, tracking);
+  const withoutTracking = exportCalibration(calibration, frames, {}, { gridMm: null }, '');
+  assert.equal(unzipSync(withoutTracking)['tracking.json'], undefined);
+  const emptyTracking = exportCalibration(calibration, frames, {}, { gridMm: null }, '', { ...tracking, path: [] });
+  assert.equal(unzipSync(emptyTracking)['tracking.json'], undefined);
+  const damaged = unzipSync(packed);
+  damaged['tracking.json'] = strToU8(JSON.stringify({ ...tracking, path: [tracking.path[0], tracking.path[0]] }));
+  assert.throws(() => importCalibration(zipSync(damaged)), /Trackingframe/);
   for (let index = 0; index < calibration.maps.valid.length; index += 19) {
     if (!calibration.maps.valid[index]) continue;
     const point = evaluate(field, calibration.maps.inverseX[index], calibration.maps.inverseY[index]);

@@ -67,20 +67,22 @@ export class VideoExporter {
     const started = performance.now();
     if (this.failure) throw this.failure;
     if (width !== this.sourceWidth || height !== this.sourceHeight) throw new Error('Frameaufloesung weicht von der Exportmap ab.');
-    const pixels = data instanceof Uint8ClampedArray ? data : new Uint8ClampedArray(data.buffer, data.byteOffset, data.byteLength);
+    const bitmap = typeof ImageBitmap !== 'undefined' && data instanceof ImageBitmap;
+    const pixels = bitmap ? null : data instanceof Uint8ClampedArray ? data : new Uint8ClampedArray(data.buffer, data.byteOffset, data.byteLength);
     let frame;
     let direct = true;
     try {
-      frame = new VideoFrame(pixels, { format: 'RGBA', codedWidth: width, codedHeight: height, timestamp, duration });
+      frame = bitmap ? new VideoFrame(data, {timestamp, duration}) : new VideoFrame(pixels, { format: 'RGBA', codedWidth: width, codedHeight: height, timestamp, duration });
     } catch {
       direct = false;
-      this.frameContext.putImageData(new ImageData(pixels, width, height), 0, 0);
+      if (bitmap) this.frameContext.drawImage(data, 0, 0);
+      else this.frameContext.putImageData(new ImageData(pixels, width, height), 0, 0);
       frame = new VideoFrame(this.frameCanvas, { timestamp, duration });
     }
     const frameMs = performance.now() - started;
     const submitStarted = performance.now();
-    this.encoder.encode(frame, { keyFrame: index % Math.max(1, Math.round(this.fps)) === 0 });
-    frame.close();
+    try { this.encoder.encode(frame, { keyFrame: index % Math.max(1, Math.round(this.fps)) === 0 }); }
+    finally { frame.close(); }
     const submitMs = performance.now() - submitStarted;
     const submitted = performance.now();
     if (this.encoder.encodeQueueSize > 4 || this.pendingPacketCount > 4) {

@@ -1,3 +1,4 @@
+import { applyLoopClosure, trackingReferenceCounts } from './tracking-data.js';
 import './style.css';
 import { createIcons, icons } from 'lucide';
 import { WorkerClient } from './rpc.js';
@@ -6,9 +7,17 @@ import { poseFor } from './solver.js';
 import { Field3DView } from './field-3d.js';
 import { VideoExporter } from './video-exporter.js';
 import { relativeCoverageScale } from './maps.js';
-import { createPatchMask, MASK_FORBIDDEN, MASK_NEUTRAL, MASK_SEARCH, paintPatchMask, patchAllowed, validatePointsAgainstMask } from './patch-mask.js';
+import { createPatchMask, MASK_FORBIDDEN, MASK_NEUTRAL, MASK_SEARCH, maskIncludes, paintPatchMask, patchAllowed, remapInclusionMask, validatePointsAgainstMask } from './patch-mask.js';
 import { analyzeObservations, selectConsistentFrames } from './observation-diagnostics.js';
 import { fitCameraPose, stabilizePose } from './motion-tracking.js';
+import { frameGeometry, localSelectionMask, localSelectionDistance, localSelectionSupport, supportColor, applyPixelMask, edgeFeatherMask, applyEdgeFeather, accumulateFrame, approximateTopFrames, averagedFrames, sharpestFramesFirst } from './path-support.js';
+import { FrameReader } from './frame-reader.js';
+import { installTrackingInspector } from './tracking-inspector.js';
+import { installCheckerboardView } from './checkerboard-view.js';
+import { WebGpuOverlay } from './webgpu-overlay.js';
+import { renderTiledOverlay, closeOverlayTiles } from './overlay-tiles.js';
+import { applyPoseCorrection, buildPoseGraph, localRefitGroups, searchLocalRefit } from './pose-graph-refit.js';
+import { refitColorMatrix } from './refit-preprocess.js';
 
 createIcons({ icons });
 const element = id => document.getElementById(id);
@@ -23,8 +32,6 @@ const coverageImage = document.createElement('canvas');
 const residualImage = document.createElement('canvas');
 const rectifiedImage = document.createElement('canvas');
 const observationImage = document.createElement('canvas');
-const conversionCanvas = new OffscreenCanvas(1, 1);
-const conversionContext = conversionCanvas.getContext('2d', { willReadFrequently: true });
 let decoder = new WorkerClient('/decoder-worker.js', showProgress);
 const computer = new WorkerClient('/compute-worker.js', showProgress);
 let trackingComputer = new WorkerClient('/compute-worker.js', showProgress);
@@ -32,7 +39,12 @@ let videoInfo = null;
 let expectedVideo = null;
 let videoUrl = null;
 let currentIndex = 0;
+let currentSharpness = null;
 let calibration = null;
+const frameReader = new FrameReader({ getDecoder: () => decoder, getMaps: () => calibration?.maps, computer,
+  onFallback: error => console.warn('FrameReader: CPU-Fallback:', error.message) });
+const readFrame = (index, options = {}) => frameReader.read(index, { gpu: element('useWebGpu').checked, ...options });
+const readTrackingFrame = (index, options = {}) => frameReader.read(index, { gpu: element('trackingUseWebGpu').checked, ...options });
 let snapshotFrames = [];
 let snapshotParameters = null;
 let frames = new Map();
@@ -69,16 +81,57 @@ let maskImageRevision = -1;
 const maskImage = document.createElement('canvas');
 const transforms = new Map();
 const previewFilter = 'url(#imageAdjustmentFilter)';
+const refitPreviewFilter = 'url(#refitAdjustmentFilter)';
+function drawAdjustedImage(context, image, ...coordinates) {
+  context.save();
+  try {
+    context.filter = previewFilter;
+    context.drawImage(image, ...coordinates);
+  } finally { context.restore(); }
+}
+
+function drawRefitPreviewImage(context, image, ...coordinates) {
+  context.save();
+  try {
+    context.filter = element('refitPreprocessPreview')?.checked ? refitPreviewFilter : previewFilter;
+    context.drawImage(image, ...coordinates);
+  } finally { context.restore(); }
+}
+
+function refitPreprocessing() {
+  return { brightness: number('refitBrightness', 0) / 100, contrast: number('refitContrast', 100) / 100,
+    gamma: number('refitGamma', 1), red: number('refitRed', 30), green: number('refitGreen', 59), blue: number('refitBlue', 11),
+    region: number('refitRegion', 40) / 100, edgeFeather: number('overlayEdgeFeather', 10) / 100 };
+}
+
+function updateRefitPreprocessing() {
+  const options = refitPreprocessing();
+  element('refitBrightnessValue').value = `${Math.round(options.brightness * 100)}`;
+  element('refitContrastValue').value = `${Math.round(options.contrast * 100)}%`;
+  element('refitGammaValue').value = options.gamma.toFixed(2);
+  element('refitRegionValue').value = `${Math.round(options.region * 100)}%`;
+  element('overlayEdgeFeatherValue').value = `${Math.round(options.edgeFeather * 100)}%`;
+  for (const channel of ['Red', 'Green', 'Blue']) element(`refit${channel}Value`).value = `${number(`refit${channel}`, 0)}`;
+  element('refitColorMatrix').setAttribute('values', refitColorMatrix(options));
+  const intercept = 0.5 - options.contrast * 0.5 + options.brightness;
+  for (const channel of ['Red', 'Green', 'Blue']) {
+    element(`refit${channel}Level`).setAttribute('slope', `${options.contrast}`);
+    element(`refit${channel}Level`).setAttribute('intercept', `${intercept}`);
+    element(`refit${channel}Gamma`).setAttribute('exponent', `${1 / options.gamma}`);
+  }
+  renderPathOverlay();
+}
 const trackingPreviewImage = document.createElement('canvas');
 let workflow = 'calibration';
 let trackingRunning = false;
 let trackingPaused = false;
 let trackingNextIndex = 0;
 let trackingPath = [];
+let trackingFailures = [];
+let trackingDataset = null;
 let trackingPreviewTransform = null;
 let trackingPreviewPoints = [];
 let trackingPreviewRequest = 0;
-let trackingPreviewTimer = null;
 let trackingProfile = null;
 let trackingZoom = 1;
 let trackingPan = { x: 0, y: 0 };
@@ -88,11 +141,92 @@ let selectingTrackingWindow = false;
 let trackingPreviewBusy = false;
 let trackingRunOptions = null;
 let trackingLost = false;
+let pathProject = null;
+let pathHover = null;
+let pathSelection = null;
+let overlayRequest = 0;
+let overlayGpuIdle = Promise.resolve();
+let pathOverlay = document.createElement('canvas');
+let overlayContributors = [];
+let overlayBounds = null;
+let overlaySelectedImage = null;
+let overlaySelectionRequest = 0;
+function clearPathOverlay() {
+  closeOverlayTiles(pathOverlay);
+  if (!pathOverlay.tiles) pathOverlay.width = pathOverlay.height = 0;
+  pathOverlay = document.createElement('canvas');
+  overlaySelectedImage?.bitmap.close();
+  overlaySelectedImage = null;
+  overlayContributors = [];
+  overlayBounds = null;
+  overlaySelectionRequest++;
+  const selector = element('trackingOverlayFrame');
+  selector.replaceChildren(new Option('Mischbild', ''));
+  selector.disabled = true;
+  element('trackingOverlayInspect').disabled = true;
+}
+let overlayZoom = 1;
+let overlayPan = { x: 0, y: 0 };
+let pathRefitProposal = null;
+let pathRefitBusy = false;
+let trackingImageMask = null;
+let trackingMaskHasSelection = false;
+let trackingMaskTool = 'include';
+let trackingMaskPreviewRequest = 0;
+const trackingMaskPreview = document.createElement('canvas');
+const trackingMaskPaintLayer = document.createElement('canvas');
+let trackingMaskTransform = null;
 const windowTracking = () => element('trackingMode').value === 'window';
+const checkerboardView = installCheckerboardView({ canvas: resultCanvas, redraw: () => draw(),
+  getState: () => ({ visible: view === 'rectified', ready: rectifiedReady && Boolean(calibration) && video.paused && !rectifiedPlayback && !taskBusy && !navigationBusy && !trackingRunning,
+    key: `${currentIndex}:${displayRevision}:${calibration?.version}`, image: rectifiedImage, step: calibration?.step }) });
+const trackingInspector = installTrackingInspector({ readFrame: readTrackingFrame,
+  getMask: () => (trackingRunOptions ?? trackingDataset?.options)?.imageMask ?? null,
+  busy: () => trackingRunning || trackingPreviewBusy || taskBusy,
+  drawImage: drawAdjustedImage });
+createIcons({ icons });
 const number = (id, fallback) => element(id).value === '' ? fallback : Number(element(id).value);
 const text = (id, value) => { element(id).textContent = value; };
 const fixed = (value, digits = 2) => Number.isFinite(value) ? value.toFixed(digits) : '-';
 const megabytes = bytes => `${(bytes / 1024 / 1024).toFixed(bytes >= 100 * 1024 * 1024 ? 0 : 1)} MB`;
+const APP_SETTINGS_KEY = 'app-settings';
+const videoSettingIds = ['previewBrightness', 'previewContrast', 'previewGamma', 'trackingMaskBrush', 'speed', 'overlay'];
+
+function storedAppSettings() {
+  try {
+    const settings = JSON.parse(localStorage.getItem(APP_SETTINGS_KEY) || '{}');
+    return settings && typeof settings === 'object' && !Array.isArray(settings) ? settings : {};
+  } catch { return {}; }
+}
+
+function restoreVideoOptions() {
+  const options = storedAppSettings().videoOptions;
+  if (!options || typeof options !== 'object' || Array.isArray(options)) return;
+  for (const id of videoSettingIds) {
+    const control = element(id), value = options[id];
+    if (control.type === 'checkbox') {
+      if (typeof value === 'boolean') control.checked = value;
+      continue;
+    }
+    if (typeof value !== 'string' && typeof value !== 'number') continue;
+    const candidate = String(value);
+    if (control instanceof HTMLSelectElement) {
+      if ([...control.options].some(option => option.value === candidate)) control.value = candidate;
+      continue;
+    }
+    const numeric = Number(candidate), minimum = Number(control.min), maximum = Number(control.max);
+    if (Number.isFinite(numeric) && (!control.min || numeric >= minimum) && (!control.max || numeric <= maximum)) control.value = candidate;
+  }
+}
+
+function saveVideoOptions() {
+  const settings = storedAppSettings();
+  settings.videoOptions = Object.fromEntries(videoSettingIds.map(id => {
+    const control = element(id);
+    return [id, control.type === 'checkbox' ? control.checked : control.value];
+  }));
+  try { localStorage.setItem(APP_SETTINGS_KEY, JSON.stringify(settings)); } catch {}
+}
 
 function updateMemoryStats() {
   const footer = element('memoryStats');
@@ -140,8 +274,10 @@ function showProgress(progress) {
   const accelerator = progress.accelerator ? ` | ${progress.accelerator}` : '';
   const speed = Number.isFinite(progress.iterationsPerSecond) && Number.isFinite(progress.iterationSeconds) ?
     ` | Mittel ${progress.iterationsPerSecond.toPrecision(3)} Iter./s | letzte ${fixed(progress.iterationSeconds, 2)} s` : '';
+  const indexing = progress.stage === 'index' && Number.isFinite(progress.done) && Number.isFinite(progress.total) ?
+    ` ${fixed(100 * progress.done / Math.max(1, progress.total), 1)}% | ${megabytes(progress.done)} / ${megabytes(progress.total)}` : '';
   text('processingStatus', progress.stage === 'fit' ? `Fit ${progress.iteration}/${progress.iterations} | RMS ${fixed(progress.rms)} px${accelerator}${speed}` :
-    `${names[progress.stage] || progress.stage}${accelerator}`);
+    `${names[progress.stage] || progress.stage}${indexing}${accelerator}`);
   element('progress').value = progress.stage === 'fit' ? progress.iteration / progress.iterations : (progress.done || 0) / (progress.total || 1);
   if (progress.stage === 'fit') renderFitProfile(progress.profile);
 }
@@ -165,8 +301,10 @@ function renderTrackingProfile(profile) {
   if (!profile?.frames) { updateTimeProfiles(); return; }
   const average = value => value / profile.frames;
   const rows = [
-    ['Frame dekodieren', average(profile.decodeMs)], ['Bitmap nach RGBA', average(profile.rgbaMs)],
+    ['Frame dekodieren', average(profile.decodeMs)], ['Bildschaerfe messen', average(profile.sharpnessMs)],
+    ['Bitmap nach RGBA', average(profile.rgbaMs)],
     ['Entzerrung inkl. Transfer', average(profile.remapMs)],
+    ['Umfeldframes laden / entzerren', average(profile.referenceMs || 0)],
     ['Worker-Transfer / Warteschlange', average(profile.workerTransferMs)], ['Tracking im Worker', average(profile.trackMs)],
     ['Pose / Stabilisierung', average(profile.poseMs)], ['Vorschau / Tabelle / Pfad', average(profile.renderMs)],
     ['Gesamt', average(profile.totalMs)]
@@ -174,12 +312,32 @@ function renderTrackingProfile(profile) {
   const tracker = profile.tracker;
   if (profile.mode === 'window') rows.splice(5, 0,
     ['  Fenster / Grauwert / FFT', average(tracker.sampleMs)], ['  FFT-Translationssuche', average(tracker.matchMs)],
-    ['  Iterative X/Y- und Rotationssuche', average(tracker.refinementMs)]);
+    ['  Iterative X/Y- und Rotationssuche', average(tracker.refinementMs)],
+    ['  Umfeld gesamt', average(tracker.contextMs || 0)],
+    ['    Pyramiden inkl. nativer Entzerrung/Transfer', average(tracker.contextPyramidMs || 0)],
+    ['    Paarregistrierung vor / zurueck', average(tracker.contextRegistrationMs || 0)]);
   if (tracker.accelerator === 'WebGPU') rows.splice(4, 0,
     ['  GPU Grauwert', average(tracker.grayscaleMs)], ['  GPU Kontext / Shader', average(tracker.contextMs)],
     ['  GPU Upload', average(tracker.uploadMs)], ['  GPU Vorwaertssuche', average(tracker.forwardMs)],
     ['  GPU Rueckwaertssuche', average(tracker.backwardMs)], ['  CPU Nachfilter / Wiedererkennung', average(tracker.postprocessMs)]);
   const tbody = element('trackingProfileRows');
+  const pyramid = profile.pyramidProfile;
+  if (pyramid) {
+    const insertion = rows.findIndex(row => row[0].includes('Pyramiden inkl.')) + 1;
+    rows.splice(insertion, 0, ...[
+      ['      CPU-Pyramiden', 'cpuMs'], ['      GPU-Fehlversuch', 'failedGpuMs'],
+      ['      Native Entzerrung initialisieren', 'nativeRemapSetupMs'],
+      ['      GPU-Initialisierung', 'setupMs'], ['      GPU-Upload vorbereiten/kopieren', 'uploadMs'],
+      ['      GPU-Puffer / Befehle', 'encodeMs'], ['      GPU/Transfer warten', 'waitMs'],
+      ['      Grauwert/RGBA-Rueckkopie CPU', 'readbackMs'],
+      ...(pyramid.gpuTimedImages ? [['      GPU-Kernel (Teil der Wartezeit)', 'gpuComputeMs']] : [])
+    ].map(([label, key]) => [label, average(pyramid[key] || 0)]));
+    rows.splice(rows.findIndex(row => row[0] === 'Umfeldframes laden / entzerren') + 1, 0,
+      ['  Referenzen dekodieren', average(profile.referenceDecodeMs || 0)],
+      ['  Referenzen Schaerfe', average(profile.referenceSharpnessMs || 0)],
+      ['  Referenzen RGBA', average(profile.referenceRgbaMs || 0)],
+      ['  Referenzen entzerren', average(profile.referenceRemapMs || 0)]);
+  }
   tbody.replaceChildren();
   for (const [label, milliseconds] of rows) {
     if (!Number.isFinite(milliseconds)) continue;
@@ -190,6 +348,8 @@ function renderTrackingProfile(profile) {
   const slowest = rows.slice(0, -1).reduce((largest, row) => row[1] > largest[1] ? row : largest);
   section.dataset.summary = `Tracking ${fixed(1000 / average(profile.totalMs), 2)} fps`;
   text('trackingProfileNote', `${profile.frames} Frames | ${[...profile.accelerators].join(' / ')} | langsamster Schritt: ${slowest[0].trim()} ${fixed(slowest[1], 2)} ms / Frame | letzte Frame ${fixed(profile.lastTotalMs, 2)} ms`);
+  if (pyramid) element('trackingProfileNote').textContent += ` | Pyramiden CPU/GPU ${pyramid.cpuImages || 0}/${pyramid.gpuImages || 0} | Upload/Ruecklesen ${fixed((pyramid.uploadBytes || 0) / 1048576 / profile.frames, 1)}/${fixed((pyramid.readbackBytes || 0) / 1048576 / profile.frames, 1)} MiB/Frame | Cache ${profile.cacheHits || 0} Treffer / ${profile.cacheMisses || 0} angefordert / ${profile.cacheEvictions || 0} verdraengt`;
+  if (pyramid?.nativeImages) element('trackingProfileNote').textContent += ` | Direkt GPU ${pyramid.nativeImages} Bilder | RGBA fuer Fenster/Vorschau ${fixed((pyramid.rgbaReadbackBytes || 0) / 1048576 / profile.frames, 1)} MiB/Frame`;
   updateTimeProfiles();
 }
 
@@ -199,7 +359,8 @@ function renderExportProfile(profile) {
   if (!profile?.frames) { updateTimeProfiles(); return; }
   const average = value => value / profile.frames;
   const rows = [
-    ['Quelldecodierung', average(profile.decodeMs)], ['Bitmap nach RGBA', average(profile.rgbaMs)],
+    ['Quelldecodierung', average(profile.decodeMs)], ['Bildschaerfe messen', average(profile.sharpnessMs)],
+    ['Bitmap nach RGBA', average(profile.rgbaMs)],
     ['Entzerrung im Worker', average(profile.remapComputeMs)], ['Worker-Transfer / Nachrichtenlaufzeit', average(profile.remapTransferMs)],
     ['VideoFrame vorbereiten', average(profile.frameMs)], ['Encoder-Einreichung', average(profile.submitMs)],
     ['Encoder- / Schreib-Wartezeit', average(profile.backpressureMs)], ['Gesamt', average(profile.totalMs)]
@@ -378,7 +539,64 @@ function commitMaskEdit() {
     'Patch-Maske geaendert. Vorhandene Vektoren wurden direkt geprueft; nur neu fitten erforderlich.');
 }
 
+function updateCorrectionDataStatus() {
+  for (const [id, label, present] of [
+    ['lensDataStatus', 'Linsenkalibrierung', Boolean(calibration?.maps)],
+    ['trackingDataStatus', 'XYR-Tracking', trackingPath.length > 0],
+    ['brightnessDataStatus', 'Helligkeitskorrektur', false]
+  ]) {
+    const indicator = element(id);
+    indicator.classList.toggle('present', present);
+    const state = `${label}: ${present ? 'vorhanden' : 'nicht vorhanden'}`;
+    indicator.title = state;
+    indicator.setAttribute('aria-label', state);
+  }
+}
+
+function trackingForExport() {
+  if (!trackingPath.length) return null;
+  return {
+    ...trackingDataset,
+    format: 'rasterlabor-xyr-tracking', model_version: 1,
+    created_at: trackingDataset?.created_at ?? new Date().toISOString(),
+    video: trackingDataset?.video ?? (videoInfo ? { name: videoInfo.name, width: videoInfo.width, height: videoInfo.height } : null),
+    options: trackingRunOptions,
+    coordinate_system: 'rectified pixels; x right; y down; rotation radians; camera pose relative to first tracked frame',
+    path: trackingPath.map(({ patchPoints, ...entry }) => entry), failures: trackingFailures
+  };
+}
+
+function restoreTracking(tracking) {
+  if (!tracking?.path?.length) return;
+  trackingImageMask = null;
+  trackingMaskHasSelection = false;
+  trackingDataset = tracking;
+  trackingPath = tracking.path;
+  trackingFailures = Array.isArray(tracking.failures) ? tracking.failures : [];
+  trackingRunOptions = tracking.options ?? null;
+    const storedMask = tracking.options?.sourceImageMask ?? tracking.options?.patchMask;
+    const sourceWidth = videoInfo?.width ?? calibration?.field.width;
+    const sourceHeight = videoInfo?.height ?? calibration?.field.height;
+  if (storedMask?.data && Number.isInteger(storedMask.width) && Number.isInteger(storedMask.height) &&
+      storedMask.width > 0 && storedMask.height > 0 && Number.isFinite(storedMask.cellSize) && storedMask.cellSize > 0 &&
+      storedMask.data.length === storedMask.width * storedMask.height &&
+      storedMask.sourceWidth === sourceWidth && storedMask.sourceHeight === sourceHeight) {
+    const data = Uint8Array.from(storedMask.data);
+    if (data.every(value => value === MASK_NEUTRAL || value === MASK_SEARCH || value === MASK_FORBIDDEN)) {
+      trackingImageMask = { ...storedMask, data };
+      trackingMaskHasSelection = data.includes(MASK_SEARCH);
+    }
+  }
+  // A stored path can be inspected/exported; decoder and tracker history are not stored.
+  trackingPaused = false;
+  renderTrackingResults(trackingPath.at(-1));
+  updateTrackingControls();
+  updateCorrectionDataStatus();
+}
+
 function updateControls() {
+  checkerboardView.refresh();
+  updateCorrectionDataStatus();
   const hasVideo = Boolean(videoInfo);
   for (const id of ['firstFrame', 'previousFrame', 'nextFrame', 'timeline']) element(id).disabled = !hasVideo || navigationBusy || rectifiedPlayback || trackingRunning;
   element('playButton').disabled = !hasVideo || trackingRunning || (navigationBusy && !rectifiedPlayback);
@@ -439,7 +657,8 @@ function updateTime() {
   if (!videoInfo) return;
   const timestamp = videoInfo.timestamps[currentIndex];
   text('frameTime', `Frame ${currentIndex} / PTS ${(timestamp / 1e6).toFixed(6)} s`);
-  text('rawState', `${video.paused ? 'Framegenau' : 'Wiedergabe'} | #${currentIndex}`);
+  const sharpness = Number.isFinite(currentSharpness?.score) ? ` | Schaerfe ${fixed(currentSharpness.score, 2)}` : '';
+  text('rawState', `${video.paused ? 'Framegenau' : 'Wiedergabe'} | #${currentIndex}${sharpness}`);
   element('timeline').value = currentIndex;
   text('elapsed', timeLabel((timestamp - videoInfo.firstTimestamp) / 1e6));
 }
@@ -452,22 +671,15 @@ function renderVideoMetadata() {
   text('videoMetadata', `${videoInfo.width} x ${videoInfo.height} | ${videoInfo.duration.toFixed(2)} s | ${videoInfo.frameCount} Frames | ${fixed(videoInfo.fps, 3)} fps${videoInfo.variableFrameRate ? ' (variabel, Mittel)' : ''} | ${videoInfo.codec}${colorLabel}`);
 }
 
-function imageFromBitmap(bitmap) {
-  if (conversionCanvas.width !== bitmap.width || conversionCanvas.height !== bitmap.height) {
-    conversionCanvas.width = bitmap.width;
-    conversionCanvas.height = bitmap.height;
-  }
-  conversionContext.drawImage(bitmap, 0, 0);
-  return conversionContext.getImageData(0, 0, bitmap.width, bitmap.height);
-}
 
-function setRaw(bitmap, index) {
+function setRaw(bitmap, index, sharpness = null) {
   rawImage.width = bitmap.width;
   rawImage.height = bitmap.height;
   rawImage.getContext('2d').drawImage(bitmap, 0, 0);
   rawReady = true;
   if (element('pattern').value === 'patches') ensurePatchMask(bitmap.width, bitmap.height);
   currentIndex = index;
+  currentSharpness = sharpness;
   currentDetection = detections.get(index) || detectionFromFrame(frames.get(index));
   element('rawEmpty').hidden = true;
   updateTime();
@@ -486,7 +698,8 @@ function detectionFromFrame(frame) {
     for (const [index, points] of groups) lines.push({ family, index, points: points.sort((first, second) => first[family === 'row' ? 'col' : 'row'] - second[family === 'row' ? 'col' : 'row']) });
   }
   return { points: frame.points, lines: frame.patchSize ? [] : lines, rejected: [], roi: frame.roi, patchSize: frame.patchSize,
-    success: frame.accepted, reason: frame.reason, accelerator: frame.accelerator, timing: frame.timing };
+    success: frame.accepted, reason: frame.reason, accelerator: frame.accelerator,
+    sharpness: frame.sharpness, timing: frame.timing };
 }
 
 async function showFrame(index) {
@@ -496,8 +709,8 @@ async function showFrame(index) {
   updatePlayIcon();
   updateControls();
   try {
-    const result = await decoder.call('frame', { index: Math.max(0, Math.min(videoInfo.frameCount - 1, index)) });
-    setRaw(result.bitmap, result.index);
+    const result = await readFrame(Math.max(0, Math.min(videoInfo.frameCount - 1, index)));
+    setRaw(result.bitmap, result.index, result.sharpness);
     result.bitmap.close();
     rectifiedReady = false;
     if (view === 'rectified' && calibration && !taskBusy) await task(updateRectified);
@@ -517,8 +730,8 @@ async function playRectified() {
       const started = performance.now();
       navigationBusy = true;
       updateControls();
-      const result = await decoder.call('frame', { index });
-      setRaw(result.bitmap, result.index);
+      const result = await readFrame(index);
+      setRaw(result.bitmap, result.index, result.sharpness);
       result.bitmap.close();
       await updateRectified();
       navigationBusy = false;
@@ -547,18 +760,19 @@ async function playRectified() {
 
 async function detectIndex(index, display = true) {
   const revision = parameterRevision;
-  const result = await decoder.call('frame', { index });
-  if (display) setRaw(result.bitmap, index);
+  const result = await readFrame(index);
+  if (display) setRaw(result.bitmap, index, result.sharpness);
   const settings = parameters();
   let detection;
   if (settings.pattern === 'chessboard' && settings.useWebGpu) {
     detection = await computer.call('detect-bitmap', { bitmap: result.bitmap, index, options: settings }, [result.bitmap]);
   } else {
-    const image = imageFromBitmap(result.bitmap);
+    const image = frameReader.toRgba(result.bitmap);
     result.bitmap.close();
     detection = await computer.call('detect', { image, index, options: settings }, [image.data.buffer]);
   }
   if (revision !== parameterRevision) throw new Error('Parameter wurden waehrend der Erkennung geaendert.');
+  detection.sharpness = result.sharpness;
   detections.set(index, detection);
   while (detections.size > 30) detections.delete(detections.keys().next().value);
   if (currentIndex === index) currentDetection = detection;
@@ -594,8 +808,8 @@ async function evaluateIndex(index, display = true, force = false, status = '', 
   const retryInterruptedPatch = previous && !previous.accepted && previous.reason.startsWith('Image-Patch-Sequenz');
   if (frames.has(index) && !detectionsStale && !force && !retryMotionRejection && !retryInterruptedPatch) {
     if (display) {
-      const result = await decoder.call('frame', { index });
-      setRaw(result.bitmap, index);
+      const result = await readFrame(index);
+      setRaw(result.bitmap, index, result.sharpness);
       result.bitmap.close();
     }
     return false;
@@ -612,7 +826,7 @@ async function evaluateIndex(index, display = true, force = false, status = '', 
   const frame = { id: index, timestamp: videoInfo.timestamps[index], role: oldFrame?.role || role,
     enabled: !reason, accepted: !reason, points: detection.success ? detection.points : [], roi: settings.roi || null,
     patchSize: detection.patchSize || null, confidence: detection.confidence, accelerator: detection.accelerator,
-    timing: detection.timing,
+    sharpness: detection.sharpness, timing: detection.timing,
     reason: reason || (detection.patchSize ? 'Brauchbare Image-Patches' : 'Brauchbares Raster') };
   frames.set(index, frame);
   geometrySelection = null;
@@ -672,6 +886,7 @@ async function refit() {
   updateControls();
   if (view === 'rectified' && rawReady) await updateRectified();
   draw();
+  if (videoInfo) setTimeout(() => { void loadTrackingMaskPreview(); }, 0);
 }
 
 async function runContinuous() {
@@ -751,8 +966,9 @@ function updateTable() {
     row.insertCell().append(role);
     row.insertCell().textContent = frame.points.length;
     const geometry = geometrySelection?.candidates.get(frame.id);
-    row.insertCell().textContent = geometry ? `${geometry.selected ? 'Geometrie passend' : 'Geometrie abweichend'} | Skala ${fixed(geometry.scale, 4)} | Anisotropie ${fixed(geometry.anisotropy, 4)}` : frame.enabled && calibration && !stale ?
-      (frame.role === 'train' ? 'Im Fit verwendet' : 'Zur Validierung verwendet') : frame.reason;
+    const sharpness = Number.isFinite(frame.sharpness?.score) ? ` | Schaerfe ${fixed(frame.sharpness.score, 2)}` : '';
+    row.insertCell().textContent = (geometry ? `${geometry.selected ? 'Geometrie passend' : 'Geometrie abweichend'} | Skala ${fixed(geometry.scale, 4)} | Anisotropie ${fixed(geometry.anisotropy, 4)}` : frame.enabled && calibration && !stale ?
+      (frame.role === 'train' ? 'Im Fit verwendet' : 'Zur Validierung verwendet') : frame.reason) + sharpness;
     tbody.append(row);
   }
   if (!visibleFrames.length) { const row = tbody.insertRow(); const cell = row.insertCell(); cell.colSpan = 5; cell.textContent = view === 'data' ? 'Keine selektierten Messframes' : 'Keine Messframes'; cell.className = 'muted'; }
@@ -910,11 +1126,12 @@ async function updateRectified() {
   if (!calibration || !rawReady || !video.paused) return;
   const revision = displayRevision;
   const frameIndex = currentIndex;
-  const image = rawImage.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, rawImage.width, rawImage.height);
-  const result = await computer.call('remap', { image, useWebGpu: element('useWebGpu').checked }, [image.data.buffer]);
-  if (frameIndex !== currentIndex || revision !== displayRevision) return;
-  rectifiedImage.width = result.width; rectifiedImage.height = result.height;
-  rectifiedImage.getContext('2d').putImageData(new ImageData(result.data, result.width, result.height), 0, 0);
+  const result = await readFrame(frameIndex, { rectified: true });
+  try {
+    if (frameIndex !== currentIndex || revision !== displayRevision) return;
+    rectifiedImage.width = result.bitmap.width; rectifiedImage.height = result.bitmap.height;
+    rectifiedImage.getContext('2d').drawImage(result.bitmap, 0, 0);
+  } finally { result.bitmap.close(); }
   rectifiedReady = true;
   draw();
 }
@@ -936,10 +1153,8 @@ function drawCanvas(canvas, image, width, height, overlay = null, adjustImage = 
   context.setTransform(scale * pixelRatio, 0, 0, scale * pixelRatio, left * pixelRatio, top * pixelRatio);
   context.imageSmoothingEnabled = zoom < 2;
   if (image) {
-    context.save();
-    if (adjustImage) context.filter = previewFilter;
-    context.drawImage(image, 0, 0, width, height);
-    context.restore();
+    if (adjustImage) drawAdjustedImage(context, image, 0, 0, width, height);
+    else context.drawImage(image, 0, 0, width, height);
   }
   if (overlay) overlay(context, scale);
 }
@@ -1001,6 +1216,7 @@ function drawOverlay(context, scale) {
 }
 
 function draw() {
+  checkerboardView.refresh();
   const detection = currentDetection;
   if (!rawReady) text('detectionStatus', 'Kein Frame geladen.');
   else if (!detection) text('detectionStatus', `Frame #${currentIndex}: noch nicht geprueft.`);
@@ -1029,6 +1245,7 @@ function draw() {
   element('resultEmpty').querySelector('span').textContent = view === 'data' ? 'Keine Messdaten vorhanden' : calibration && view === 'rectified' ? videoInfo ? 'Vorschau fuer pausierten Frame' : 'Zugehoeriges Video nicht geladen' : 'Kein Feld berechnet';
   if (showResult && is3d) field3d.resize();
   else if (showResult) drawCanvas(resultCanvas, image, image.width, image.height, view === 'rectified' ? (context, scale) => {
+    checkerboardView.draw(context, scale);
     context.strokeStyle = '#ffd74b'; context.fillStyle = '#ffd74b'; context.lineWidth = 1.5 / scale;
     context.beginPath(); measurements.forEach((point, index) => index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y)); context.stroke();
     for (const point of measurements) { context.beginPath(); context.arc(point.x, point.y, 3 / scale, 0, Math.PI * 2); context.fill(); }
@@ -1061,12 +1278,20 @@ function resetTrackingWorker() {
 }
 
 function clearTrackingResults(preserveRectangle = false) {
+  trackingInspector.clear();
+  overlayRequest++;
+  pathHover = null; pathSelection = null; pathProject = null;
+  pathRefitProposal = null; pathRefitBusy = false;
+  clearPathOverlay();
+  element('trackingOverlayPane').hidden = true;
   trackingPreviewRequest++;
-  clearTimeout(trackingPreviewTimer);
   trackingRunning = false;
   trackingPaused = false;
   trackingNextIndex = number('trackingStart', 0);
   trackingPath = [];
+  trackingFailures = [];
+  trackingDataset = null;
+  updateCorrectionDataStatus();
   trackingProfile = null;
   trackingRunOptions = null;
   trackingLost = false;
@@ -1075,6 +1300,7 @@ function clearTrackingResults(preserveRectangle = false) {
   if (!preserveRectangle) trackingRectangle = null;
   text('trackingWindowInfo', trackingRectangle ? `${trackingRectangle.width} x ${trackingRectangle.height} px` : 'Kein Fenster ausgewaehlt');
   text('trackingMatchQuality', 'Korrelation: -');
+  element('trackingMatchQuality').title = '';
   trackingPreviewTransform = null;
   trackingPreviewPoints = [];
   trackingZoom = 1;
@@ -1093,12 +1319,89 @@ function clearTrackingResults(preserveRectangle = false) {
   element('trackingPreviewEmpty').hidden = false;
   element('trackingPathEmpty').hidden = false;
   const row = document.createElement('tr');
-  const cell = row.insertCell(); cell.colSpan = 5; cell.className = 'muted'; cell.textContent = 'Noch keine Posen';
+  const cell = row.insertCell(); cell.colSpan = 8; cell.className = 'muted'; cell.textContent = 'Noch keine Posen';
   element('trackingTable').replaceChildren(row);
   for (const id of ['trackingPreviewCanvas', 'trackingPathCanvas']) {
     const canvas = element(id); canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
   }
   updateTrackingControls();
+}
+
+function ensureTrackingImageMask(width, height) {
+  if (!trackingImageMask || trackingImageMask.sourceWidth !== width || trackingImageMask.sourceHeight !== height) {
+    trackingImageMask = createPatchMask(width, height);
+    trackingMaskHasSelection = false;
+  }
+  return trackingImageMask;
+}
+
+function updateTrackingMaskBrushLimit(width, height) {
+  const control = element('trackingMaskBrush');
+  const step = Math.max(1, Number(control.step) || 1);
+  const maximum = Math.max(Number(control.min) || step, Math.floor(Math.min(width, height) * 0.5 / step) * step);
+  control.max = String(maximum);
+  if (Number(control.value) > maximum) control.value = String(maximum);
+  text('trackingMaskBrushValue', `${control.value} px`);
+}
+
+function trackingPixelAllowed(x, y) {
+  // An untouched mask is optional. As soon as one green cell exists it becomes
+  // an inclusion mask and only green cells contribute to footprints/overlays.
+  if (!trackingMaskHasSelection) return true;
+  if (!trackingImageMask?.data) return true;
+  const maps = calibration?.maps;
+  if (!maps) return maskIncludes(trackingImageMask, x, y);
+  const px = Math.floor(x), py = Math.floor(y);
+  if (px < 0 || py < 0 || px >= maps.outputWidth || py >= maps.outputHeight) return false;
+  const index = py * maps.outputWidth + px;
+  return Boolean(maps.valid[index]) && maskIncludes(trackingImageMask, maps.inverseX[index], maps.inverseY[index]);
+}
+
+function updateTrackingMaskInfo(prefix = '') {
+  text('trackingMaskInfo', `${prefix}${prefix ? ' | ' : ''}${trackingMaskHasSelection ?
+    'nur gruene Bereiche werden genutzt' : 'keine Auswahl: gesamter gueltiger Bildbereich'}`);
+}
+
+function renderTrackingMask() {
+  const canvas = element('trackingMaskCanvas');
+  const { context, width, height } = trackingCanvasContext('trackingMaskCanvas');
+  context.clearRect(0, 0, width, height);
+  if (!trackingMaskPreview.width) { trackingMaskTransform = null; return; }
+  const scale = Math.min(width / trackingMaskPreview.width, height / trackingMaskPreview.height);
+  const left = (width - trackingMaskPreview.width * scale) / 2;
+  const top = (height - trackingMaskPreview.height * scale) / 2;
+  drawAdjustedImage(context, trackingMaskPreview, left, top, trackingMaskPreview.width * scale, trackingMaskPreview.height * scale);
+  const mask = trackingImageMask;
+  if (mask) {
+    trackingMaskPaintLayer.width = mask.width; trackingMaskPaintLayer.height = mask.height;
+    const pixels = trackingMaskPaintLayer.getContext('2d').createImageData(mask.width, mask.height);
+    for (let index = 0; index < mask.data.length; index++) {
+      if (mask.data[index] === MASK_SEARCH) pixels.data.set([20, 184, 110, 110], index * 4);
+      else pixels.data.set([25, 34, 30, 135], index * 4);
+    }
+    trackingMaskPaintLayer.getContext('2d').putImageData(pixels, 0, 0);
+    context.imageSmoothingEnabled = false;
+    context.drawImage(trackingMaskPaintLayer, left, top, trackingMaskPreview.width * scale, trackingMaskPreview.height * scale);
+  }
+  trackingMaskTransform = { left, top, scale };
+  canvas.style.cursor = trackingMaskTool === 'erase' ? 'cell' : 'crosshair';
+}
+
+async function loadTrackingMaskPreview() {
+  const request = ++trackingMaskPreviewRequest;
+  if (!videoInfo) { text('trackingMaskInfo', 'Zuerst ein Video laden.'); return; }
+  const index = Math.max(0, Math.min(videoInfo.frameCount - 1, Math.round(number('trackingStart', 0))));
+  text('trackingMaskInfo', `Lade Rohframe #${index}...`);
+  try {
+    const image = await readTrackingFrame(index, { rectified: false, output: 'rgba' });
+    if (request !== trackingMaskPreviewRequest) return;
+    updateTrackingMaskBrushLimit(image.width, image.height);
+    trackingMaskPreview.width = image.width; trackingMaskPreview.height = image.height;
+    trackingMaskPreview.getContext('2d').putImageData(new ImageData(image.data, image.width, image.height), 0, 0);
+    ensureTrackingImageMask(image.width, image.height);
+    updateTrackingMaskInfo(`Rohframe #${index}`);
+    renderTrackingMask(); drawTrackingPath();
+  } catch (error) { if (request === trackingMaskPreviewRequest) text('trackingMaskInfo', error.message); }
 }
 
 function trackingCanvasContext(id) {
@@ -1120,10 +1423,7 @@ function renderTrackingPreview() {
   const scale = Math.min(width / trackingPreviewImage.width, height / trackingPreviewImage.height) * trackingZoom;
   const left = (width - trackingPreviewImage.width * scale) / 2 + trackingPan.x * width;
   const top = (height - trackingPreviewImage.height * scale) / 2 + trackingPan.y * height;
-  context.save();
-  context.filter = previewFilter;
-  context.drawImage(trackingPreviewImage, left, top, trackingPreviewImage.width * scale, trackingPreviewImage.height * scale);
-  context.restore();
+  drawAdjustedImage(context, trackingPreviewImage, left, top, trackingPreviewImage.width * scale, trackingPreviewImage.height * scale);
   trackingPreviewTransform = { scale, left, top };
   element('trackingPreviewEmpty').hidden = true;
   context.fillStyle = '#19d6a0'; context.strokeStyle = '#063d34'; context.lineWidth = 1;
@@ -1142,18 +1442,6 @@ function renderTrackingPreview() {
   text('trackingZoomValue', `${Math.round(trackingZoom * 100)}%`);
 }
 
-async function rectifiedTrackingImage(bitmap, useWebGpu) {
-  let image;
-  try { image = imageFromBitmap(bitmap); } finally { bitmap.close(); }
-  return computer.call('remap', { image, useWebGpu }, [image.data.buffer]);
-}
-
-function drawTrackingImage(image) {
-  trackingPreviewImage.width = image.width; trackingPreviewImage.height = image.height;
-  trackingPreviewImage.getContext('2d').putImageData(new ImageData(image.data, image.width, image.height), 0, 0);
-  trackingPreviewPoints = [];
-  renderTrackingPreview();
-}
 
 function drawTrackingFrame(bitmap) {
   trackingPreviewImage.width = bitmap.width;
@@ -1178,9 +1466,7 @@ function renderTrackingPatchDetail() {
   canvas.width = cropSize; canvas.height = cropSize;
   const context = canvas.getContext('2d');
   context.imageSmoothingEnabled = false;
-  context.save(); context.filter = previewFilter;
-  context.drawImage(trackingPreviewImage, point.x - cropSize / 2, point.y - cropSize / 2, cropSize, cropSize, 0, 0, cropSize, cropSize);
-  context.restore();
+  drawAdjustedImage(context, trackingPreviewImage, point.x - cropSize / 2, point.y - cropSize / 2, cropSize, cropSize, 0, 0, cropSize, cropSize);
   context.strokeStyle = '#ffd74b'; context.lineWidth = Math.max(1, cropSize / 192);
   context.strokeRect(cropSize / 2 - patchSize / 2, cropSize / 2 - patchSize / 2, patchSize, patchSize);
   context.strokeStyle = '#c6404a'; context.beginPath(); context.moveTo(cropSize / 2 - 7, cropSize / 2); context.lineTo(cropSize / 2 + 7, cropSize / 2); context.moveTo(cropSize / 2, cropSize / 2 - 7); context.lineTo(cropSize / 2, cropSize / 2 + 7); context.stroke();
@@ -1195,16 +1481,15 @@ function selectTrackingPatch(point) {
 
 async function showTrackedFrame(entry) {
   if (trackingRunning || trackingPreviewBusy || taskBusy) return;
+  trackingInspector.show(entry);
   const request = ++trackingPreviewRequest;
   trackingPreviewBusy = true; updateTrackingControls();
   try {
-    const decoded = await decoder.call('frame', { index: entry.frame });
+    const decoded = await readTrackingFrame(entry.frame, { rectified: entry.mode === 'window' });
     if (request !== trackingPreviewRequest) { decoded.bitmap.close(); return; }
     if (entry.mode === 'window') {
-      const image = await rectifiedTrackingImage(decoded.bitmap, element('trackingUseWebGpu').checked);
-      if (request !== trackingPreviewRequest) return;
-      trackingRectangle = entry.rectangle; drawTrackingImage(image);
-    } else { drawTrackingFrame(decoded.bitmap); decoded.bitmap.close(); drawTrackingPatches(entry.patchPoints); }
+      trackingRectangle = entry.rectangle; drawTrackingFrame(decoded.bitmap); decoded.bitmap.close();
+    } else { drawTrackingFrame(decoded.bitmap); decoded.bitmap.close(); drawTrackingPatches(entry.patchPoints ?? []); }
     renderTrackingResults(entry);
   } finally { trackingPreviewBusy = false; updateTrackingControls(); }
 }
@@ -1279,12 +1564,10 @@ async function previewTrackingStartFrame() {
   trackingPreviewBusy = true; updateTrackingControls();
   text('trackingPreviewState', `Lade Frame ${index}...`);
   try {
-    const decoded = await decoder.call('frame', { index });
+    const decoded = await readTrackingFrame(index, { rectified: windowTracking() });
     if (request !== trackingPreviewRequest || trackingRunning) { decoded.bitmap.close(); return; }
     if (windowTracking()) {
-      const image = await rectifiedTrackingImage(decoded.bitmap, element('trackingUseWebGpu').checked);
-      if (request !== trackingPreviewRequest) return;
-      drawTrackingImage(image);
+      drawTrackingFrame(decoded.bitmap); decoded.bitmap.close();
     } else { drawTrackingFrame(decoded.bitmap); decoded.bitmap.close(); }
     text('trackingFrameState', `Vorschau Frame ${index} / PTS ${(decoded.timestamp / 1e6).toFixed(6)} s`);
     text('trackingPreviewState', windowTracking() ? 'Entzerrter Startframe' : 'Startframe-Vorschau');
@@ -1293,19 +1576,17 @@ async function previewTrackingStartFrame() {
   } finally { trackingPreviewBusy = false; updateTrackingControls(); }
 }
 
-function scheduleTrackingStartPreview() {
-  clearTimeout(trackingPreviewTimer);
-  trackingPreviewTimer = setTimeout(() => { void previewTrackingStartFrame(); }, 120);
-}
-
 function drawTrackingPath() {
   const poses = trackingPath.filter(entry => entry.pose);
   const { context, width, height } = trackingCanvasContext('trackingPathCanvas');
   context.clearRect(0, 0, width, height);
-  if (!poses.length) { element('trackingPathEmpty').hidden = false; return; }
+  if (!poses.length) { pathProject = null; element('trackingPathEmpty').hidden = false; return; }
   element('trackingPathEmpty').hidden = true;
-  const xs = poses.map(entry => entry.pose.x);
-  const ys = poses.map(entry => entry.pose.y);
+  const geometries = trackingPath.map(entry => frameGeometry(entry, calibration?.field, calibration?.maps)).filter(Boolean);
+  const corners = geometries.flatMap(geometry => geometry.corners);
+  const proposed = pathRefitProposal ? [...pathRefitProposal.byFrame.values()].map(item => item.pose) : [];
+  const xs = [...poses.map(entry => entry.pose.x), ...proposed.map(pose => pose.x), ...corners.map(point => point.x)];
+  const ys = [...poses.map(entry => entry.pose.y), ...proposed.map(pose => pose.y), ...corners.map(point => point.y)];
   const minimumX = Math.min(0, ...xs); const maximumX = Math.max(0, ...xs);
   const minimumY = Math.min(0, ...ys); const maximumY = Math.max(0, ...ys);
   const rangeX = Math.max(1, maximumX - minimumX);
@@ -1313,6 +1594,20 @@ function drawTrackingPath() {
   const padding = 28;
   const scale = Math.min((width - 2 * padding) / rangeX, (height - 2 * padding) / rangeY);
   const project = pose => ({ x: padding + (pose.x - minimumX) * scale, y: height - padding - (pose.y - minimumY) * scale });
+  pathProject = project;
+  pathProject.invert = point => ({ x: minimumX + (point.x - padding) / scale,
+    y: minimumY + (height - padding - point.y) / scale });
+  const selected = pathHover ?? pathSelection;
+  const supporting = selected ? geometries.filter(geometry => geometry.supports(selected, trackingPixelAllowed)) : [];
+  for (const geometry of supporting) {
+    const points = geometry.corners.map(project);
+    context.strokeStyle = supportColor(geometry.entry.frame); context.lineWidth = 1;
+    context.beginPath(); points.forEach((point, index) => index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y));
+    context.closePath(); context.stroke();
+    context.fillStyle = context.strokeStyle; context.font = '11px sans-serif';
+    context.fillText(`#${geometry.entry.frame}`, points[0].x + 3, points[0].y - 3);
+  }
+  text('trackingPathInfo', selected ? `Position (${fixed(selected.x, 1)}, ${fixed(selected.y, 1)}) | ${supporting.length} Bilder: ${supporting.map(item => `#${item.entry.frame}`).join(', ')}` : 'Maus im Canvas: Bildrechtecke anzeigen. Klicken: Frames an dieser Position ueberlagern.');
   const origin = project({ x: 0, y: 0 });
   context.strokeStyle = '#aebbb5'; context.lineWidth = 1; context.beginPath();
   context.moveTo(padding, origin.y); context.lineTo(width - padding, origin.y);
@@ -1320,17 +1615,554 @@ function drawTrackingPath() {
   context.strokeStyle = '#067566'; context.lineWidth = 2; context.beginPath();
   poses.forEach((entry, index) => { const point = project(entry.pose); index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y); });
   context.stroke();
+  if (pathRefitProposal) {
+    context.strokeStyle = '#c6404a'; context.lineWidth = 2; context.setLineDash([6, 4]); context.beginPath();
+    poses.forEach((entry, index) => {
+      const point = project(pathRefitProposal.byFrame.get(entry.frame)?.pose ?? entry.pose);
+      index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y);
+    });
+    context.stroke(); context.setLineDash([]);
+  }
   const latest = project(poses.at(-1).pose);
   context.fillStyle = '#c6404a'; context.beginPath(); context.arc(latest.x, latest.y, 4, 0, Math.PI * 2); context.fill();
+  if (selected) {
+    const point = project(selected);
+    context.strokeStyle = '#111'; context.beginPath(); context.arc(point.x, point.y, 6, 0, Math.PI * 2); context.stroke();
+  }
+}
+
+function updatePathRefitControls() {
+  element('trackingPathRefit').disabled = pathRefitBusy || Boolean(pathRefitProposal) || !pathSelection || trackingPath.length < 2;
+  element('trackingPathRefitApply').disabled = pathRefitBusy || !pathRefitProposal?.overlayReady;
+  element('trackingPathRefitDiscard').disabled = pathRefitBusy || !pathRefitProposal;
+  for (const control of document.querySelectorAll('.refit-adjustments input, .refit-adjustments button')) control.disabled = pathRefitBusy;
+}
+
+function trackingGeometry(entry) {
+  const proposed = pathRefitProposal?.byFrame.get(entry.frame)?.pose;
+  return frameGeometry(proposed ? { ...entry, pose: proposed } : entry, calibration?.field, calibration?.maps);
+}
+
+function localRefitFailure(matches, conditionalLimit) {
+  const usable = match => match?.accepted || match?.conditionallyAccepted;
+  const forward = matches.filter(match => usable(match.forward)).length;
+  const backward = matches.filter(match => usable(match.backward)).length;
+  const cycle = matches.filter(match => usable(match.backward) && Number.isFinite(match.reverseDistance) &&
+    match.reverseDistance <= conditionalLimit).length;
+  const reasons = new Map();
+  for (const match of matches) {
+    const reason = usable(match.forward) ? (usable(match.backward) ?
+      (Number.isFinite(match.reverseDistance) ? (match.reverseDistance <= conditionalLimit ? 'Kein Mehrheitskonsens' :
+        `Zyklus > ${fixed(conditionalLimit, 1)} px`) : 'Zyklus ungueltig') : 'Rueckwaertssuche') :
+      (match.forward?.reason || 'Vorwaertssuche');
+    reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
+  }
+  const breakdown = [...reasons].sort((first, second) => second[1] - first[1]).map(([reason, count]) => `${reason}: ${count}`).join(', ');
+  return `${matches.length} Paare versucht; vorwaerts ${forward}, rueckwaerts ${backward}, innerhalb Zyklusgrenze ${cycle}. ${breakdown}`;
+}
+
+async function localGroupComposite(entries, bounds, maxFrames, edgeFeather, featherMask, baseMask, region) {
+  const candidates = sharpestFramesFirst(entries.map(entry => frameGeometry(entry, calibration?.field, calibration?.maps)).filter(Boolean));
+  const supporting = approximateTopFrames(candidates, maxFrames, trackingPixelAllowed, pathSelection).slice(0, 16);
+  const composite = document.createElement('canvas');
+  composite.width = bounds.width; composite.height = bounds.height;
+  const context = composite.getContext('2d', { willReadFrequently: true });
+  const scratch = document.createElement('canvas');
+  const sum = new Float32Array(bounds.width * bounds.height * 4);
+  const counts = new Uint32Array(bounds.width * bounds.height);
+  for (const [index, geometry] of supporting.entries()) {
+    text('trackingPathRefitInfo', `Gruppenmatch: Lade ${index + 1}/${supporting.length}, Frame #${geometry.entry.frame}...`);
+    const image = await readTrackingFrame(geometry.entry.frame, { rectified: true, output: 'rgba' });
+    const mask = localSelectionMask(geometry, pathSelection, region, baseMask);
+    const allowed = (x, y) => trackingPixelAllowed(x, y) && maskIncludes(mask, x, y);
+    applyPixelMask(image.data, image.width, allowed);
+    applyEdgeFeather(image.data, image.width, image.height, edgeFeather, featherMask);
+    scratch.width = image.width; scratch.height = image.height;
+    scratch.getContext('2d').putImageData(new ImageData(image.data, image.width, image.height), 0, 0);
+    const origin = geometry.world(0, 0);
+    context.setTransform(1, 0, 0, 1, 0, 0); context.clearRect(0, 0, bounds.width, bounds.height);
+    context.setTransform(geometry.c, geometry.s, -geometry.s, geometry.c, origin.x - bounds.minX, origin.y - bounds.minY);
+    context.drawImage(scratch, 0, 0);
+    accumulateFrame(sum, context.getImageData(0, 0, bounds.width, bounds.height).data, counts, maxFrames);
+  }
+  context.setTransform(1, 0, 0, 1, 0, 0);
+  context.putImageData(new ImageData(averagedFrames(sum), bounds.width, bounds.height), 0, 0);
+  return { bitmap: await createImageBitmap(composite), frames: supporting.map(geometry => geometry.entry.frame) };
+}
+
+async function seedFromLocalGroupMatch(entries, worker, limits, preprocessing, baseMask, selectedFrame, localLimit) {
+  const groups = localRefitGroups(entries);
+  if (groups.length < 2) return { entries, attempts: 0, accepted: 0 };
+  const radius = Math.min(calibration.maps.outputWidth, calibration.maps.outputHeight) * preprocessing.region / 2;
+  const bounds = { minX: Math.floor(pathSelection.x - radius), minY: Math.floor(pathSelection.y - radius),
+    width: Math.max(128, Math.ceil(radius * 2)), height: Math.max(128, Math.ceil(radius * 2)) };
+  const maxFrames = Math.min(8, Math.max(1, number('trackingOverlayMaxFrames', 3)));
+  const edgeFeather = number('overlayEdgeFeather', 10) / 100;
+  const anchor = Math.max(0, groups.findIndex(group => group.some(entry => entry.frame === Number(selectedFrame))));
+  const centerPose = { x: bounds.minX + bounds.width / 2, y: bounds.minY + bounds.height / 2, rotation: 0 };
+  const featherMask = edgeFeatherMask(calibration.maps.outputWidth, calibration.maps.outputHeight, trackingPixelAllowed, edgeFeather);
+  const composites = [];
+  try {
+    for (const [index, group] of groups.entries()) {
+      const composite = await localGroupComposite(group, bounds, maxFrames, edgeFeather, featherMask, baseMask, preprocessing.region);
+      composites.push({ frame: index, pose: centerPose,
+        bitmap: composite.bitmap, sourceFrames: composite.frames });
+    }
+    const pairs = [];
+    for (let reference = 0; reference < groups.length; reference++) for (let current = reference + 1; current < groups.length; current++) {
+      pairs.push({ reference, current, group: `${reference}:${current}` });
+    }
+    text('trackingPathRefitInfo', `Pruefe ${pairs.length} Gruppenueberlappungen vor dem Einzelbild-Refinement...`);
+    const matches = await worker.call('local-refit-register', { images: composites, pairs,
+      limits: { ...limits, radius: Math.max(limits.radius, radius), reverseRadius: Math.min(32, limits.reverseRadius) },
+      preprocessing }, composites.map(item => item.bitmap));
+    const accepted = matches.filter(match => match.forward?.accepted && match.backward?.accepted &&
+      Number.isFinite(match.reverseDistance) && match.reverseDistance <= localLimit);
+    const centers = new Map([[anchor, centerPose]]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const match of accepted) {
+        if (centers.has(match.reference) && !centers.has(match.current)) {
+          centers.set(match.current, applyPoseCorrection(match.forward.pose, match.referencePose, centers.get(match.reference)));
+          changed = true;
+        } else if (centers.has(match.current) && !centers.has(match.reference)) {
+          centers.set(match.reference, applyPoseCorrection(match.backward.pose, match.forward.pose, centers.get(match.current)));
+          changed = true;
+        }
+      }
+    }
+    return { entries: entries.map(entry => {
+      const group = groups.findIndex(items => items.some(item => item.frame === entry.frame));
+      return centers.has(group) ? { ...entry, pose: applyPoseCorrection(entry.pose, centerPose, centers.get(group)) } : entry;
+    }), attempts: matches.length, accepted: accepted.length, aligned: centers.size };
+  } finally { for (const composite of composites) composite.bitmap.close(); }
+}
+
+async function refitTrackingPath() {
+  if (!pathSelection || pathRefitBusy || trackingRunning || taskBusy) return;
+  const geometries = trackingPath.map(entry => frameGeometry(entry, calibration?.field, calibration?.maps)).filter(Boolean);
+  const seeds = geometries.filter(geometry => geometry.supports(pathSelection, trackingPixelAllowed)).map(geometry => geometry.entry.frame);
+  if (!seeds.length) { text('trackingPathRefitInfo', 'Am Auswahlpunkt liegen keine Frames.'); return; }
+  const conditionalLimit = trackingRunOptions?.contextCycleConditional ?? number('trackingContextCycleConditional', 7.5);
+  const preprocessing = refitPreprocessing();
+  const baseMask = (trackingRunOptions ?? trackingDataset?.options)?.imageMask ?? null;
+  const regionRadius = Math.min(calibration.maps.outputWidth, calibration.maps.outputHeight) * preprocessing.region / 2;
+  const localCandidates = path => path.map(entry => frameGeometry(entry, calibration?.field, calibration?.maps)).filter(Boolean)
+    .map(geometry => ({ geometry, distance: localSelectionDistance(geometry, pathSelection) }))
+    .filter(item => item.distance <= regionRadius)
+    .filter(item => localSelectionSupport(item.geometry, pathSelection, preprocessing.region, baseMask,
+      (x, y) => Boolean(calibration.maps.valid[y * calibration.maps.outputWidth + x])) >= 128)
+    .map(item => ({ ...item.geometry.entry, localSelectionDistance: item.distance }));
+  let localEntries = localCandidates(trackingPath);
+  const selectedFrame = element('trackingOverlayFrame').value;
+  if (localEntries.length < 2) { text('trackingPathRefitInfo', 'Die Auswahl enthaelt zu wenige auswertbare Frames.'); return; }
+  pathRefitBusy = true; pathRefitProposal = null; updatePathRefitControls();
+  let searchProgress = { pass: 1, round: 1, attempted: 0, limit: 512 };
+  const worker = new WorkerClient('/compute-worker.js', status => {
+    if (status.operation === 'local-refit') text('trackingPathRefitInfo', searchProgress.stage === 'group' ?
+      `Gruppenmatch ${status.pair}/${status.pairs}: Gruppe ${status.current} gegen ${status.reference}...` :
+      `Refit-Iteration ${searchProgress.pass}, Suchrunde ${searchProgress.round}, Paar ${searchProgress.attempted + status.pair}/${searchProgress.limit}: #${status.current} gegen #${status.reference}...`);
+  });
+  try {
+    const limits = { radius: Math.min(256, Math.max(64, number('trackingContextRadius', 32) * 4)),
+      reverseRadius: Math.min(256, Math.max(64, number('trackingContextRadius', 32) * 4)),
+      angle: Math.min(5, Math.max(2, number('trackingContextAngle', 1) * 4)), coarseStep: 1 };
+    let graph = buildPoseGraph(trackingPath, { conditionalLimit });
+    const localLimit = Math.min(50, Math.max(25, conditionalLimit * 3));
+    const graphOptions = { conditionalLimit, cycleLimit: localLimit, consensusLimit: localLimit,
+      lever: Math.hypot(calibration.maps.outputWidth, calibration.maps.outputHeight) / 2 };
+    searchProgress = { stage: 'group', pass: 0, round: 0, attempted: 0, limit: 0 };
+    const groupSeed = await seedFromLocalGroupMatch(localEntries, worker, limits, preprocessing, baseMask, selectedFrame, localLimit);
+    localEntries = groupSeed.entries;
+    text('trackingPathRefitInfo', `Gruppenmatch: ${groupSeed.accepted}/${groupSeed.attempts} Ueberlappungen bestaetigt, ${groupSeed.aligned} Gruppen ausgerichtet; starte Einzelbild-Refinement...`);
+    let result = null; let totalMatches = 0; let completedPasses = 0;
+    for (let pass = 1; pass <= 3 && localEntries.length >= 2; pass++) {
+      const entries = new Map(localEntries.map(entry => [entry.frame, entry]));
+      const search = await searchLocalRefit(localEntries, async (pairs, progress) => {
+        searchProgress = { ...progress, pass };
+        const requiredFrames = [...new Set(pairs.flatMap(pair => [pair.current, pair.reference]))];
+        const images = [];
+        try {
+          for (const [index, frame] of requiredFrames.entries()) {
+            text('trackingPathRefitInfo', `Refit-Iteration ${pass}: Lade Frame ${index + 1}/${requiredFrames.length}: #${frame}...`);
+            const decoded = await readTrackingFrame(frame, { rectified: true });
+            const entry = entries.get(frame); const geometry = frameGeometry(entry, calibration?.field, calibration?.maps);
+            images.push({ frame, pose: { ...entry.pose }, bitmap: decoded.bitmap,
+              mask: localSelectionMask(geometry, pathSelection, preprocessing.region, baseMask) });
+          }
+          return await worker.call('local-refit-register', { images, pairs, limits, preprocessing }, images.map(item => item.bitmap));
+        } finally { for (const item of images) item.bitmap.close(); }
+      }, { baseGraph: graph, preferredFrames: selectedFrame ? [Number(selectedFrame)] : [],
+        maxPairs: pass === 1 ? 512 : 256, graphOptions });
+      totalMatches += search.matches.length;
+      if (search.graph.localEdges < 1) {
+        if (!result) throw new Error(`Kein bestaetigter lokaler Match nach ${search.rounds} Runden (${search.limited ? 'Suchbudget erreicht' : 'Kandidaten ausgeschoepft'}). ${localRefitFailure(search.matches, localLimit)}`);
+        break;
+      }
+      graph = search.graph; completedPasses = pass;
+      text('trackingPathRefitInfo', `Refit-Iteration ${pass}: ${graph.localEdges} neue lokale Kanten; verteile Korrektur durch das Pose-Netz...`);
+      result = await worker.call('pose-graph-refit', { graph, options: { seedFrames: seeds, iterations: 10, huber: 20 } });
+      const corrected = new Map(result.corrections.map(item => [item.frame, item.pose]));
+      localEntries = localCandidates(trackingPath.map(entry => corrected.has(entry.frame) ?
+        { ...entry, pose: corrected.get(entry.frame) } : entry));
+    }
+    pathRefitProposal = { ...result, byFrame: new Map(result.corrections.map(item => [item.frame, item])),
+      overlayFrames: localEntries.map(entry => entry.frame), preprocessing, refitPasses: completedPasses,
+      refitMatches: totalMatches, groupMatches: groupSeed.accepted, groupAttempts: groupSeed.attempts, overlayReady: false };
+    text('trackingPathRefitInfo', `${groupSeed.accepted}/${groupSeed.attempts} Gruppenmatches | ${completedPasses} Refit-Iterationen, ${totalMatches} Paarversuche | ${result.nodes} Frames, ${result.edges} Kanten (${result.localEdges} lokal, ${result.spatialEdges} raeumlich) | Lokal RMS ${fixed(result.localBeforeRms, 2)} -> ${fixed(result.localAfterRms, 2)} px | Netz RMS ${fixed(result.beforeRms, 2)} -> ${fixed(result.afterRms, 2)} px | Rot gestrichelt: Vorschlag.`);
+    drawTrackingPath();
+    await loadPathOverlay(pathSelection);
+    if (!pathOverlay.width) throw new Error('Das Mischbild der Refit-Vorschau konnte nicht aufgebaut werden.');
+    pathRefitProposal.overlayReady = true;
+    text('trackingPathRefitInfo', `${groupSeed.accepted}/${groupSeed.attempts} Gruppenmatches | ${completedPasses} Refit-Iterationen, ${totalMatches} Paarversuche | ${result.nodes} Frames, ${result.edges} Kanten (${result.localEdges} lokal, ${result.spatialEdges} raeumlich) | Lokal RMS ${fixed(result.localBeforeRms, 2)} -> ${fixed(result.localAfterRms, 2)} px | Netz RMS ${fixed(result.beforeRms, 2)} -> ${fixed(result.afterRms, 2)} px | Mischbild zeigt die Refit-Vorschau.`);
+  } catch (error) { text('trackingPathRefitInfo', `Refit fehlgeschlagen: ${error.message}`); }
+  finally { worker.terminate(); pathRefitBusy = false; updatePathRefitControls(); }
+}
+
+async function discardTrackingPathRefit() {
+  if (pathRefitBusy) return;
+  pathRefitBusy = true;
+  pathRefitProposal = null; text('trackingPathRefitInfo', 'Kein Refit-Vorschlag.');
+  updatePathRefitControls(); drawTrackingPath();
+  try { if (pathSelection) await loadPathOverlay(pathSelection); }
+  finally { pathRefitBusy = false; updatePathRefitControls(); }
+}
+
+function applyTrackingPathRefit() {
+  if (!pathRefitProposal || pathRefitBusy) return;
+  for (const entry of trackingPath) {
+    const correction = pathRefitProposal.byFrame.get(entry.frame);
+    if (!correction) continue;
+    entry.pose = { ...correction.pose };
+    if (entry.raw) entry.raw = { ...entry.raw, x: entry.raw.x + correction.dx, y: entry.raw.y + correction.dy,
+      rotation: Math.atan2(Math.sin(entry.raw.rotation + correction.rotation), Math.cos(entry.raw.rotation + correction.rotation)) };
+  }
+  const summary = { created_at: new Date().toISOString(), nodes: pathRefitProposal.nodes, edges: pathRefitProposal.edges,
+    spatialEdges: pathRefitProposal.spatialEdges, localEdges: pathRefitProposal.localEdges,
+    refitPasses: pathRefitProposal.refitPasses, refitMatches: pathRefitProposal.refitMatches,
+    groupMatches: pathRefitProposal.groupMatches, groupAttempts: pathRefitProposal.groupAttempts,
+    localBeforeRms: pathRefitProposal.localBeforeRms, localAfterRms: pathRefitProposal.localAfterRms,
+    beforeRms: pathRefitProposal.beforeRms, afterRms: pathRefitProposal.afterRms,
+    preprocessing: pathRefitProposal.preprocessing };
+  if (trackingDataset) (trackingDataset.refits ??= []).push(summary);
+  pathRefitProposal = null; clearPathOverlay();
+  text('trackingPathRefitInfo', `Refit uebernommen | RMS ${fixed(summary.beforeRms, 2)} -> ${fixed(summary.afterRms, 2)} px.`);
+  updatePathRefitControls(); renderTrackingResults(trackingPath.at(-1));
+  if (pathSelection) void loadPathOverlay(pathSelection);
+}
+
+function renderPathOverlay() {
+  if (element('trackingOverlayPane').hidden) return;
+  const { context, width, height } = trackingCanvasContext('trackingOverlayCanvas');
+  context.clearRect(0, 0, width, height);
+  if (!pathOverlay.width) return;
+  const scale = Math.min(width / pathOverlay.width, height / pathOverlay.height) * overlayZoom;
+  context.imageSmoothingEnabled = false;
+  if (overlaySelectedImage && overlayBounds) {
+    const left = (width - pathOverlay.width * scale) / 2 + overlayPan.x;
+    const top = (height - pathOverlay.height * scale) / 2 + overlayPan.y;
+    const { geometry, bitmap } = overlaySelectedImage;
+    const origin = geometry.world(0, 0);
+    context.save();
+    context.translate(left + (origin.x - overlayBounds.minX) * scale, top + (origin.y - overlayBounds.minY) * scale);
+    context.transform(geometry.c * scale, geometry.s * scale, -geometry.s * scale, geometry.c * scale, 0, 0);
+    drawRefitPreviewImage(context, bitmap, 0, 0);
+    context.restore();
+    return;
+  }
+  if (pathOverlay.tiles) {
+    const left = (width - pathOverlay.width * scale) / 2 + overlayPan.x;
+    const top = (height - pathOverlay.height * scale) / 2 + overlayPan.y;
+    const ratio = context.getTransform().a;
+    const snap = value => Math.round(value * ratio) / ratio;
+    for (const tile of pathOverlay.tiles) {
+      const x = snap(left + tile.x * scale), y = snap(top + tile.y * scale);
+      const w = snap(left + (tile.x + tile.width) * scale) - x;
+      const h = snap(top + (tile.y + tile.height) * scale) - y;
+      if (w <= 0 || h <= 0 || x >= width || y >= height || x + w <= 0 || y + h <= 0) continue;
+      drawRefitPreviewImage(context, tile.bitmap, 0, 0, tile.width, tile.height, x, y, w, h);
+    }
+    return;
+  }
+  drawRefitPreviewImage(context, pathOverlay, (width - pathOverlay.width * scale) / 2 + overlayPan.x,
+    (height - pathOverlay.height * scale) / 2 + overlayPan.y, pathOverlay.width * scale, pathOverlay.height * scale);
+}
+
+function publishOverlayContributors(supporting, bounds) {
+  overlayContributors = supporting;
+  overlayBounds = bounds;
+  const selector = element('trackingOverlayFrame');
+  selector.replaceChildren(new Option('Mischbild', ''));
+  for (const geometry of supporting) {
+    const entry = geometry.entry;
+    const score = Number.isFinite(entry.sharpness?.score) ? ` | Schaerfe ${fixed(entry.sharpness.score, 1)}` : '';
+    const matches = (entry.incrementalMatch ? 1 : 0) + (entry.context?.matches?.length ?? 0);
+    selector.add(new Option(`#${entry.frame}${score} | ${matches} Matches`, String(entry.frame)));
+  }
+  selector.disabled = false;
+}
+
+async function selectOverlayContributor() {
+  const request = ++overlaySelectionRequest;
+  overlaySelectedImage?.bitmap.close();
+  overlaySelectedImage = null;
+  const frame = Number(element('trackingOverlayFrame').value);
+  const geometry = overlayContributors.find(item => item.entry.frame === frame);
+  element('trackingOverlayInspect').disabled = !geometry;
+  if (!geometry) { renderPathOverlay(); return; }
+  text('trackingOverlayInfo', `Lade Frame #${frame} einzeln...`);
+  const decoded = await readTrackingFrame(frame, { rectified: true });
+  if (request !== overlaySelectionRequest) { decoded.bitmap.close(); return; }
+  overlaySelectedImage = { geometry, bitmap: decoded.bitmap };
+  const pose = geometry.entry.pose ?? geometry.entry.raw;
+  text('trackingOverlayInfo', `Frame #${frame} einzeln | Pose (${fixed(pose.x, 2)}, ${fixed(pose.y, 2)}, ${fixed(pose.rotation * 180 / Math.PI, 3)} Grad) | Pruefen zeigt die zugehoerigen Referenzmatches.`);
+  renderPathOverlay();
+}
+
+async function loadPathOverlay(point) {
+  const request = ++overlayRequest;
+  pathSelection = point;
+  updatePathRefitControls();
+  const maxFrames = number('trackingOverlayMaxFrames', 3);
+  const edgeFeather = number('overlayEdgeFeather', 10) / 100;
+  if (!Number.isInteger(maxFrames) || maxFrames < 1 || maxFrames > 64) {
+    text('trackingOverlayInfo', 'Framegrenze muss zwischen 1 und 64 liegen.'); return;
+  }
+  const positionLabel = `${pathRefitProposal ? 'Refit-Vorschau | ' : ''}Position (${fixed(point.x, 1)}, ${fixed(point.y, 1)}) | Top ${maxFrames}/Bereich`;
+  element('trackingOverlayPane').hidden = false;
+  clearPathOverlay();
+  overlayZoom = 1; overlayPan = { x: 0, y: 0 }; renderPathOverlay(); drawTrackingPath();
+  if (!videoInfo || !calibration || (trackingDataset?.video && trackingDataset.video.name !== videoInfo.name)) {
+    text('trackingOverlayInfo', 'Bitte das zum Tracking gehoerende Video und die Kalibrierung laden.'); return;
+  }
+  if (trackingRunning || taskBusy) { text('trackingOverlayInfo', 'Verarbeitung pausieren und die Position erneut anklicken.'); return; }
+  const previewFrames = pathRefitProposal?.overlayFrames ? new Set(pathRefitProposal.overlayFrames) : null;
+  const candidates = sharpestFramesFirst(trackingPath.filter(item => !previewFrames || previewFrames.has(item.frame))
+    .map(item => trackingGeometry(item)).filter(geometry => geometry && (previewFrames || geometry.supports(point, trackingPixelAllowed))));
+  if (!candidates.length) { text('trackingOverlayInfo', 'Keine Bilddaten an dieser Position.'); return; }
+  const supporting = previewFrames ? candidates : approximateTopFrames(candidates, maxFrames, trackingPixelAllowed, point);
+  const corners = supporting.flatMap(geometry => geometry.corners);
+  const minX = Math.floor(Math.min(...corners.map(p => p.x))), minY = Math.floor(Math.min(...corners.map(p => p.y)));
+  const width = Math.ceil(Math.max(...corners.map(p => p.x))) - minX;
+  const height = Math.ceil(Math.max(...corners.map(p => p.y))) - minY;
+  const bounds = { minX, minY, width, height };
+  if (element('trackingUseWebGpu').checked && navigator.gpu) {
+    const previous = overlayGpuIdle;
+    let release;
+    overlayGpuIdle = new Promise(resolve => { release = resolve; });
+    await previous; // Cancelled requests release large buffers before the next allocation.
+    let overlay = null;
+    const started = performance.now();
+    try {
+      await frameReader.dispose(); // Reserve the GPU budget for the overlay's accumulation buffers.
+      if (request !== overlayRequest) return;
+      text('trackingOverlayInfo', `${positionLabel} | Bereite Vollaufloesung ${width} x ${height} vor...`);
+      if (await WebGpuOverlay.needsTiles(calibration.maps, width, height)) {
+        const tiled = await renderTiledOverlay({ maps: calibration.maps, width, height, minX, minY,
+          geometries: supporting, pixelAllowed: trackingPixelAllowed, maxFrames, edgeFeather,
+          decode: index => readTrackingFrame(index, { output: 'native' }), cancelled: () => request !== overlayRequest,
+          progress: p => text('trackingOverlayInfo', `${positionLabel} | Kachel ${p.tileIndex + 1}/${p.tileCount} bis ${p.tileSize} px | Kandidat ${p.frameIndex + 1}/${p.frameCount}: #${p.frame} | Durchlauf ${p.framePass}/${p.plannedFramePasses} | WebGPU, Vollaufloesung`) });
+        if (!tiled) return;
+        if (request !== overlayRequest) { closeOverlayTiles(tiled); return; }
+        pathOverlay = tiled;
+        publishOverlayContributors(supporting, bounds);
+        text('trackingOverlayInfo', `${positionLabel} | ${supporting.length} von ${candidates.length} Kandidaten | ${width} x ${height} px, Vollaufloesung | WebGPU | ${tiled.tiles.length} Kacheln bis ${tiled.tileSize} px | ${fixed(tiled.frameMs / Math.max(1, tiled.framePasses), 1)} ms/Frame-Durchlauf | ${tiled.framePasses} Durchlaeufe | Gesamt ${fixed((performance.now() - started) / 1000, 2)} s`);
+        element('trackingOverlayInfo').textContent += ` | Frameabruf ${fixed(tiled.decodeMs / 1000, 2)} s | GPU inkl. Entzerrung/Warten ${fixed(tiled.gpuMs / 1000, 2)} s | Ausgabe ${fixed(tiled.finishMs / 1000, 2)} s | Vorbereitung ${fixed(tiled.setupMs, 0)} ms`;
+        renderPathOverlay();
+        return;
+      }
+      overlay = await WebGpuOverlay.create(calibration.maps, width, height, minX, minY, trackingPixelAllowed, maxFrames, edgeFeather);
+      if (request !== overlayRequest) return;
+      const setupMs = performance.now() - started;
+      let frameMs = 0, decodeMs = 0, gpuMs = 0;
+      for (const [index, geometry] of supporting.entries()) {
+        text('trackingOverlayInfo', `${positionLabel} | Lade ${index + 1}/${supporting.length}: Frame #${geometry.entry.frame} | WebGPU, Vollaufloesung`);
+        const frameStarted = performance.now();
+        const decoded = await readTrackingFrame(geometry.entry.frame, { output: 'native' });
+        decodeMs += performance.now() - frameStarted;
+        try {
+          if (request !== overlayRequest) return;
+          const gpuStarted = performance.now();
+          await overlay.addFrame(decoded.frame, decoded.orientation, geometry);
+          gpuMs += performance.now() - gpuStarted;
+        } finally { decoded.frame.close(); }
+        if (request !== overlayRequest) return;
+        frameMs += performance.now() - frameStarted;
+      }
+      const bitmap = await overlay.finish();
+      try {
+        if (request !== overlayRequest) return;
+        pathOverlay.width = width; pathOverlay.height = height;
+        pathOverlay.getContext('2d').drawImage(bitmap, 0, 0);
+      } finally { bitmap.close(); }
+      text('trackingOverlayInfo', `${positionLabel} | ${supporting.length} von ${candidates.length} Kandidaten | ${width} x ${height} px, Vollaufloesung | WebGPU | ${fixed(frameMs / supporting.length, 1)} ms/Frame | Vorbereitung ${fixed(setupMs, 0)} ms | Gesamt ${fixed((performance.now() - started) / 1000, 2)} s`);
+      element('trackingOverlayInfo').textContent += ` | Frameabruf ${fixed(decodeMs / 1000, 2)} s | GPU inkl. Entzerrung/Warten ${fixed(gpuMs / 1000, 2)} s`;
+      publishOverlayContributors(supporting, bounds);
+      renderPathOverlay();
+    } catch (error) {
+      if (request === overlayRequest) text('trackingOverlayInfo', `Ueberlagerung fehlgeschlagen: ${error.message}`);
+    } finally { overlay?.destroy(); release(); }
+    return;
+  }
+  // Keep the native pixel scale. Larger mosaics need tiling, never silent downscaling.
+  if (width * height > 64e6 || Math.max(width, height) > 16384) {
+    text('trackingOverlayInfo', 'Vollaufloesende Ueberlagerung ist zu gross fuer den CPU-Puffer. Kleineren Bildbereich auswaehlen.'); return;
+  }
+  const resolution = 1;
+  const composite = document.createElement('canvas');
+  composite.width = Math.ceil(width * resolution); composite.height = Math.ceil(height * resolution);
+  const context = composite.getContext('2d', { willReadFrequently: true });
+  // Sum before dividing to avoid rounding alpha 1/N to zero for long paths.
+  const sum = new Float32Array(composite.width * composite.height * 4);
+  const counts = new Uint32Array(composite.width * composite.height);
+  const scratch = document.createElement('canvas');
+  const featherMask = edgeFeatherMask(calibration.maps.outputWidth, calibration.maps.outputHeight, trackingPixelAllowed, edgeFeather);
+  try {
+    for (const [index, geometry] of supporting.entries()) {
+      text('trackingOverlayInfo', `${positionLabel} | Lade ${index + 1}/${supporting.length}: Frame #${geometry.entry.frame}`);
+      const image = await readTrackingFrame(geometry.entry.frame, { rectified: true, output: 'rgba' });
+      if (request !== overlayRequest) return;
+      applyPixelMask(image.data, image.width, trackingPixelAllowed);
+      applyEdgeFeather(image.data, image.width, image.height, edgeFeather, featherMask);
+      scratch.width = image.width; scratch.height = image.height;
+      scratch.getContext('2d').putImageData(new ImageData(image.data, image.width, image.height), 0, 0);
+      const origin = geometry.world(0, 0);
+      context.setTransform(1, 0, 0, 1, 0, 0);
+      context.clearRect(0, 0, composite.width, composite.height);
+      context.setTransform(resolution * geometry.c, resolution * geometry.s, -resolution * geometry.s, resolution * geometry.c,
+        resolution * (origin.x - minX), resolution * (origin.y - minY));
+      context.drawImage(scratch, 0, 0);
+      accumulateFrame(sum, context.getImageData(0, 0, composite.width, composite.height).data, counts, maxFrames);
+    }
+    pathOverlay.width = composite.width; pathOverlay.height = composite.height;
+    pathOverlay.getContext('2d').putImageData(new ImageData(averagedFrames(sum), composite.width, composite.height), 0, 0);
+    text('trackingOverlayInfo', `${positionLabel} | ${supporting.length} von ${candidates.length} Kandidaten | ${width} x ${height} px, Vollaufloesung | Gleich gewichtet, deckend | ${supporting.map(g => `#${g.entry.frame}`).join(', ')}`);
+    publishOverlayContributors(supporting, bounds);
+    renderPathOverlay();
+  } catch (error) { if (request === overlayRequest) text('trackingOverlayInfo', `Ueberlagerung fehlgeschlagen: ${error.message}`); }
+}
+
+function installPathInteraction() {
+  const path = element('trackingPathCanvas');
+  const hit = event => {
+    if (!pathProject) return null;
+    const bounds = path.getBoundingClientRect();
+    return pathProject.invert({ x: event.clientX - bounds.left, y: event.clientY - bounds.top });
+  };
+  path.addEventListener('pointermove', event => { pathHover = hit(event); drawTrackingPath(); });
+  path.addEventListener('pointerleave', () => { pathHover = null; drawTrackingPath(); });
+  path.addEventListener('click', event => { const point = hit(event); if (point) void loadPathOverlay(point); });
+  const canvas = element('trackingOverlayCanvas');
+  let drag = null;
+  canvas.addEventListener('pointerdown', event => { if (event.button !== 0) return; drag = { clientX: event.clientX, clientY: event.clientY, pan: { ...overlayPan } }; canvas.setPointerCapture(event.pointerId); });
+  canvas.addEventListener('pointermove', event => { if (!drag) return; overlayPan = { x: drag.pan.x + event.clientX - drag.clientX, y: drag.pan.y + event.clientY - drag.clientY }; renderPathOverlay(); });
+  for (const name of ['pointerup', 'pointercancel', 'lostpointercapture']) canvas.addEventListener(name, () => { drag = null; });
+  canvas.addEventListener('wheel', event => {
+    event.preventDefault();
+    const bounds = canvas.getBoundingClientRect();
+    const next = Math.max(0.25, Math.min(64, overlayZoom * Math.exp(-event.deltaY * 0.001)));
+    const factor = next / overlayZoom;
+    const x = event.clientX - bounds.left - bounds.width / 2, y = event.clientY - bounds.top - bounds.height / 2;
+    overlayPan = { x: x - (x - overlayPan.x) * factor, y: y - (y - overlayPan.y) * factor };
+    overlayZoom = next; renderPathOverlay();
+  }, { passive: false });
+  element('trackingOverlayFit').onclick = () => { overlayZoom = 1; overlayPan = { x: 0, y: 0 }; renderPathOverlay(); };
+  element('trackingPathRefit').onclick = () => void refitTrackingPath();
+  element('trackingPathRefitApply').onclick = applyTrackingPathRefit;
+  element('trackingPathRefitDiscard').onclick = () => void discardTrackingPathRefit();
+  for (const id of ['refitBrightness', 'refitContrast', 'refitGamma', 'refitRed', 'refitGreen', 'refitBlue', 'refitRegion', 'overlayEdgeFeather']) {
+    element(id).addEventListener('input', updateRefitPreprocessing);
+  }
+  element('overlayEdgeFeather').addEventListener('change', () => { if (pathSelection) void loadPathOverlay(pathSelection); });
+  element('refitPreprocessPreview').onchange = renderPathOverlay;
+  element('refitPreprocessReset').onclick = () => {
+    const defaults = { refitBrightness: 0, refitContrast: 100, refitGamma: 1, refitRed: 30, refitGreen: 59, refitBlue: 11,
+      refitRegion: 40, overlayEdgeFeather: 10 };
+    for (const [id, value] of Object.entries(defaults)) element(id).value = value;
+    updateRefitPreprocessing();
+    if (pathSelection) void loadPathOverlay(pathSelection);
+  };
+  element('trackingOverlayFrame').onchange = () => void selectOverlayContributor().catch(error => message(error.message, true));
+  element('trackingOverlayInspect').onclick = () => {
+    const frame = Number(element('trackingOverlayFrame').value);
+    const entry = overlayContributors.find(item => item.entry.frame === frame)?.entry;
+    if (!entry) return;
+    void showTrackedFrame(entry).then(() => element('trackingInspector').scrollIntoView({ behavior: 'smooth', block: 'start' })).catch(error => message(error.message, true));
+  };
+  element('trackingOverlayMaxFrames').onchange = () => { if (pathSelection) void loadPathOverlay(pathSelection); };
+  updateRefitPreprocessing();
+  updatePathRefitControls();
+  new ResizeObserver(drawTrackingPath).observe(path.parentElement);
+  new ResizeObserver(renderPathOverlay).observe(canvas.parentElement);
+}
+
+function installTrackingMaskInteraction() {
+  const canvas = element('trackingMaskCanvas');
+  let painting = false;
+  const paint = event => {
+    if (!trackingMaskTransform || !trackingImageMask) return;
+    const bounds = canvas.getBoundingClientRect();
+    const x = (event.clientX - bounds.left - trackingMaskTransform.left) / trackingMaskTransform.scale;
+    const y = (event.clientY - bounds.top - trackingMaskTransform.top) / trackingMaskTransform.scale;
+    if (x < 0 || y < 0 || x >= trackingImageMask.sourceWidth || y >= trackingImageMask.sourceHeight) return;
+    paintPatchMask(trackingImageMask, x, y, number('trackingMaskBrush', 96) / 2,
+      trackingMaskTool === 'include' ? MASK_SEARCH : MASK_NEUTRAL);
+    if (trackingMaskTool === 'include') trackingMaskHasSelection = true;
+    renderTrackingMask(); drawTrackingPath();
+  };
+  canvas.addEventListener('pointerdown', event => {
+    if (event.button !== 0) return;
+    painting = true; canvas.setPointerCapture(event.pointerId); paint(event);
+  });
+  canvas.addEventListener('pointermove', event => { if (painting) paint(event); });
+  const finish = () => {
+    if (!painting) return;
+    painting = false;
+    trackingMaskHasSelection = trackingImageMask?.data.includes(MASK_SEARCH) ?? false;
+    updateTrackingMaskInfo();
+    if (pathSelection) void loadPathOverlay(pathSelection);
+  };
+  canvas.addEventListener('pointerup', finish);
+  canvas.addEventListener('pointercancel', finish);
+  for (const button of document.querySelectorAll('[data-tracking-mask-tool]')) button.onclick = () => {
+    trackingMaskTool = button.dataset.trackingMaskTool;
+    for (const tool of document.querySelectorAll('[data-tracking-mask-tool]')) tool.setAttribute('aria-pressed', String(tool === button));
+    renderTrackingMask();
+  };
+  element('trackingMaskBrush').oninput = () => {
+    text('trackingMaskBrushValue', `${element('trackingMaskBrush').value} px`);
+    saveVideoOptions();
+  };
+  element('reloadTrackingMask').onclick = () => { void loadTrackingMaskPreview(); };
+  element('clearTrackingMask').onclick = () => {
+    if (!trackingImageMask) return;
+    trackingImageMask.data.fill(MASK_NEUTRAL); trackingImageMask.revision++;
+    trackingMaskHasSelection = false;
+    updateTrackingMaskInfo();
+    renderTrackingMask(); drawTrackingPath();
+    if (pathSelection) void loadPathOverlay(pathSelection);
+  };
+  new ResizeObserver(renderTrackingMask).observe(canvas.parentElement);
 }
 
 function renderTrackingResults(entry) {
+  updateCorrectionDataStatus();
   const pose = entry.pose;
   text('trackingFrameState', `Frame ${entry.frame} / PTS ${(entry.timestamp / 1e6).toFixed(6)} s`);
-  text('trackingPreviewState', entry.success ? `${entry.points} Patches | ${entry.rediscovered} wiedererkannt | ${entry.accelerator}` : entry.reason);
+  const sharpnessLabel = Number.isFinite(entry.sharpness?.score) ? ` | Schaerfe ${fixed(entry.sharpness.score, 2)}` : '';
+  text('trackingPreviewState', entry.success ? `${entry.points} Patches | ${entry.rediscovered} wiedererkannt | ${entry.accelerator}${sharpnessLabel}` : entry.reason);
   if (entry.mode === 'window') {
-    text('trackingPreviewState', entry.success ? `Window | ${entry.resolution} | ${entry.accelerator}` : entry.reason);
-    text('trackingMatchQuality', `Korrelation: ${fixed(entry.score, 3)} | Iterationen: ${entry.iterations ?? 0}`);
+    text('trackingPreviewState', entry.success ? `Window | ${entry.resolution} | ${entry.accelerator}${sharpnessLabel}` : entry.reason);
+    const context = entry.context;
+    const status = context ? ` | Umfeld ${context.inliers.length}/${context.selected}: ${context.applied ? 'korrigiert' : 'inkrementell'} | ${context.accelerator || 'CPU'}${context.fallback ? ' (Fallback)' : ''}` : '';
+    text('trackingMatchQuality', `Korrelation: ${fixed(entry.score, 3)} | Iterationen: ${entry.iterations ?? 0}${status}`);
+    element('trackingMatchQuality').title = context?.matches.map(match => {
+      const diagnostics = `${Number.isFinite(match.margin) ? ` | Marge ${fixed(match.margin, 5)}` : ''}${Number.isFinite(match.reverseDistance) ? ` | Rueckweg ${fixed(match.reverseDistance, 2)} px` : ''}${Number.isFinite(match.searchRadius) ? ` | Radius ${match.searchRadius} px` : ''}`;
+      return `#${match.frame} ${match.kind || ''}: NCC ${fixed(match.score, 3)}${diagnostics} ${match.reason || (context.inliers.includes(match.frame) ? 'Konsens' : 'kein Konsens')}`;
+    }).join('\n') || '';
+    if (context) element('trackingMatchQuality').title += `\nBildcache: ${context.cacheHits ?? 0} Treffer / ${context.cacheMisses ?? 0} angeforderte Nachladungen\nGPU-Cache: ${fixed((context.gpuCacheBytes || 0) / 1048576, 1)} MiB${context.fallback ? `\nCPU-Fallback/Backendwahl: ${context.fallback}` : ''}`;
+    if (context?.pyramidBytes) element('trackingMatchQuality').title += `\nPyramide ${context.imageWidth} x ${context.imageHeight}: ${fixed(context.pyramidBytes / 1048576, 1)} MiB | Cache ${context.cacheEntries} Bilder, ${fixed(context.cacheBytes / 1048576, 1)}/${fixed(context.cacheLimit / 1048576, 0)} MiB, Kapazitaet ${Math.floor(context.cacheLimit / context.pyramidBytes)} Bilder | ${context.cacheEvictions} Verdraengungen`;
   }
   if (pose) {
     text('trackingX', `${fixed(pose.x, 3)} px`); text('trackingY', `${fixed(pose.y, 3)} px`);
@@ -1341,16 +2173,24 @@ function renderTrackingResults(entry) {
   }
   text('trackingPatchCount', String(entry.points));
   text('trackingPathState', `${trackingPath.filter(item => item.pose).length} Posen`);
-  text('trackingSummary', `${trackingPath.length} Frames | Fenster ${number('trackingWindow', 15)}`);
+  text('trackingSummary', `${trackingPath.length} Frames | Fenster ${number('trackingWindow', 1)}`);
   const tbody = element('trackingTable'); tbody.replaceChildren();
-  for (const item of trackingPath.slice(-200).reverse()) {
+  const referenceCounts = trackingReferenceCounts(trackingPath);
+  for (const item of [...trackingPath, ...trackingFailures].sort((first, second) => first.frame - second.frame).slice(-200).reverse()) {
     const row = tbody.insertRow();
     row.className = 'tracking-row'; row.tabIndex = 0;
     row.insertCell().textContent = `#${item.frame} / ${(item.timestamp / 1e6).toFixed(3)} s`;
     row.insertCell().textContent = item.pose ? fixed(item.pose.x, 3) : '-';
     row.insertCell().textContent = item.pose ? fixed(item.pose.y, 3) : '-';
     row.insertCell().textContent = item.pose ? `${fixed(item.pose.rotation * 180 / Math.PI, 4)} deg` : '-';
-    row.insertCell().textContent = item.mode === 'window' ? (item.success ? `NCC ${fixed(item.score, 3)}` : item.reason) : item.raw ? `${item.raw.points} / ${fixed(item.raw.rms, 3)} px` : item.reason;
+    row.insertCell().textContent = (item.mode === 'window' ? (item.success ? `NCC ${fixed(item.score, 3)}` : item.reason) :
+      item.raw ? `${item.raw.points} / ${fixed(item.raw.rms, 3)} px` : item.reason);
+    row.insertCell().textContent = Number.isFinite(item.sharpness?.score) ? fixed(item.sharpness.score, 2) : '-';
+    const stats = referenceCounts.get(item.frame) ?? { referencedBy: null, references: null };
+    const referencedBy = row.insertCell(); referencedBy.textContent = stats.referencedBy ?? '-';
+    referencedBy.title = stats.referencedBy === null ? 'Keine Umfeldreferenzdiagnose gespeichert' : `Von anderen Frames angefordert: ${stats.referencedBy}; davon im Konsens: ${stats.consensusBy}`;
+    const references = row.insertCell(); references.textContent = stats.references ?? '-';
+    references.title = stats.references === null ? 'Keine Umfeldreferenzdiagnose gespeichert' : `Eigene angeforderte Umfeldreferenzen: ${stats.references}; davon im Konsens: ${stats.consensus}`;
     row.onclick = () => void showTrackedFrame(item).catch(error => message(error.message, true));
     row.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); void showTrackedFrame(item).catch(error => message(error.message, true)); } };
   }
@@ -1361,7 +2201,7 @@ function trackingOptions() {
   const patchSize = number('trackingPatchSize', 64);
   const patchSearchRadius = number('trackingSearchRadius', 32);
   const threshold = number('trackingThreshold', 16);
-  const windowSize = number('trackingWindow', 15);
+  const windowSize = number('trackingWindow', 1);
   const maximumSearchRadius = windowTracking() ? 1024 : 128;
   if (!Number.isFinite(patchSearchRadius) || patchSearchRadius < 4 || patchSearchRadius > maximumSearchRadius) {
     throw new Error(`Suchradius muss zwischen 4 und ${maximumSearchRadius} px liegen.`);
@@ -1371,8 +2211,24 @@ function trackingOptions() {
     throw new Error('Patchgroesse muss zwischen 16 und 256 px liegen; Mindestkontrast muss positiv und endlich sein.');
   }
   const maxRotation = number('trackingMaxRotation', 5);
+  const contextRecent = number('trackingContextRecent', 2); const contextSpatial = number('trackingContextSpatial', 2);
+  const contextRadius = number('trackingContextRadius', 32); const contextAngle = number('trackingContextAngle', 1);
+  const contextCycleStrict = number('trackingContextCycleStrict', 1.5);
+  const contextCycleConditional = number('trackingContextCycleConditional', 7.5);
+  if (windowTracking() && (![contextRecent, contextSpatial].every(value => Number.isInteger(value) && value >= 0 && value <= 8) ||
+    !Number.isFinite(contextRadius) || contextRadius < 4 || contextRadius > 256 || !Number.isFinite(contextAngle) || contextAngle < 0.1 || contextAngle > 5 ||
+    !Number.isFinite(contextCycleStrict) || contextCycleStrict <= 0 || !Number.isFinite(contextCycleConditional) ||
+    contextCycleConditional < contextCycleStrict || contextCycleConditional > 50)) {
+    throw new Error('Umfeld: n/m 0 bis 8, Radius 4 bis 256 px, Winkel 0.1 bis 5 Grad; Zyklusgrenzen positiv, aufsteigend und maximal 50 px.');
+  }
   if (windowTracking() && (!trackingRectangle || !Number.isFinite(maxRotation) || maxRotation < 1 || maxRotation > 10)) throw new Error('Fenster auswaehlen und Rotationsgrenze zwischen 1 und 10 Grad setzen.');
+  const sourceImageMask = trackingMaskHasSelection && trackingImageMask ?
+    { ...trackingImageMask, coordinateSystem: 'oriented source pixels', data: Array.from(trackingImageMask.data) } : null;
+  const imageMask = windowTracking() && sourceImageMask ? remapInclusionMask(trackingImageMask, calibration?.maps) : null;
   return { mode: element('trackingMode').value, rectangle: trackingRectangle ? { ...trackingRectangle } : null, maxRotation,
+    contextRecent, contextSpatial, contextRadius, contextAngle, contextCycleStrict, contextCycleConditional,
+    sourceImageMask, imageMask: imageMask ? { ...imageMask, data: Array.from(imageMask.data) } : null,
+    patchMask: !windowTracking() ? sourceImageMask : null,
     pattern: 'patches', patchSize, patchSearchRadius, threshold, rediscoverPatches: true,
     useWebGpu: element('trackingUseWebGpu').checked };
 }
@@ -1383,52 +2239,100 @@ async function runTracking(restart = false) {
   const start = Math.max(0, Math.min(videoInfo.frameCount - 1, Math.round(number('trackingStart', 0))));
   const end = Math.max(start, Math.min(videoInfo.frameCount - 1, Math.round(number('trackingEnd', videoInfo.frameCount - 1))));
   if (trackingPreviewBusy) return;
-  const options = !restart && trackingRunOptions ? trackingRunOptions : trackingOptions();
+  let options = !restart && trackingRunOptions ? trackingRunOptions : trackingOptions();
+  if (!restart && trackingRunOptions?.mode === 'window') {
+    const changed = trackingOptions();
+    options = { ...trackingRunOptions, patchSearchRadius: changed.patchSearchRadius, maxRotation: changed.maxRotation,
+      contextRadius: changed.contextRadius, contextAngle: changed.contextAngle,
+      contextCycleStrict: changed.contextCycleStrict, contextCycleConditional: changed.contextCycleConditional };
+    trackingRunOptions = options;
+  }
   message();
   if (restart) {
     clearTrackingResults(true); trackingNextIndex = start;
     trackingRunOptions = options;
-    trackingProfile = { mode: options.mode, frames: 0, decodeMs: 0, rgbaMs: 0, remapMs: 0, workerTransferMs: 0, trackMs: 0, poseMs: 0,
+    trackingProfile = { mode: options.mode, frames: 0, decodeMs: 0, sharpnessMs: 0, rgbaMs: 0, remapMs: 0, referenceMs: 0, workerTransferMs: 0, trackMs: 0, poseMs: 0,
       renderMs: 0, totalMs: 0, lastTotalMs: 0, accelerators: new Set(), tracker: { accelerator: 'CPU',
         grayscaleMs: 0, contextMs: 0, uploadMs: 0, forwardMs: 0, backwardMs: 0, postprocessMs: 0, sampleMs: 0, matchMs: 0, refinementMs: 0 } };
   }
+  trackingInspector.clear();
   video.pause(); trackingRunning = true; trackingPaused = false; updateControls();
   try {
+    const nativeTracking = options.mode === 'window' && options.useWebGpu && (options.contextRecent > 0 || options.contextSpatial > 0);
+    if (nativeTracking && trackingComputer.nativeMaps !== calibration.maps) {
+      const { outputWidth, outputHeight, inverseX, inverseY, valid } = calibration.maps;
+      await trackingComputer.call('tracking-maps', { maps: { outputWidth, outputHeight, inverseX, inverseY, valid } });
+      trackingComputer.nativeMaps = calibration.maps;
+    }
     while (trackingRunning && trackingNextIndex <= end) {
       const frameStarted = performance.now();
       const index = trackingNextIndex;
       text('processingStatus', `Tracking Frame ${index}/${end}`);
       element('progress').value = (index - start + 1) / (end - start + 1);
-      const decodeStarted = performance.now();
-      const decoded = await decoder.call('frame', { index });
-      const decodeMs = performance.now() - decodeStarted;
-      const rgbaStarted = performance.now();
-      let image;
-      try { image = imageFromBitmap(decoded.bitmap); } finally { decoded.bitmap.close(); }
-      const rgbaMs = performance.now() - rgbaStarted;
-      let remapMs = 0;
-      if (options.mode === 'window') {
-        const remapStarted = performance.now();
-        image = await computer.call('remap', { image, useWebGpu: options.useWebGpu }, [image.data.buffer]);
-        remapMs = performance.now() - remapStarted;
-      }
+      const image = await readTrackingFrame(index, { gpu: options.useWebGpu,
+        rectified: !nativeTracking && options.mode === 'window', output: nativeTracking ? 'native' : 'rgba' });
+      const { decodeMs, sharpnessMs, rgbaMs, remapMs } = image.frameTiming;
       const renderStarted = performance.now();
-      trackingPreviewImage.width = image.width; trackingPreviewImage.height = image.height;
-      trackingPreviewImage.getContext('2d').putImageData(new ImageData(image.data, image.width, image.height), 0, 0);
+      if (!nativeTracking) {
+        trackingPreviewImage.width = image.width; trackingPreviewImage.height = image.height;
+        trackingPreviewImage.getContext('2d').putImageData(new ImageData(image.data, image.width, image.height), 0, 0);
+      }
       let renderMs = performance.now() - renderStarted;
       const workerStarted = performance.now();
-      const detection = await trackingComputer.call(options.mode === 'window' ? 'track-window' : 'detect', { image, index, options }, [image.data.buffer]);
-      const workerRoundtripMs = performance.now() - workerStarted;
+      let detection, nativeRenderMs = 0;
+      if (nativeTracking) {
+        try {
+          detection = await trackingComputer.call('track-window-native', { native: { frame: image.frame, orientation: image.orientation }, index, options }, [image.frame]);
+        } finally { image.frame.close(); }
+        const previewStarted = performance.now();
+        try {
+          trackingPreviewImage.width = detection.width; trackingPreviewImage.height = detection.height;
+          trackingPreviewImage.getContext('2d').drawImage(detection.preview, 0, 0);
+        } finally { detection.preview?.close(); delete detection.preview; }
+        nativeRenderMs = performance.now() - previewStarted; renderMs += nativeRenderMs;
+      } else detection = await trackingComputer.call(options.mode === 'window' ? 'track-window' : 'detect', { image, index, options }, [image.data.buffer]);
+      let referenceMs = 0;
+      if (detection.contextPending) {
+        for (const referenceIndex of detection.references) {
+          let reference = null; let failure = null;
+          const referenceStarted = performance.now();
+          try {
+            if (!trackingRunning) throw new Error('Pausiert');
+            text('processingStatus', `Tracking #${index} | Umfeld #${referenceIndex}`);
+            reference = await readTrackingFrame(referenceIndex, { gpu: options.useWebGpu, rectified: !nativeTracking, output: nativeTracking ? 'native' : 'rgba' });
+            for (const [destination, source] of [['referenceDecodeMs', 'decodeMs'], ['referenceSharpnessMs', 'sharpnessMs'], ['referenceRgbaMs', 'rgbaMs'], ['referenceRemapMs', 'remapMs']]) {
+              trackingProfile[destination] = (trackingProfile[destination] || 0) + (reference.frameTiming?.[source] || 0);
+            }
+          } catch (error) { failure = error.message; }
+          referenceMs += performance.now() - referenceStarted;
+          try {
+            await trackingComputer.call('context-reference', { index: referenceIndex,
+              ...(nativeTracking && reference ? { native: { frame: reference.frame, orientation: reference.orientation } } : { image: reference }),
+              error: failure }, reference ? [nativeTracking ? reference.frame : reference.data.buffer] : []);
+          } finally { reference?.frame?.close(); }
+        }
+        detection = await trackingComputer.call('context-finish');
+      }
+      const workerRoundtripMs = performance.now() - workerStarted - referenceMs - nativeRenderMs;
       const poseStarted = performance.now();
       const raw = options.mode === 'window' ? detection.raw ?? null : detection.success && detection.points.length >= 3 ? fitCameraPose(detection.points, calibration.field) : null;
-      const entry = { frame: index, timestamp: videoInfo.timestamps[index], raw, pose: null,
+      const entry = { frame: index, timestamp: videoInfo.timestamps[index], sharpness: image.sharpness, raw, pose: null,
         mode: options.mode, rectangle: options.rectangle, score: detection.score, iterations: detection.iterations, resolution: detection.resolution,
+        incremental: detection.incremental, incrementalMatch: detection.incrementalMatch, context: detection.context,
         points: options.mode === 'window' ? (detection.success ? 1 : 0) : detection.points.length, patchPoints: detection.points,
         rediscovered: detection.rediscovered || 0,
         success: detection.success && Boolean(raw), reason: detection.reason || (raw ? '' : 'Zu wenige gueltige Patch-Paare im Kalibrierbereich.'),
         accelerator: detection.accelerator || 'CPU' };
+      if (options.mode === 'window' && !detection.success) {
+        trackingFailures.push(entry);
+        renderTrackingResults(entry); trackingInspector.show(entry);
+        trackingPaused = true;
+        message(`${detection.reason} Suchgrenze anpassen und denselben Frame mit Fortsetzen erneut versuchen.`, true);
+        break;
+      }
+      if (detection.context?.loopClosure) applyLoopClosure(trackingPath, detection.context.loopClosure);
       trackingPath.push(entry);
-      entry.pose = stabilizePose(trackingPath, number('trackingWindow', 15));
+      entry.pose = stabilizePose(trackingPath, number('trackingWindow', 1));
       const poseMs = performance.now() - poseStarted;
       const overlayStarted = performance.now();
       drawTrackingPatches(detection.points); renderTrackingResults(entry);
@@ -1436,20 +2340,29 @@ async function runTracking(restart = false) {
       const workerMs = detection.timing?.totalMs ?? workerRoundtripMs;
       const profile = trackingProfile;
       profile.frames++;
-      profile.decodeMs += decodeMs; profile.rgbaMs += rgbaMs; profile.remapMs += remapMs; profile.workerTransferMs += Math.max(0, workerRoundtripMs - workerMs);
+      profile.referenceMs = (profile.referenceMs || 0) + referenceMs;
+      if (detection.context?.pyramidProfile) {
+        profile.pyramidProfile ??= {};
+        for (const [key, value] of Object.entries(detection.context.pyramidProfile)) profile.pyramidProfile[key] = (profile.pyramidProfile[key] || 0) + value;
+        for (const key of ['cacheHits', 'cacheMisses', 'cacheEvictions']) profile[key] = (profile[key] || 0) + (detection.context[key] || 0);
+      }
+      profile.decodeMs += decodeMs; profile.sharpnessMs += sharpnessMs; profile.rgbaMs += rgbaMs; profile.remapMs += remapMs; profile.workerTransferMs += Math.max(0, workerRoundtripMs - workerMs);
       profile.trackMs += workerMs; profile.poseMs += poseMs; profile.renderMs += Math.max(0, renderMs);
       profile.lastTotalMs = performance.now() - frameStarted; profile.totalMs += profile.lastTotalMs;
+      profile.accelerators.add(image.accelerator || 'CPU');
       profile.accelerators.add(detection.accelerator || 'CPU');
       profile.tracker.accelerator = detection.accelerator || 'CPU';
-      for (const key of ['grayscaleMs', 'contextMs', 'uploadMs', 'forwardMs', 'backwardMs', 'postprocessMs', 'sampleMs', 'matchMs', 'refinementMs']) {
-        profile.tracker[key] += detection.timing?.[key] || 0;
+      for (const key of ['grayscaleMs', 'contextMs', 'contextPyramidMs', 'contextRegistrationMs', 'uploadMs', 'forwardMs', 'backwardMs', 'postprocessMs', 'sampleMs', 'matchMs', 'refinementMs']) {
+        profile.tracker[key] = (profile.tracker[key] || 0) + (detection.timing?.[key] || 0);
       }
       renderTrackingProfile(profile);
       trackingNextIndex = index + 1;
-      if (options.mode === 'window' && !detection.success) { trackingLost = true; message(detection.reason, true); break; }
       text('pendingStatus', `${end - index} Tracking-Frames verbleiben`);
       await new Promise(resolve => setTimeout(resolve, 0));
     }
+  } catch (error) {
+    if (options.mode === 'window') trackingLost = true;
+    throw error;
   } finally {
     const completed = trackingNextIndex > end;
     trackingRunning = false; trackingPaused = !completed && !trackingLost;
@@ -1574,7 +2487,10 @@ async function resetCalibration() {
   updateMetrics(); updateTable(); updateControls(); draw();
 }
 
-element('openVideo').onclick = () => element('videoFile').click();
+element('openVideo').onclick = () => {
+  element('videoFile').value = '';
+  element('videoFile').click();
+};
 element('videoFile').onchange = () => void task(async () => {
   const file = element('videoFile').files[0];
   if (!file) return;
@@ -1590,20 +2506,26 @@ element('videoFile').onchange = () => void task(async () => {
   decoder.terminate(); decoder = candidate;
   video.pause(); if (videoUrl) URL.revokeObjectURL(videoUrl);
   videoUrl = URL.createObjectURL(file); video.src = videoUrl;
+  const retainedTracking = trackingForExport();
   videoInfo = metadata; expectedVideo = { ...metadata, timestamps: undefined };
+  trackingImageMask = null; trackingMaskHasSelection = false; trackingMaskPreview.width = trackingMaskPreview.height = 0;
   element('trackingStart').max = metadata.frameCount - 1; element('trackingEnd').max = metadata.frameCount - 1;
   element('trackingEnd').value = metadata.frameCount - 1; text('trackingVideoName', metadata.name);
   clearTrackingResults();
+  if (retainedTracking?.video?.name === metadata.name && retainedTracking.video.width === metadata.width && retainedTracking.video.height === metadata.height) {
+    restoreTracking(retainedTracking);
+  }
   rawReady = false; currentIndex = 0; zoom = 1; pan = { x: 0, y: 0 };
   element('timeline').max = metadata.frameCount - 1;
   text('videoName', metadata.name);
   renderVideoMetadata();
-  const first = await decoder.call('frame', { index: 0 });
-  videoInfo.color = first.color; renderVideoMetadata(); setRaw(first.bitmap, 0); first.bitmap.close();
+  const first = await readFrame(0);
+  videoInfo.color = first.color; renderVideoMetadata(); setRaw(first.bitmap, 0, first.sharpness); first.bitmap.close();
   if (frames.size) phaseChecked = [...frames.values()].some(frame => frame.accepted);
   updateTable(); text('processingStatus', videoNameMismatch ?
     'Video geladen; Dateiname weicht von der Kalibrierung ab, vorhandene Daten bleiben erhalten' :
     'Video geladen; keine automatische Kalibrierung');
+  setTimeout(() => { void loadTrackingMaskPreview(); }, 0);
 });
 
 element('detectButton').onclick = () => void task(async () => { message(); await detectIndex(currentIndex); });
@@ -1640,21 +2562,24 @@ element('playButton').onclick = async () => {
   } else { video.pause(); await showFrame(currentIndex); }
   updatePlayIcon();
 };
-element('speed').onchange = () => { video.playbackRate = Number(element('speed').value); };
-element('overlay').onchange = draw;
-element('trackingStart').oninput = scheduleTrackingStartPreview;
-element('trackingStart').onchange = () => { clearTimeout(trackingPreviewTimer); void previewTrackingStartFrame(); };
+element('speed').onchange = () => { video.playbackRate = Number(element('speed').value); saveVideoOptions(); };
+element('overlay').onchange = () => { saveVideoOptions(); draw(); };
+element('trackingStart').onchange = () => { void previewTrackingStartFrame(); void loadTrackingMaskPreview(); };
 element('trackingMode').onchange = () => {
   clearTrackingResults();
   element('trackingWindowControls').hidden = !windowTracking();
   for (const id of ['trackingPatchSize', 'trackingThreshold']) element(id).closest('label').hidden = windowTracking();
   void previewTrackingStartFrame();
+  void loadTrackingMaskPreview();
 };
+element('previewBrightness').closest('details').addEventListener('toggle', event => {
+  if (event.currentTarget.open) void loadTrackingMaskPreview();
+});
 element('trackingSelectWindow').onclick = () => {
   selectingTrackingWindow = !selectingTrackingWindow;
   element('trackingSelectWindow').setAttribute('aria-pressed', String(selectingTrackingWindow));
 };
-function updatePreviewAdjustments() {
+function updatePreviewAdjustments(save = true) {
   const brightness = number('previewBrightness', 0) / 100;
   const contrast = number('previewContrast', 100) / 100;
   const gamma = number('previewGamma', 1);
@@ -1669,9 +2594,13 @@ function updatePreviewAdjustments() {
   text('previewGammaValue', gamma.toFixed(2));
   draw();
   renderTrackingPreview();
+  renderPathOverlay();
+  renderTrackingMask();
+  if (element('trackingPatchDialog').open) renderTrackingPatchDetail();
   if (!trackingPreviewImage.width && videoInfo && !taskBusy && !continuous && !rectifiedPlayback && !trackingRunning) {
     void previewTrackingStartFrame();
   }
+  if (save) saveVideoOptions();
 }
 for (const id of ['previewBrightness', 'previewContrast', 'previewGamma']) element(id).oninput = updatePreviewAdjustments;
 element('resetPreviewAdjustments').onclick = () => {
@@ -1733,6 +2662,7 @@ for (const button of document.querySelectorAll('[data-workflow]')) button.onclic
   if (workflow === 'tracking') {
     drawTrackingPath(); updateTrackingControls();
     if (!trackingPreviewImage.width) void previewTrackingStartFrame();
+    if (!trackingMaskPreview.width) void loadTrackingMaskPreview();
   }
 };
 element('trackingStartButton').onclick = () => void runTracking(true).catch(error => {
@@ -1742,11 +2672,11 @@ element('trackingPauseButton').onclick = () => { trackingRunning = false; tracki
 element('trackingResumeButton').onclick = () => void runTracking(false).catch(error => {
   message(error.message, true); trackingRunning = false; updateControls();
 });
-element('trackingResetButton').onclick = () => { clearTrackingResults(); void previewTrackingStartFrame(); };
+element('trackingResetButton').onclick = () => { clearTrackingResults(); void previewTrackingStartFrame(); void loadTrackingMaskPreview(); };
 element('trackingExportButton').onclick = () => {
   const header = 'frame,timestamp_us,x_px,y_px,rotation_deg,raw_x_px,raw_y_px,raw_rotation_deg,patches,rms_px';
   const rows = trackingPath.filter(entry => entry.pose).map(entry => [entry.frame, entry.timestamp, entry.pose.x, entry.pose.y,
-    entry.pose.rotation * 180 / Math.PI, entry.raw.x, entry.raw.y, entry.raw.rotation * 180 / Math.PI, entry.raw.points, entry.raw.rms].join(','));
+    entry.pose.rotation * 180 / Math.PI, entry.raw?.x ?? '', entry.raw?.y ?? '', entry.raw ? entry.raw.rotation * 180 / Math.PI : '', entry.raw?.points ?? '', entry.raw?.rms ?? ''].join(','));
   const link = document.createElement('a');
   link.href = URL.createObjectURL(new Blob([[header, ...rows].join('\n')], { type: 'text/csv' }));
   link.download = `${(videoInfo?.name || 'tracking').replace(/\.[^.]+$/, '')}-movement.csv`; link.click();
@@ -1792,12 +2722,7 @@ for (const control of document.querySelectorAll('.settings input, .settings sele
 
 element('exportButton').onclick = () => void task(async () => {
   if (stale && !confirm(`Die aktuellen Eingaben sind noch nicht eingerechnet. Konsistente Feldversion ${calibration.version} mit ihren damaligen Parametern und Beobachtungen speichern?`)) return;
-  const tracking = trackingPath.length ? {
-    format: 'rasterlabor-xyr-tracking', model_version: 1, created_at: new Date().toISOString(),
-    video: videoInfo ? { name: videoInfo.name, width: videoInfo.width, height: videoInfo.height } : null,
-    options: trackingRunOptions, coordinate_system: 'rectified pixels; x right; y down; rotation radians; camera pose relative to first tracked frame',
-    path: trackingPath.map(({ patchPoints, ...entry }) => entry)
-  } : null;
+  const tracking = trackingForExport();
   const bytes = await computer.call('export', { frames: snapshotFrames, video: expectedVideo, parameters: snapshotParameters,
     opticalConfiguration: element('opticalConfiguration').value, tracking });
   const url = URL.createObjectURL(new Blob([bytes], { type: 'application/zip' }));
@@ -1828,7 +2753,7 @@ element('correctedVideoButton').onclick = () => void task(async () => {
     throw error;
   }
   if (exporter.scaled) text('pendingStatus', `H.264-Ausgabe proportional skaliert: ${exporter.sourceWidth} x ${exporter.sourceHeight} -> ${exporter.config.width} x ${exporter.config.height} px`);
-  const profile = { frames: 0, decodeMs: 0, rgbaMs: 0, remapComputeMs: 0, remapTransferMs: 0,
+  const profile = { frames: 0, decodeMs: 0, sharpnessMs: 0, rgbaMs: 0, remapComputeMs: 0, remapTransferMs: 0,
     gpuContextMs: 0, gpuUploadMs: 0, gpuCommandMs: 0, gpuCompletionMs: 0, gpuReadbackMs: 0,
     frameMs: 0, submitMs: 0, backpressureMs: 0, totalMs: 0,
     width: exporter.config.width, height: exporter.config.height };
@@ -1838,18 +2763,11 @@ element('correctedVideoButton').onclick = () => void task(async () => {
       const frameStarted = performance.now();
       text('processingStatus', `Videoexport | Frame ${index + 1}/${videoInfo.frameCount}`);
       element('progress').value = index / videoInfo.frameCount;
-      let phaseStarted = performance.now();
-      const decoded = await decoder.call('frame', { index });
-      profile.decodeMs += performance.now() - phaseStarted;
-      phaseStarted = performance.now();
-      const image = imageFromBitmap(decoded.bitmap);
-      decoded.bitmap.close();
-      profile.rgbaMs += performance.now() - phaseStarted;
-      phaseStarted = performance.now();
-      const remapped = await computer.call('remap', { image, useWebGpu: element('useWebGpu').checked }, [image.data.buffer]);
-      const remapRoundtripMs = performance.now() - phaseStarted;
-      profile.remapComputeMs += remapped.processingMs;
-      profile.remapTransferMs += Math.max(0, remapRoundtripMs - remapped.processingMs);
+      const remapped = await readFrame(index, { rectified: true });
+      profile.decodeMs += remapped.frameTiming.decodeMs;
+      profile.sharpnessMs += remapped.frameTiming.sharpnessMs;
+      profile.rgbaMs += remapped.frameTiming.rgbaMs;
+      profile.remapComputeMs += remapped.frameTiming.remapMs;
       profile.remapAccelerator = remapped.accelerator;
       if (remapped.timing) {
         profile.gpuContextMs += remapped.timing.contextMs;
@@ -1860,7 +2778,9 @@ element('correctedVideoButton').onclick = () => void task(async () => {
       }
       const timestamp = videoInfo.timestamps[index] - videoInfo.firstTimestamp;
       const nextTimestamp = index + 1 < videoInfo.frameCount ? videoInfo.timestamps[index + 1] - videoInfo.firstTimestamp : timestamp + Math.round(1e6 / fps);
-      const encoderTiming = await exporter.addFrame(remapped.data, remapped.width, remapped.height, timestamp, nextTimestamp - timestamp, index);
+      let encoderTiming;
+      try { encoderTiming = await exporter.addFrame(remapped.bitmap, remapped.width, remapped.height, timestamp, nextTimestamp - timestamp, index); }
+      finally { remapped.bitmap.close(); }
       profile.frameMs += encoderTiming.frameMs;
       profile.submitMs += encoderTiming.submitMs;
       profile.backpressureMs += encoderTiming.backpressureMs;
@@ -1894,6 +2814,7 @@ element('calibrationFile').onchange = () => void task(async () => {
   const videoNameMismatch = videoInfo && imported.video?.name !== videoInfo.name;
   calibration = imported.calibration;
   clearTrackingResults();
+  restoreTracking(imported.tracking);
   applyParameters(imported.parameters);
   const invalidMaskPoints = revalidatePatchFrames(imported.observations, patchMask);
   frames = new Map(imported.observations.map(frame => [frame.id, frame]));
@@ -1907,15 +2828,22 @@ element('calibrationFile').onchange = () => void task(async () => {
   message(invalidMaskPoints ? `Kalibrierung geladen. ${invalidMaskPoints} gespeicherte Patch-Vektoren beruehrten die rote Maske und wurden verworfen; neu fitten erforderlich.` :
     videoNameMismatch ? 'Kalibrierung geladen. Der Videodateiname weicht ab; Video und Kalibrierungsdaten bleiben erhalten.' :
     'Kalibrierung geladen. Feld und Metadaten sind lokal verfuegbar.');
+  setTimeout(() => { void loadTrackingMaskPreview(); }, 0);
 });
 element('infoButton').onclick = () => element('infoDialog').showModal();
 element('closeInfo').onclick = () => element('infoDialog').close();
 installPan(rawCanvas); installPan(resultCanvas);
 installTrackingPreviewInteraction();
+installPathInteraction();
+installTrackingMaskInteraction();
 new ResizeObserver(draw).observe(element('rawCanvas').parentElement);
 new ResizeObserver(draw).observe(element('resultCanvas').parentElement);
 new ResizeObserver(renderTrackingPreview).observe(element('trackingPreviewCanvas').parentElement);
 window.addEventListener('beforeunload', event => { if (frames.size && !calibration) { event.preventDefault(); event.returnValue = ''; } });
+restoreVideoOptions();
+video.playbackRate = Number(element('speed').value);
+text('trackingMaskBrushValue', `${element('trackingMaskBrush').value} px`);
+updatePreviewAdjustments(false);
 updatePatternControls();
 updateControls(); updateMetrics(); draw();
 setInterval(updateMemoryStats, 2000);

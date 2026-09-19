@@ -108,6 +108,24 @@ Kontrollwerte auf ein anderes Gitter uebertragen.
   Tracking-Frame, Rotation ist in Radiant angegeben. Patch-Bilddaten werden
   nicht eingebettet.
 
+Der Speichern-Button fuegt `tracking.json` nur bei einem nichtleeren Pfad hinzu.
+Import stellt den Pfad zur Anzeige und zum erneuten Export wieder her, auch ohne
+geladenes Video. Beim Zuordnen desselben Videos (Name und Aufloesung) bleibt er
+erhalten. Ein importierter Pfad setzt keinen laufenden Tracker fort; dessen
+interner Bildzustand ist nicht Bestandteil des Pakets. Unbekannte Trackingversionen,
+doppelte Frame-IDs und ungueltige Posen werden abgelehnt.
+Der aus einer laufenden Browsersitzung gerettete CSV-Datensatz mit `timestamp_us`,
+`x_px`, `y_px` und `rotation_deg` wird ebenfalls eingelesen. Beim Import werden
+die Roh- und geglaetteten Winkel von Grad nach Radiant konvertiert und Posen
+in die regulaere Struktur ueberfuehrt. Fehlende Fensterpositionen werden nicht
+erfunden; der XYR-Pfad bleibt auch ohne gueltiges Trackingrechteck verwendbar.
+
+Die Statuspunkte rechts neben Speichern zeigen vorhandene Linsen- und XYR-Daten
+gruen an. Grau bedeutet nicht vorhanden, nicht etwa ungueltig. Die Anzeige ist
+kein Qualitaetsurteil. Helligkeitskorrektur ist als spaetere Komponente vorgesehen;
+dieser Status bleibt vorerst aus. Globale Vorschau-Regler sind keine gespeicherte
+Helligkeitskorrektur.
+
 Geometrisch veraltete UI-Einstellungen ersetzen beim Export nicht stillschweigend
 die zu den Maps gehoerenden Parameter und Beobachtungen. Import prueft Format,
 Arraygroessen, endliche Zahlen, Koordinaten, Masken, Beobachtungen und metrische

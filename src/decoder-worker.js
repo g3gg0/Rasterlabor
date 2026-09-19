@@ -1,11 +1,13 @@
 import { createFile, DataStream } from 'mp4box';
 import { orientationFromMatrix } from './video-orientation.js';
+import { measureFrameSharpness } from './sharpness.js';
 
 let file = null;
 let samples = [];
 let presentation = [];
 let configuration = null;
 const cache = new Map();
+const sharpnessCache = new Map();
 let cacheLimit = 3;
 let decoder = null;
 let decodedSampleIndex = -1;
@@ -65,6 +67,7 @@ async function openVideo(source) {
   closeDecoder();
   for (const bitmap of cache.values()) bitmap.close();
   cache.clear();
+  sharpnessCache.clear();
   decodedColor = null;
   file = source;
   const parser = createFile(false);
@@ -72,9 +75,10 @@ async function openVideo(source) {
   let parseError = null;
   parser.onReady = value => { information = value; };
   parser.onError = value => { parseError = String(value); };
+  const chunkSize = 16 * 1024 * 1024;
   let offset = 0;
   while (offset < file.size) {
-    const buffer = await file.slice(offset, Math.min(file.size, offset + 1024 * 1024)).arrayBuffer();
+    const buffer = await file.slice(offset, Math.min(file.size, offset + chunkSize)).arrayBuffer();
     buffer.fileStart = offset;
     const next = parser.appendBuffer(buffer);
     offset = Math.max(offset + buffer.byteLength, next || 0);
@@ -128,11 +132,11 @@ async function openVideo(source) {
     firstTimestamp, timestamps: presentation.map(sample => sample.timestamp), cacheLimit };
 }
 
-async function decodeFrame(index) {
+async function decodeFrame(index, native = false, useWebGpu = false) {
   if (!file || !presentation[index]) throw new Error('Frameindex ausserhalb der Videospur.');
   const target = presentation[index];
-  if (cache.has(target.timestamp)) return { bitmap: await createImageBitmap(cache.get(target.timestamp)), index,
-    timestamp: target.timestamp, color: decodedColor };
+  if (!native && cache.has(target.timestamp)) return { bitmap: await createImageBitmap(cache.get(target.timestamp)), index,
+    timestamp: target.timestamp, color: decodedColor, sharpness: sharpnessCache.get(target.timestamp), sharpnessMs: 0 };
   let keyIndex = target.index;
   while (keyIndex > 0 && !samples[keyIndex].key) keyIndex--;
   if (!samples[keyIndex].key) throw new Error('Kein vorausgehender Keyframe fuer dieses Sample vorhanden.');
@@ -166,6 +170,18 @@ async function decodeFrame(index) {
     decodedColor ||= { format: selectedFrame.format, primaries: selectedFrame.colorSpace?.primaries,
       transfer: selectedFrame.colorSpace?.transfer, matrix: selectedFrame.colorSpace?.matrix,
       fullRange: selectedFrame.colorSpace?.fullRange };
+    let sharpness = sharpnessCache.get(target.timestamp), sharpnessMs = 0;
+    if (!sharpness) {
+      const sharpnessStarted = performance.now();
+      sharpness = await measureFrameSharpness(selectedFrame, useWebGpu);
+      sharpnessMs = performance.now() - sharpnessStarted;
+      sharpnessCache.set(target.timestamp, sharpness);
+    }
+    if (native) {
+      const frame = selectedFrame;
+      selectedFrame = null; // Ownership moves to the caller; it must close the VideoFrame.
+      return { frame, orientation, index, timestamp: target.timestamp, color: decodedColor, sharpness, sharpnessMs };
+    }
     const bitmap = await createOrientedBitmap(selectedFrame);
     cache.set(target.timestamp, bitmap);
     while (cache.size > cacheLimit) {
@@ -173,7 +189,7 @@ async function decodeFrame(index) {
       cache.get(oldest).close();
       cache.delete(oldest);
     }
-    return { bitmap: await createImageBitmap(bitmap), index, timestamp: target.timestamp, color: decodedColor };
+    return { bitmap: await createImageBitmap(bitmap), index, timestamp: target.timestamp, color: decodedColor, sharpness, sharpnessMs };
   } catch (error) {
     closeDecoder();
     throw error;
@@ -189,8 +205,8 @@ let queue = Promise.resolve();
 self.onmessage = ({ data }) => {
   queue = queue.then(async () => {
     try {
-      const result = data.type === 'open' ? await openVideo(data.file) : await decodeFrame(data.index);
-      self.postMessage({ id: data.id, result }, result.bitmap ? [result.bitmap] : []);
+      const result = data.type === 'open' ? await openVideo(data.file) : await decodeFrame(data.index, data.type === 'native-frame', data.useWebGpu);
+      self.postMessage({ id: data.id, result }, result.frame ? [result.frame] : result.bitmap ? [result.bitmap] : []);
     } catch (error) { self.postMessage({ id: data.id, error: error.message }); }
   });
 };

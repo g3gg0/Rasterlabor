@@ -89,7 +89,7 @@ function refineRigid(previous, current, rectangle, initialX, initialY, searchRad
       const first = sample.value;
       firstSum += first; secondSum += second; firstSquare += first ** 2; secondSquare += second ** 2; product += first * second; count++;
     }
-    if (count < samples.length * 0.65) return -1;
+    if (count < Math.max(1, samples.length * 0.65)) return -1;
     return (product - firstSum * secondSum / count) /
       Math.max(1e-9, Math.sqrt(Math.max(0, (firstSquare - firstSum ** 2 / count) * (secondSquare - secondSum ** 2 / count))));
   };
@@ -125,20 +125,37 @@ function refineRigid(previous, current, rectangle, initialX, initialY, searchRad
 }
 
 export class WindowTracker {
-  reset() { this.previous = null; this.index = null; this.signature = null; this.x = 0; this.y = 0; this.angle = 0; this.lost = false; }
+  reset() {
+    this.previous = null; this.index = null; this.signature = null; this.x = 0; this.y = 0; this.angle = 0;
+  }
   constructor() { this.reset(); }
+
+  setPose(pose, width, height) {
+    this.angle = -pose.rotation;
+    const cosine = Math.cos(this.angle); const sine = Math.sin(this.angle);
+    this.x = width / 2 - cosine * (width / 2 + pose.x) + sine * (height / 2 + pose.y);
+    this.y = height / 2 - sine * (width / 2 + pose.x) - cosine * (height / 2 + pose.y);
+  }
 
   process(image, index, rectangle, searchRadius = 32, maxRotation = 5) {
     const started = performance.now();
     const signature = JSON.stringify([image.width, image.height, rectangle]);
     if (this.signature !== null && (signature !== this.signature || index !== this.index + 1)) throw new Error('Fenster oder Framefolge geaendert: Tracking neu starten.');
-    if (this.lost) throw new Error('Window Tracking verloren: Tracking neu starten.');
     const current = sampleWindow(image, rectangle);
     const sampleMs = performance.now() - started;
     let refinementMs = 0;
-    const finish = result => ({ ...result, points: [], accelerator: 'CPU FFT + Rigid', window: rectangle,
+    const referenceFrame = this.index;
+    const shiftedReferenceX = image.width / 2 - this.x; const shiftedReferenceY = image.height / 2 - this.y;
+    const referencePose = { x: Math.cos(this.angle) * shiftedReferenceX + Math.sin(this.angle) * shiftedReferenceY - image.width / 2,
+      y: -Math.sin(this.angle) * shiftedReferenceX + Math.cos(this.angle) * shiftedReferenceY - image.height / 2, rotation: -this.angle };
+    const finish = result => ({ ...result, incrementalMatch: referenceFrame === null ? null : {
+      frame: referenceFrame, kind: 'incremental', accepted: result.success, reason: result.reason ?? '',
+      referencePose: { ...referencePose }, prediction: { ...referencePose }, pose: result.raw ? { ...result.raw } : null,
+      score: result.score, psr: result.psr, dx: result.dx, dy: result.dy, angle: result.angle, iterations: result.iterations,
+      searchRadius, maxRotation, rectangle: { ...rectangle }, backward: null, milliseconds: performance.now() - started },
+      points: [], accelerator: 'CPU FFT + Rigid', window: rectangle,
       resolution: `${current.columns} x ${current.rows}`, timing: { sampleMs, refinementMs, matchMs: performance.now() - started - sampleMs - refinementMs, totalMs: performance.now() - started } });
-    if (current.deviation < 2) { this.lost = true; return finish({ success: false, reason: 'Zu wenig Struktur im Fenster.' }); }
+    if (current.deviation < 2) return finish({ success: false, reason: 'Zu wenig Struktur im Fenster.' });
     if (!this.previous) {
       this.previous = current; this.index = index; this.signature = signature;
       return finish({ success: true, initial: true, raw: { x: 0, y: 0, rotation: 0, points: 1 }, dx: 0, dy: 0 });
@@ -175,8 +192,8 @@ export class WindowTracker {
     const angleLimit = maxRotation * Math.PI / 180;
     const rigid = refineRigid(this.previous, current, rectangle, dx, dy, searchRadius, angleLimit);
     refinementMs = performance.now() - refinementStarted;
-    const limitX = Math.min(searchRadius, rectangle.width / 4);
-    const limitY = Math.min(searchRadius, rectangle.height / 4);
+    const limitX = Math.min(searchRadius, rectangle.width / 2);
+    const limitY = Math.min(searchRadius, rectangle.height / 2);
     const rejected = [];
     if (!(rigid.score >= 0.65)) rejected.push('Korrelation zu niedrig');
     if (!(Math.abs(rigid.dx) < limitX)) rejected.push('X-Suchgrenze erreicht');
@@ -184,7 +201,6 @@ export class WindowTracker {
     if (!(Math.abs(rigid.angle) < angleLimit)) rejected.push('Winkel-Suchgrenze erreicht');
     const success = rejected.length === 0;
     if (!success) {
-      this.lost = true;
       return finish({ success, psr, ...rigid, reason: `Fenster-Match verworfen: ${rejected.join(', ')}. ` +
         `NCC ${rigid.score.toFixed(3)} (min. 0.650), X ${rigid.dx.toFixed(2)} / +/-${limitX.toFixed(2)} px, ` +
         `Y ${rigid.dy.toFixed(2)} / +/-${limitY.toFixed(2)} px, Winkel ${(rigid.angle * 180 / Math.PI).toFixed(3)} / +/-${maxRotation} deg. ` +

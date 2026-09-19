@@ -1,23 +1,41 @@
 import { detectGrid } from './detector.js';
+import { analyzeCheckerboard } from './checkerboard-analysis.js';
 import { fitCalibration, geometryCheck } from './solver.js';
 import { buildMaps, remapRGBA } from './maps.js';
 import { exportCalibration, importCalibration } from './format.js';
 import { PatchTracker } from './patch-tracker.js';
 import { WindowTracker } from './window-tracker.js';
+import { ContextTracker, contextImage, contextSearchRadii, registerOverlap } from './context-tracker.js';
 import { patchGpuStatus } from './webgpu-patch-tracker.js';
 import { remapGpuStatus, WebGpuRemapper } from './webgpu-remapper.js';
 import { restoreDetectionScale, scaleDetectionOptions } from './detection-scale.js';
 import { gpuGrayscaleBitmap, gpuImageStatus } from './webgpu-image.js';
 import { buildInverseMapsGpu, mapBuilderGpuStatus } from './webgpu-map-builder.js';
 import { createSpline } from './spline.js';
+import { optimizePoseGraph } from './pose-graph-refit.js';
+import { registerFeatureOverlap } from './feature-overlap.js';
 
 let calibration = null;
 let cancelled = false;
 let active = false;
 const patchTracker = new PatchTracker();
 const windowTracker = new WindowTracker();
+const contextTracker = new ContextTracker();
+let contextDetection = null;
+let trackingMaps = null;
 const gpuRemapper = new WebGpuRemapper();
 const progress = value => self.postMessage({ progress: value });
+const usableLocalMatch = match => Boolean(match?.accepted || (match?.conditionallyAccepted &&
+  Number.isFinite(match.score) && match.score >= 0.93 && match.pose &&
+  [match.pose.x, match.pose.y, match.pose.rotation].every(Number.isFinite)));
+const wrapAngle = angle => Math.atan2(Math.sin(angle), Math.cos(angle));
+function boundedFeatureMatch(match, prediction, limits, width, height) {
+  if (!match.accepted) return match;
+  const correction = Math.hypot(match.pose.x - prediction.x, match.pose.y - prediction.y);
+  const rotation = Math.abs(wrapAngle(match.pose.rotation - prediction.rotation)) * 180 / Math.PI;
+  return correction <= Math.hypot(width, height) * 1.05 && rotation <= limits.angle ? match :
+    { ...match, accepted: false, reason: 'Feature-Treffer ausserhalb Suchbereich' };
+}
 
 function calibrationTransferCopy(value) {
   const coefficients = value.field.coefficients.slice();
@@ -46,12 +64,95 @@ self.onmessage = async ({ data }) => {
     self.postMessage({ id: data.id, result: true });
     return;
   }
-  if (active) { self.postMessage({ id: data.id, error: 'Rechen-Worker ist beschaeftigt.' }); return; }
+  if (active) { data.native?.frame?.close(); self.postMessage({ id: data.id, error: 'Rechen-Worker ist beschaeftigt.' }); return; }
   active = true;
   try {
     let result;
     let transfer = [];
     if (data.type === 'patch-gpu-status') result = await patchGpuStatus();
+    else if (data.type === 'pose-graph-refit') {
+      result = optimizePoseGraph(data.graph, data.options);
+    }
+    else if (data.type === 'local-refit-register') {
+      const images = new Map();
+      try {
+        for (const item of data.images) images.set(item.frame, {
+          ...item, image: contextImage(imageFromBitmap(item.bitmap), item.mask ?? data.mask, data.preprocessing)
+        });
+        result = [];
+        for (const [index, pair] of data.pairs.entries()) {
+          if (cancelled) throw new Error('Lokaler Refit abgebrochen.');
+          const current = images.get(pair.current); const reference = images.get(pair.reference);
+          if (!current || !reference) continue;
+          progress({ operation: 'local-refit', pair: index + 1, pairs: data.pairs.length,
+            current: current.frame, reference: reference.frame });
+          let forward;
+          let forwardSeed = current.pose;
+          const attempts = [];
+          for (const radius of contextSearchRadii(data.limits.radius, current.image.width, current.image.height, 'spatial', 1.05)) {
+            forward = registerOverlap(current.image, reference.image, forwardSeed, reference.pose,
+              { ...data.limits, radius, coarseStep: radius > data.limits.radius ? data.limits.radius : 0,
+                coarseRadiusFactor: 1.05, partial: true });
+            if (!forward.accepted && forward.reason === 'Mehrdeutig' && forward.score >= 0.93) {
+              forward = { ...forward, conditionallyAccepted: true };
+            }
+            attempts.push({ accepted: forward.accepted, reason: forward.reason, score: forward.score,
+              margin: forward.margin, support: forward.support, evaluated: forward.evaluated, radius });
+            if (usableLocalMatch(forward) || !['Suchgrenze', 'Korrelation', 'Mehrdeutig',
+              'Unzureichende Struktur oder Ueberlappung'].includes(forward.reason)) break;
+            if (forward.reason === 'Suchgrenze' && Number.isFinite(forward.score) && forward.score >= 0.8 &&
+              forward.pose && [forward.pose.x, forward.pose.y, forward.pose.rotation].every(Number.isFinite)) forwardSeed = forward.pose;
+          }
+          if (!forward.accepted) {
+            const feature = boundedFeatureMatch(registerFeatureOverlap(current.image, reference.image, reference.pose),
+              current.pose, data.limits, current.image.width, current.image.height);
+            if (feature.accepted) forward = { ...feature, attempts, fallbackFor: forward };
+            else forward.featureFallback = feature;
+          }
+          const reverseRadius = Math.min(32, data.limits.reverseRadius ?? data.limits.radius);
+          let backward = usableLocalMatch(forward) ? registerOverlap(reference.image, current.image, reference.pose, forward.pose,
+            { radius: reverseRadius, angle: data.limits.angle, coarseStep: 0, partial: true }) : null;
+          if (!backward?.accepted && backward?.reason === 'Mehrdeutig' && backward.score >= 0.93) {
+            backward = { ...backward, conditionallyAccepted: true };
+          }
+          if (usableLocalMatch(forward) && !backward?.accepted) {
+            const feature = boundedFeatureMatch(registerFeatureOverlap(reference.image, current.image, forward.pose),
+              reference.pose, data.limits, current.image.width, current.image.height);
+            if (feature.accepted) backward = { ...feature, fallbackFor: backward };
+            else if (backward) backward.featureFallback = feature;
+          }
+          const rotation = backward?.pose ? backward.pose.rotation - reference.pose.rotation : 0;
+          const reverseDistance = usableLocalMatch(backward) ? Math.hypot(backward.pose.x - reference.pose.x, backward.pose.y - reference.pose.y) +
+            Math.abs(Math.atan2(Math.sin(rotation), Math.cos(rotation))) * Math.hypot(current.image.width, current.image.height) / 2 : null;
+          result.push({ ...pair, currentPose: current.pose, referencePose: reference.pose,
+            forward: { ...forward, attempts }, backward, reverseDistance });
+        }
+      } finally { for (const item of data.images) item.bitmap.close(); }
+    }
+    else if (data.type === 'checkerboard-analysis') {
+      try { result = analyzeCheckerboard(imageFromBitmap(data.bitmap), data.options); }
+      finally { data.bitmap.close(); }
+    }
+    else if (data.type === 'context-inspect') {
+      try {
+        const { radius, angle, coarseStep, reverseRadius = radius } = data.limits;
+        if (![radius, angle, coarseStep, reverseRadius].every(Number.isFinite) || radius < 1 || radius > 10000 || angle < 0.1 || angle > 10 || coarseStep < 0 || reverseRadius < 1 || reverseRadius > 10000 ||
+          [data.prediction, data.referencePose].some(pose => !pose || ![pose.x, pose.y, pose.rotation].every(Number.isFinite))) {
+          throw new Error('Ungueltige Debug-Suchparameter.');
+        }
+        const current = contextImage(imageFromBitmap(data.current), data.mask);
+        const reference = contextImage(imageFromBitmap(data.reference), data.mask);
+        const forward = registerOverlap(current, reference, data.prediction, data.referencePose, data.limits);
+        const backward = forward.accepted ? { ...registerOverlap(reference, current, data.referencePose, forward.pose, { radius: reverseRadius, angle }), searchRadius: reverseRadius, angle } : null;
+        const rotation = backward?.pose ? backward.pose.rotation - data.referencePose.rotation : 0;
+        const reverseDistance = backward?.accepted ? Math.hypot(backward.pose.x - data.referencePose.x, backward.pose.y - data.referencePose.y) +
+          Math.abs(Math.atan2(Math.sin(rotation), Math.cos(rotation))) * Math.hypot(current.width, current.height) / 2 : null;
+        result = { ...forward, prediction: data.prediction, referencePose: data.referencePose,
+          attempts: [{ ...forward, searchRadius: radius, angle, coarseStep }], backward, reverseDistance,
+          accepted: forward.accepted && reverseDistance !== null && reverseDistance <= 1.5,
+          reason: forward.accepted && !(reverseDistance !== null && reverseDistance <= 1.5) ? 'Rueckwaertspruefung' : forward.reason };
+      } finally { data.current.close(); data.reference.close(); }
+    }
     else if (data.type === 'gpu-image-status') result = await gpuImageStatus();
     else if (data.type === 'map-builder-gpu-status') result = await mapBuilderGpuStatus();
     else if (data.type === 'map-builder-gpu-self-test') {
@@ -90,8 +191,51 @@ self.onmessage = async ({ data }) => {
       result = { available: Boolean(gpu), maximumChannelDifference: gpu ? Math.max(...cpu.data.map((value, index) => Math.abs(value - gpu.data[index]))) : null,
         timing: gpu?.timing };
     }
-    else if (data.type === 'track-window') {
-      result = windowTracker.process(data.image, data.index, data.options.rectangle, data.options.patchSearchRadius, data.options.maxRotation);
+    else if (data.type === 'tracking-maps') {
+      if (contextDetection) throw new Error('Umfeldregistrierung noch offen.');
+      const maps = data.maps;
+      if (!maps || !Number.isSafeInteger(maps.outputWidth) || !Number.isSafeInteger(maps.outputHeight) || maps.outputWidth < 1 || maps.outputHeight < 1 ||
+        [maps.inverseX, maps.inverseY, maps.valid].some(values => values?.length !== maps.outputWidth * maps.outputHeight)) throw new Error('Ungueltige Tracking-Maps.');
+      contextTracker.reset(); windowTracker.reset(); trackingMaps = maps; result = true;
+    }
+    else if (data.type === 'track-window' || data.type === 'track-window-native') {
+      if (contextDetection) throw new Error('Umfeldregistrierung noch offen.');
+      let image = data.image, prepared = null, preview = null;
+      if (data.native) {
+        if (!trackingMaps) throw new Error('Tracking-Maps fehlen.');
+        const started = performance.now();
+        prepared = await contextTracker.image({ ...data.native, maps: trackingMaps, width: trackingMaps.outputWidth,
+          height: trackingMaps.outputHeight, readRgba: true }, data.options);
+        prepared.preparationMs = performance.now() - started;
+        image = prepared.rgba; delete prepared.rgba;
+      }
+      result = windowTracker.process(image, data.index, data.options.rectangle, data.options.patchSearchRadius, data.options.maxRotation);
+      if (result.success && (data.options.contextRecent > 0 || data.options.contextSpatial > 0)) {
+        const references = await contextTracker.begin(image, data.index, result.raw, data.options, prepared);
+        contextDetection = { result, width: image.width, height: image.height };
+        result = { ...result, references, contextPending: true };
+      }
+      else if (prepared) result.timing = { ...result.timing, totalMs: result.timing.totalMs + prepared.preparationMs };
+      if (data.native) {
+        preview = await createImageBitmap(new ImageData(image.data, image.width, image.height));
+        result = { ...result, preview, width: image.width, height: image.height };
+        transfer.push(preview);
+      }
+    }
+    else if (data.type === 'context-reference') {
+      const image = data.native ? { ...data.native, maps: trackingMaps, width: trackingMaps.outputWidth, height: trackingMaps.outputHeight } : data.image;
+      await contextTracker.provide(data.index, image, data.error);
+      result = true;
+    }
+    else if (data.type === 'context-finish') {
+      const context = contextTracker.finish();
+      const original = contextDetection.result;
+      if (context.applied) windowTracker.setPose(context.pose, contextDetection.width, contextDetection.height);
+      result = { ...original, incremental: original.raw, raw: { ...context.pose, points: Math.max(1, context.inliers.length) }, context,
+        accelerator: `${original.accelerator} / Umfeld ${context.accelerator}`,
+        timing: { ...original.timing, contextMs: context.milliseconds, contextPyramidMs: context.pyramidMs,
+          contextRegistrationMs: context.registrationMs, totalMs: original.timing.totalMs + context.milliseconds } };
+      contextDetection = null;
     }
     else if (data.type === 'detect' || data.type === 'detect-bitmap') {
       const started = performance.now();
@@ -157,9 +301,9 @@ self.onmessage = async ({ data }) => {
       const response = calibrationTransferCopy(calibration);
       result = { ...imported, calibration: response.value };
       transfer = response.transfer;
-    } else if (data.type === 'reset') { calibration = null; patchTracker.reset(); windowTracker.reset(); gpuRemapper.reset(); result = true; }
+    } else if (data.type === 'reset') { calibration = null; trackingMaps = null; patchTracker.reset(); windowTracker.reset(); contextTracker.reset(); contextDetection = null; gpuRemapper.reset(); result = true; }
     else throw new Error(`Unbekannter Workerauftrag: ${data.type}`);
     self.postMessage({ id: data.id, result }, transfer);
   } catch (error) { self.postMessage({ id: data.id, error: error.message }); }
-  finally { active = false; }
+  finally { data.native?.frame?.close(); active = false; }
 };

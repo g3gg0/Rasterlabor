@@ -7,6 +7,30 @@ export function createPatchMask(width, height, cellSize = Math.max(4, Math.ceil(
     sourceWidth: width, sourceHeight: height, data: new Uint8Array(Math.ceil(width / cellSize) * Math.ceil(height / cellSize)), revision: 0 };
 }
 
+export function maskIncludes(mask, x, y) {
+  if (!mask?.data || x < 0 || y < 0 || x >= mask.sourceWidth || y >= mask.sourceHeight) return false;
+  const col = Math.min(mask.width - 1, Math.floor(x / mask.cellSize));
+  const row = Math.min(mask.height - 1, Math.floor(y / mask.cellSize));
+  return mask.data[row * mask.width + col] === MASK_SEARCH;
+}
+
+export function remapInclusionMask(mask, maps) {
+  if (!mask?.data || !maps || maps.inverseX?.length !== maps.outputWidth * maps.outputHeight ||
+      maps.inverseY?.length !== maps.outputWidth * maps.outputHeight || maps.valid?.length !== maps.outputWidth * maps.outputHeight) return null;
+  const defaultCellSize = Math.max(4, Math.ceil(Math.max(maps.outputWidth, maps.outputHeight) / 512));
+  const result = createPatchMask(maps.outputWidth, maps.outputHeight, Math.min(mask.cellSize, defaultCellSize));
+  for (let row = 0; row < result.height; row++) for (let col = 0; col < result.width; col++) {
+    const x = Math.min(maps.outputWidth - 1, Math.floor((col + 0.5) * result.cellSize));
+    const y = Math.min(maps.outputHeight - 1, Math.floor((row + 0.5) * result.cellSize));
+    const index = y * maps.outputWidth + x;
+    if (maps.valid[index] && maskIncludes(mask, maps.inverseX[index], maps.inverseY[index])) {
+      result.data[row * result.width + col] = MASK_SEARCH;
+    }
+  }
+  result.revision = mask.revision || 0;
+  return result;
+}
+
 export function patchTouches(mask, x, y, size, value) {
   if (!mask?.data) return false;
   const radius = size / 2;

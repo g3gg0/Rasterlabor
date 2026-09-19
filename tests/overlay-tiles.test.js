@@ -1,0 +1,27 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { overlayTiles, overlayTileSize } from '../src/overlay-tiles.js';
+
+test('tile size uses larger power-of-two tiles within texture and memory limits', () => {
+  assert.equal(overlayTileSize({ outputWidth: 4096, outputHeight: 3072 }, 8192), 4096);
+  assert.equal(overlayTileSize({ outputWidth: 8192, outputHeight: 4320 }, 8192), 4096);
+  assert.equal(overlayTileSize({ outputWidth: 4096, outputHeight: 3072 }, 2048), 2048);
+  assert.equal(overlayTileSize({ outputWidth: 1024, outputHeight: 1024 }, 8192, 64 * 1024 * 1024), 1024);
+});
+
+test('tiles cover full-resolution output including partial edges without overlap', () => {
+  const geometry = { corners: [{x:0,y:0},{x:9,y:0},{x:9,y:7},{x:0,y:7}] };
+  const tiles = overlayTiles(9,7,0,0,[geometry],4);
+  const counts = new Uint8Array(63);
+  for (const tile of tiles) for(let y=tile.y;y<tile.y+tile.height;y++)for(let x=tile.x;x<tile.x+tile.width;x++)counts[y*9+x]++;
+  assert.equal(tiles.length,6); assert.ok(counts.every(x=>x===1));
+  assert.deepEqual([tiles.at(-1).width,tiles.at(-1).height],[1,3]);
+});
+
+test('tile selection includes bilinear edge footprints and skips distant frames', () => {
+  const near={corners:[{x:4.25,y:1},{x:5,y:2}]};
+  const far={corners:[{x:100,y:100},{x:101,y:101}]};
+  const tiles=overlayTiles(8,4,0,0,[near,far],4);
+  assert.equal(tiles.length,2);
+  for(const tile of tiles)assert.deepEqual(tile.geometries,[near]);
+});
