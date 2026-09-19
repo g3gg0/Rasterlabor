@@ -1501,7 +1501,7 @@ async function previewTrackingStartFrame() {
 }
 
 async function renderTrackingMosaic() {
-    if (trackingMosaicBusy || !videoInfo || !calibration?.maps || !trackingPath.some(entry => entry.pose)) return;
+  if (trackingRunning || trackingMosaicBusy || !videoInfo || !calibration?.maps || !trackingPath.some(entry => entry.pose)) return;
     trackingMosaicBusy = true;
     const request = trackingMosaicRequest;
     const geometries = trackingPath.map(trackingGeometry).filter(Boolean);
@@ -1516,6 +1516,7 @@ async function renderTrackingMosaic() {
       const context = composite.getContext('2d');
       const local = document.createElement('canvas');
       for (const geometry of selected) {
+        if (trackingRunning || request !== trackingMosaicRequest) return;
         const decoded = await readTrackingFrame(geometry.entry.frame, { rectified: true });
         try {
           const localScale = Math.min(1, scale);
@@ -1548,7 +1549,7 @@ async function renderTrackingMosaic() {
       if (request === trackingMosaicRequest) console.warn('Tracking-Mosaik:', error.message);
     } finally {
       trackingMosaicBusy = false;
-      if (request !== trackingMosaicRequest && trackingPath.length) {
+      if (request !== trackingMosaicRequest && trackingPath.length && !trackingRunning) {
         clearTimeout(trackingMosaicTimer);
         trackingMosaicTimer = setTimeout(() => void renderTrackingMosaic(), 100);
       }
@@ -1558,6 +1559,7 @@ async function renderTrackingMosaic() {
 function scheduleTrackingMosaic() {
   trackingMosaicRequest++;
   clearTimeout(trackingMosaicTimer);
+  if (trackingRunning) return;
   trackingMosaicTimer = setTimeout(() => void renderTrackingMosaic(), 250);
 }
 
@@ -2546,6 +2548,7 @@ function trackingOptions() {
   if (!(windowSize >= 1 && windowSize <= 240)) throw new Error('Stabilisierungsfenster muss zwischen 1 und 240 Frames liegen.');
   const maxRotation = number('trackingMaxRotation', 5);
   const contextRecent = number('trackingContextRecent', 2); const contextSpatial = number('trackingContextSpatial', 2);
+  const contextInterval = 8;
   const contextRadius = number('trackingContextRadius', 32); const contextAngle = number('trackingContextAngle', 1);
   const contextCycleStrict = number('trackingContextCycleStrict', 1.5);
   const contextCycleConditional = number('trackingContextCycleConditional', 7.5);
@@ -2560,7 +2563,7 @@ function trackingOptions() {
     { ...trackingImageMask, coordinateSystem: 'oriented source pixels', data: Array.from(trackingImageMask.data) } : null;
   const imageMask = sourceImageMask ? remapInclusionMask(trackingImageMask, calibration?.maps) : null;
   return { mode: 'window', rectangle: { ...trackingRectangle }, maxRotation,
-    contextRecent, contextSpatial, contextRadius, contextAngle, contextCycleStrict, contextCycleConditional,
+    contextRecent, contextSpatial, contextInterval, contextRadius, contextAngle, contextCycleStrict, contextCycleConditional,
     sourceImageMask, imageMask: imageMask ? { ...imageMask, data: Array.from(imageMask.data) } : null,
     patchSearchRadius,
     useWebGpu: useWebGpu() };
@@ -2591,8 +2594,10 @@ async function runTracking(restart = false) {
   }
   trackingInspector.clear();
   video.pause(); trackingRunning = true; trackingPaused = false; updateControls();
+  trackingMosaicRequest++; clearTimeout(trackingMosaicTimer);
+  let lastRenderedFrame = null;
   try {
-    const nativeTracking = options.useWebGpu && (options.contextRecent > 0 || options.contextSpatial > 0);
+    let nativeTracking = options.useWebGpu && (options.contextRecent > 0 || options.contextSpatial > 0);
     if (nativeTracking && trackingComputer.nativeMaps !== calibration.maps) {
       const { outputWidth, outputHeight, inverseX, inverseY, valid } = calibration.maps;
       await trackingComputer.call('tracking-maps', { maps: { outputWidth, outputHeight, inverseX, inverseY, valid,
@@ -2618,7 +2623,7 @@ async function runTracking(restart = false) {
       text('processingStatus', `Tracking Frame ${index}/${end}`);
       element('progress').value = (index - start + 1) / (end - start + 1);
       const image = await readTrackingFrame(index, { gpu: options.useWebGpu,
-        rectified: !nativeTracking, output: nativeTracking ? 'native' : 'rgba' });
+        rectified: !nativeTracking, output: nativeTracking ? 'native' : 'rgba', measureSharpness: false });
       const { decodeMs, sharpnessMs, rgbaMs, remapMs } = image.frameTiming;
       const renderStarted = performance.now();
       if (!nativeTracking) {
@@ -2647,7 +2652,8 @@ async function runTracking(restart = false) {
           try {
             if (!trackingRunning) throw new Error('Pausiert');
             text('processingStatus', `Tracking #${index} | Umfeld #${referenceIndex}`);
-            reference = await readTrackingFrame(referenceIndex, { gpu: options.useWebGpu, rectified: !nativeTracking, output: nativeTracking ? 'native' : 'rgba' });
+            reference = await readTrackingFrame(referenceIndex, { gpu: options.useWebGpu, rectified: !nativeTracking,
+              output: nativeTracking ? 'native' : 'rgba', measureSharpness: false });
             for (const [destination, source] of [['referenceDecodeMs', 'decodeMs'], ['referenceSharpnessMs', 'sharpnessMs'], ['referenceRgbaMs', 'rgbaMs'], ['referenceRemapMs', 'remapMs']]) {
               trackingProfile[destination] = (trackingProfile[destination] || 0) + (reference.frameTiming?.[source] || 0);
             }
@@ -2661,6 +2667,7 @@ async function runTracking(restart = false) {
         }
         detection = await trackingComputer.call('context-finish');
       }
+      if (detection.context?.registrationChoice?.backend === 'CPU') nativeTracking = false;
       const workerRoundtripMs = performance.now() - workerStarted - referenceMs - nativeRenderMs;
       const poseStarted = performance.now();
       const raw = detection.raw ?? null;
@@ -2682,8 +2689,9 @@ async function runTracking(restart = false) {
       entry.pose = stabilizePose(trackingPath, number('trackingWindow', 1));
       const poseMs = performance.now() - poseStarted;
       const overlayStarted = performance.now();
-      renderTrackingPreview(); renderTrackingResults(entry);
-      scheduleTrackingMosaic();
+      if (trackingPath.length % 8 === 0 || index === end) {
+        renderTrackingPreview(); renderTrackingResults(entry); lastRenderedFrame = entry.frame;
+      }
       renderMs += performance.now() - overlayStarted;
       const workerMs = detection.timing?.totalMs ?? workerRoundtripMs;
       const profile = trackingProfile;
@@ -2714,6 +2722,12 @@ async function runTracking(restart = false) {
   } finally {
     const completed = trackingNextIndex > end;
     trackingRunning = false; trackingPaused = !completed && !trackingLost;
+    const latest = trackingPath.at(-1);
+    const failedCurrent = trackingFailures.at(-1)?.frame === trackingNextIndex;
+    if (latest && !failedCurrent && latest.frame !== lastRenderedFrame) {
+      renderTrackingPreview(); renderTrackingResults(latest);
+    }
+    scheduleTrackingMosaic();
     text('processingStatus', 'Bereit');
     text('pendingStatus', trackingLost ? 'Window Tracking verloren | Neustart erforderlich' : completed ? `Tracking abgeschlossen | ${trackingPath.length} Frames` : `Tracking pausiert vor Frame ${trackingNextIndex}`);
     updateControls();

@@ -1,7 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { WindowTracker } from '../src/window-tracker.js';
-import { ContextTracker, contextImage, registerOverlap, registerOverlapAsync, chooseRegistrationBackend, consensusPose, spatialConsensusPose, confirmSpatialClosure, cycleErrorMetrics, contextSearchRadii, selectContextReferences } from '../src/context-tracker.js';
+import { ContextTracker, contextImage, registerOverlap, registerOverlapAsync, chooseRegistrationBackend, consensusPose, spatialConsensusPose, confirmSpatialClosure, cycleErrorMetrics, contextSearchRadii, selectContextReferences, shouldRunContext } from '../src/context-tracker.js';
+
+test('context checks start immediately, follow their interval, and react to weak matches', () => {
+  assert.equal(shouldRunContext(100, null, 8, 0.95), true);
+  assert.equal(shouldRunContext(101, 100, 8, 0.95), false);
+  assert.equal(shouldRunContext(108, 100, 8, 0.95), true);
+  assert.equal(shouldRunContext(102, 100, 8, 0.74), true);
+  assert.throws(() => shouldRunContext(1, 0, 0), /Umfeldintervall/);
+});
 
 test('GPU registration is selected only for matching results and lower measured latency', () => {
   const cpu = { accepted: true, pose: { x: 1, y: 2, rotation: 0 } };
@@ -37,6 +45,18 @@ test('GPU errors fall back to CPU without losing references or retrying the brok
     await tracker.begin(source, 0, pose, { ...options, useWebGpu: false });
     assert.equal(tracker.finish().accelerator, 'CPU'); assert.equal(attempts, 1);
   }
+});
+
+test('CPU registration choice also stops subsequent GPU pyramid readbacks', async () => {
+  let gpuImages = 0;
+  const gpu = { failure: '', cacheBytes: 0, reset() {}, disable() {},
+    async image() { gpuImages++; throw new Error('GPU image path should not run'); } };
+  const tracker = new ContextTracker(1024 * 1024, gpu);
+  tracker.registrationChoice = { backend: 'CPU', reason: 'CPU faster' };
+  const result = await tracker.image(rigidImage(0, 0, 0), { useWebGpu: true });
+  assert.equal(result.accelerator, 'CPU');
+  assert.equal(result.pyramidTiming.cpuImages, 1);
+  assert.equal(gpuImages, 0);
 });
 
 test('overlap registration refines masked native image translation and rotation', () => {

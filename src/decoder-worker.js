@@ -1,6 +1,7 @@
 import { createFile, DataStream } from 'mp4box';
 import { orientationFromMatrix } from './video-orientation.js';
 import { measureFrameSharpness } from './sharpness.js';
+import { decodeFrontiers } from './decode-order.js';
 
 let file = null;
 let samples = [];
@@ -13,8 +14,11 @@ let decoder = null;
 let decodedSampleIndex = -1;
 let requestedTimestamp = null;
 let selectedFrame = null;
+const pendingFrames = new Map();
 let decoderError = null;
-let sequentialSafe = false;
+let requiredDecodeIndices = [];
+let decodeLookahead = 2;
+let lastPresentationIndex = -1;
 let resolveSelected = null;
 let rejectSelected = null;
 let orientation = null;
@@ -23,11 +27,14 @@ let decodedColor = null;
 function closeDecoder() {
   selectedFrame?.close();
   selectedFrame = null;
+  for (const frame of pendingFrames.values()) frame.close();
+  pendingFrames.clear();
   if (decoder && decoder.state !== 'closed') decoder.close();
   decoder = null;
   decodedSampleIndex = -1;
   requestedTimestamp = null;
   decoderError = null;
+  lastPresentationIndex = -1;
   resolveSelected = null;
   rejectSelected = null;
 }
@@ -40,6 +47,9 @@ function startDecoder(sampleIndex) {
         selectedFrame?.close();
         selectedFrame = frame;
         resolveSelected?.();
+      } else if (frame.timestamp > requestedTimestamp) {
+        pendingFrames.get(frame.timestamp)?.close();
+        pendingFrames.set(frame.timestamp, frame);
       } else frame.close();
     },
     error: error => {
@@ -115,7 +125,8 @@ async function openVideo(source) {
   }
   presentation = [...samples].sort((first, second) => first.timestamp - second.timestamp);
   if (new Set(presentation.map(sample => sample.timestamp)).size !== presentation.length) throw new Error('Mehrdeutige Praesentationszeitstempel in der Videospur.');
-  sequentialSafe = presentation.every((sample, index) => sample.index === index);
+  requiredDecodeIndices = decodeFrontiers(presentation);
+  decodeLookahead = Math.max(2, ...presentation.map((sample, index) => Math.abs(sample.index - index))) + 2;
   const editEntries = trackBox.edts?.elst?.entries;
   if (editEntries && (editEntries.length > 1 || editEntries.some(edit => edit.media_rate_integer !== 1 || edit.media_rate_fraction !== 0 || edit.media_time < 0))) {
     throw new Error('Komplexe MP4-Editlisten werden fuer framegenaue Navigation nicht unterstuetzt.');
@@ -132,26 +143,30 @@ async function openVideo(source) {
     firstTimestamp, timestamps: presentation.map(sample => sample.timestamp), cacheLimit };
 }
 
-async function decodeFrame(index, native = false, useWebGpu = false) {
+async function decodeFrame(index, native = false, useWebGpu = false, measureSharpness = true) {
   if (!file || !presentation[index]) throw new Error('Frameindex ausserhalb der Videospur.');
   const target = presentation[index];
-  if (!native && cache.has(target.timestamp)) return { bitmap: await createImageBitmap(cache.get(target.timestamp)), index,
+  if (!native && cache.has(target.timestamp) && (!measureSharpness || sharpnessCache.has(target.timestamp))) return { bitmap: await createImageBitmap(cache.get(target.timestamp)), index,
     timestamp: target.timestamp, color: decodedColor, sharpness: sharpnessCache.get(target.timestamp), sharpnessMs: 0 };
   let keyIndex = target.index;
   while (keyIndex > 0 && !samples[keyIndex].key) keyIndex--;
   if (!samples[keyIndex].key) throw new Error('Kein vorausgehender Keyframe fuer dieses Sample vorhanden.');
-  const continueCost = sequentialSafe && decoder && target.index > decodedSampleIndex ? target.index - decodedSampleIndex : Infinity;
+  const buffered = pendingFrames.has(target.timestamp);
+  const canContinue = decoder && index > lastPresentationIndex && (buffered || requiredDecodeIndices[index] > decodedSampleIndex);
+  const continueCost = canContinue ? Math.max(0, requiredDecodeIndices[index] - decodedSampleIndex) : Infinity;
   const restartCost = target.index - keyIndex + 1;
-  if (!decoder || !sequentialSafe || restartCost < continueCost) startDecoder(keyIndex);
+  if (!decoder || (!buffered && restartCost < continueCost)) startDecoder(keyIndex);
   requestedTimestamp = target.timestamp;
   selectedFrame?.close();
-  selectedFrame = null;
-  const selected = new Promise((resolve, reject) => {
+  selectedFrame = pendingFrames.get(target.timestamp) || null;
+  pendingFrames.delete(target.timestamp);
+  const selected = selectedFrame ? null : new Promise((resolve, reject) => {
     resolveSelected = resolve;
     rejectSelected = reject;
   });
   try {
-    for (let sampleIndex = decodedSampleIndex + 1; sampleIndex <= target.index; sampleIndex++) {
+    const decodeThrough = Math.min(samples.length - 1, requiredDecodeIndices[index] + decodeLookahead);
+    for (let sampleIndex = decodedSampleIndex + 1; !selectedFrame && sampleIndex <= decodeThrough; sampleIndex++) {
       const sample = samples[sampleIndex];
       const bytes = await file.slice(sample.offset, sample.offset + sample.size).arrayBuffer();
       if (decoderError) throw decoderError;
@@ -160,8 +175,10 @@ async function decodeFrame(index, native = false, useWebGpu = false) {
       decodedSampleIndex = sampleIndex;
       if (decoder.decodeQueueSize > 12) await new Promise(resolve => { decoder.addEventListener('dequeue', resolve, { once: true }); });
     }
-    if (sequentialSafe) await selected;
-    else await decoder.flush();
+    if (!selectedFrame) {
+      if (decodeThrough === samples.length - 1) await decoder.flush();
+      else await selected;
+    }
     if (decoderError) throw decoderError;
     if (!selectedFrame) throw new Error(`Decoder lieferte Frame ${index} mit PTS ${target.timestamp} nicht.`);
     if (selectedFrame.displayWidth !== configuration.codedWidth || selectedFrame.displayHeight !== configuration.codedHeight) {
@@ -171,12 +188,13 @@ async function decodeFrame(index, native = false, useWebGpu = false) {
       transfer: selectedFrame.colorSpace?.transfer, matrix: selectedFrame.colorSpace?.matrix,
       fullRange: selectedFrame.colorSpace?.fullRange };
     let sharpness = sharpnessCache.get(target.timestamp), sharpnessMs = 0;
-    if (!sharpness) {
+    if (measureSharpness && !sharpness) {
       const sharpnessStarted = performance.now();
       sharpness = await measureFrameSharpness(selectedFrame, useWebGpu);
       sharpnessMs = performance.now() - sharpnessStarted;
       sharpnessCache.set(target.timestamp, sharpness);
     }
+    lastPresentationIndex = index;
     if (native) {
       const frame = selectedFrame;
       selectedFrame = null; // Ownership moves to the caller; it must close the VideoFrame.
@@ -205,7 +223,7 @@ let queue = Promise.resolve();
 self.onmessage = ({ data }) => {
   queue = queue.then(async () => {
     try {
-      const result = data.type === 'open' ? await openVideo(data.file) : await decodeFrame(data.index, data.type === 'native-frame', data.useWebGpu);
+      const result = data.type === 'open' ? await openVideo(data.file) : await decodeFrame(data.index, data.type === 'native-frame', data.useWebGpu, data.measureSharpness !== false);
       self.postMessage({ id: data.id, result }, result.frame ? [result.frame] : result.bitmap ? [result.bitmap] : []);
     } catch (error) { self.postMessage({ id: data.id, error: error.message }); }
   });

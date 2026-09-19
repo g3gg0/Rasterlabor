@@ -5,7 +5,7 @@ import { buildMaps, remapRGBA } from './maps.js';
 import { exportCalibration, importCalibration } from './format.js';
 import { PatchTracker } from './patch-tracker.js';
 import { WindowTracker } from './window-tracker.js';
-import { ContextTracker, contextImage, contextSearchRadii, registerOverlap } from './context-tracker.js';
+import { ContextTracker, contextImage, contextSearchRadii, registerOverlap, shouldRunContext } from './context-tracker.js';
 import { patchGpuStatus } from './webgpu-patch-tracker.js';
 import { remapGpuStatus, WebGpuRemapper } from './webgpu-remapper.js';
 import { restoreDetectionScale, scaleDetectionOptions } from './detection-scale.js';
@@ -224,7 +224,9 @@ self.onmessage = async ({ data }) => {
         image = prepared.rgba; delete prepared.rgba;
       }
       result = windowTracker.process(image, data.index, data.options.rectangle, data.options.patchSearchRadius, data.options.maxRotation);
-      if (result.success && (data.options.contextRecent > 0 || data.options.contextSpatial > 0)) {
+      const previousContextFrame = contextTracker.history.at(-1)?.frame ?? null;
+      if (result.success && (data.options.contextRecent > 0 || data.options.contextSpatial > 0) &&
+        shouldRunContext(data.index, previousContextFrame, data.options.contextInterval, result.score)) {
         const references = await contextTracker.begin(image, data.index, result.raw, data.options, prepared);
         contextDetection = { result, width: image.width, height: image.height };
         result = { ...result, references, contextPending: true };

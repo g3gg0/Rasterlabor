@@ -11,6 +11,11 @@ const median = values => [...values].sort((first, second) => first - second)[Mat
 export const CYCLE_STRICT_PX = 1.5;
 export const CYCLE_CONDITIONAL_PX = 7.5;
 
+export function shouldRunContext(frame, previousFrame, interval = 8, score = Infinity) {
+  if (!Number.isInteger(interval) || interval < 1) throw new Error('Ungueltiges Umfeldintervall.');
+  return previousFrame === null || frame - previousFrame >= interval || score < 0.75;
+}
+
 function worldPoint(pose, point) {
   const rotated = rotate(point.x, point.y, pose.rotation);
   return { x: pose.x + rotated.x, y: pose.y + rotated.y };
@@ -406,7 +411,7 @@ export class ContextTracker {
 
   async image(image, options) {
     let failedGpuMs = 0;
-    if (options.useWebGpu && !this.gpu.failure) {
+    if (options.useWebGpu && !this.gpu.failure && this.registrationChoice?.backend !== 'CPU') {
       const started = performance.now();
       try { return { ...await this.gpu.image(image, options.imageMask), accelerator: 'WebGPU' }; }
       catch (error) { failedGpuMs = performance.now() - started; this.gpu.disable(error); }

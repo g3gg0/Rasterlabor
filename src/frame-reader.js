@@ -29,7 +29,7 @@ export class FrameReader {
     return context.getImageData(0, 0, bitmap.width, bitmap.height);
   }
 
-  async readFrame(decoder, maps, brightness, index, { gpu = false, rectified = false, output = 'bitmap', brightness: applyBrightness = true } = {}) {
+  async readFrame(decoder, maps, brightness, index, { gpu = false, rectified = false, output = 'bitmap', brightness: applyBrightness = true, measureSharpness = true } = {}) {
     if (!['bitmap', 'rgba', 'native'].includes(output)) throw new Error(`Unbekanntes Frameformat: ${output}`);
     if (rectified && (!maps || output === 'native')) throw new Error('Entzerrte Frames benoetigen Maps und Bitmap- oder RGBA-Ausgabe.');
     if (this.decoder !== decoder || this.maps !== maps || this.brightness !== brightness) {
@@ -47,12 +47,12 @@ export class FrameReader {
     };
     let started = performance.now();
     if (output === 'native') {
-      const decoded = await decoder.call('native-frame', { index, useWebGpu: gpu });
+      const decoded = await decoder.call('native-frame', { index, useWebGpu: gpu, measureSharpness });
       recordDecodeTiming(decoded, performance.now() - started);
       return { ...decoded, frameTiming: timing };
     }
     if (gpu && !rectified) {
-      const decoded = await decoder.call('native-frame', { index, useWebGpu: gpu });
+      const decoded = await decoder.call('native-frame', { index, useWebGpu: gpu, measureSharpness });
       recordDecodeTiming(decoded, performance.now() - started);
       try {
         const o = decoded.orientation;
@@ -91,7 +91,7 @@ export class FrameReader {
       // Include first-use initialization in the reported remap time.
       timing.remapMs = performance.now() - started;
       if (this.renderer) {
-        const decoded = await decoder.call('native-frame', { index, useWebGpu: gpu });
+        const decoded = await decoder.call('native-frame', { index, useWebGpu: gpu, measureSharpness });
         recordDecodeTiming(decoded, performance.now() - started - timing.remapMs);
         try {
           const renderStarted = performance.now();
@@ -106,7 +106,7 @@ export class FrameReader {
     }
     // CPU mode retains the worker's bounded bitmap cache.
     started = performance.now();
-    const decoded = await decoder.call('frame', { index, useWebGpu: gpu });
+    const decoded = await decoder.call('frame', { index, useWebGpu: gpu, measureSharpness });
     recordDecodeTiming(decoded, performance.now() - started);
     if (!rectified && output === 'bitmap') return { ...decoded, frameTiming: timing };
     started = performance.now();
