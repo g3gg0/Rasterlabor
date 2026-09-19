@@ -62,7 +62,6 @@ globalThis.overlaySmoke = {
     element('globalUseWebGpu').checked=true;
     await updateRectified();
     const preview=[rectifiedImage.width,rectifiedImage.height];
-    element('trackingMode').value='window';
     element('trackingStart').value='970';element('trackingEnd').value='972';
     element('trackingSearchRadius').value='128';
     trackingRectangle={x:1682,y:3456,width:1024,height:1024};

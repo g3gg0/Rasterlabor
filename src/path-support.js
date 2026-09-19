@@ -190,6 +190,29 @@ export function averagedFrames(sum, preserveCoverage = false) {
   return rgba;
 }
 
+export function sparsePathFrames(geometries, limit = 12) {
+  if (!geometries.length || limit < 1) return [];
+  if (geometries.length <= limit) return geometries.slice();
+  const centers = geometries.map(geometry => geometry.world(geometry.width / 2, geometry.height / 2));
+  const selected = new Set([geometries.length - 1]);
+  if (limit > 1) selected.add(0);
+  while (selected.size < limit) {
+    let bestIndex = -1, bestDistance = -1;
+    for (let index = 0; index < geometries.length; index++) {
+      if (selected.has(index)) continue;
+      let nearest = Infinity;
+      for (const selectedIndex of selected) {
+        const dx = centers[index].x - centers[selectedIndex].x;
+        const dy = centers[index].y - centers[selectedIndex].y;
+        nearest = Math.min(nearest, dx * dx + dy * dy);
+      }
+      if (nearest > bestDistance) { bestIndex = index; bestDistance = nearest; }
+    }
+    selected.add(bestIndex);
+  }
+  return [...selected].sort((first, second) => first - second).map(index => geometries[index]);
+}
+
 export function nearestPathEntry(entries, project, point, radius = 12) {
   let nearest = null, distance = radius;
   for (const entry of entries) {

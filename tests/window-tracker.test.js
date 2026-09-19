@@ -397,6 +397,20 @@ test('window tracking measures rectangular translation and accumulates inverse c
   assert.ok(next.timing.totalMs >= next.timing.sampleMs);
 });
 
+test('window tracking resumes from a seeded frame and absolute pose', () => {
+  const tracker = new WindowTracker();
+  const seed = image(5, -3);
+  const pose = { x: -42.5, y: 18.25, rotation: 0.037 };
+  assert.equal(tracker.process(seed, 120, rectangle).initial, true);
+  tracker.setPose(pose, seed.width, seed.height);
+  const resumed = tracker.process(image(5, -3), 121, rectangle);
+  assert.equal(resumed.success, true, JSON.stringify(resumed));
+  assert.equal(resumed.incrementalMatch.frame, 120);
+  assert.ok(Math.abs(resumed.raw.x - pose.x) < 0.15, JSON.stringify(resumed.raw));
+  assert.ok(Math.abs(resumed.raw.y - pose.y) < 0.15, JSON.stringify(resumed.raw));
+  assert.ok(Math.abs(resumed.raw.rotation - pose.rotation) < 0.002, JSON.stringify(resumed.raw));
+});
+
 test('large window refinement evaluates a bounded seed when the FFT shift exceeds the search radius', () => {
   const tracker = new WindowTracker();
   const window = { x: 32, y: 32, width: 1024, height: 1024 };

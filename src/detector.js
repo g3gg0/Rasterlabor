@@ -55,85 +55,6 @@ function peaks(profile, threshold, radius) {
   return candidates;
 }
 
-function traceFamily(sample, transverseRange, longitudinalRange, radius, threshold, expectedStep) {
-  const scanStep = Math.max(2, Math.min(5, Math.round(expectedStep / 10)));
-  const maximumGap = Math.min(expectedStep * 0.75, Math.max(scanStep * 4, radius * 2 + scanStep * 4));
-  const tracks = [];
-  const profileWidth = Math.ceil(transverseRange[1] - transverseRange[0]);
-  for (let longitudinal = longitudinalRange[0] + 2; longitudinal < longitudinalRange[1] - 2; longitudinal += scanStep) {
-    const profile = new Float32Array(profileWidth);
-    for (let index = 0; index < profile.length; index++) {
-      const transverse = transverseRange[0] + index;
-      const center = sample(transverse, longitudinal);
-      const low = sample(transverse - radius, longitudinal);
-      const high = sample(transverse + radius, longitudinal);
-      profile[index] = Number.isFinite(center + low + high) ? Math.max(0, Math.min(low, high) - center) : 0;
-    }
-    const candidates = peaks(profile, threshold, radius).map(candidate => ({
-      ...candidate, position: candidate.position + transverseRange[0], longitudinal
-    }));
-    const available = tracks.filter(track => longitudinal - track.at(-1).longitudinal <= maximumGap);
-    const predictions = available.map(track => {
-      const recent = track.slice(-8);
-      const meanLongitudinal = recent.reduce((sum, point) => sum + point.longitudinal, 0) / recent.length;
-      const meanPosition = recent.reduce((sum, point) => sum + point.position, 0) / recent.length;
-      let covariance = 0;
-      let variance = 0;
-      for (const point of recent) {
-        covariance += (point.longitudinal - meanLongitudinal) * (point.position - meanPosition);
-        variance += (point.longitudinal - meanLongitudinal) ** 2;
-      }
-      const slope = variance ? clamp(covariance / variance, -0.8, 0.8) : 0;
-      return meanPosition + slope * (longitudinal - meanLongitudinal);
-    });
-    const assignments = [];
-    candidates.forEach((candidate, candidateIndex) => available.forEach((track, trackIndex) => {
-      const last = track.at(-1);
-      const distance = Math.abs(candidate.position - predictions[trackIndex]);
-      if (distance < Math.min(expectedStep * 0.32, (longitudinal - last.longitudinal) * 0.6 + 3)) {
-        assignments.push({ distance, candidateIndex, trackIndex });
-      }
-    }));
-    assignments.sort((first, second) => first.distance - second.distance);
-    const usedCandidates = new Set();
-    const usedTracks = new Set();
-    for (const assignment of assignments) {
-      if (usedCandidates.has(assignment.candidateIndex) || usedTracks.has(assignment.trackIndex)) continue;
-      available[assignment.trackIndex].push(candidates[assignment.candidateIndex]);
-      usedCandidates.add(assignment.candidateIndex);
-      usedTracks.add(assignment.trackIndex);
-    }
-    candidates.forEach((candidate, index) => { if (!usedCandidates.has(index)) tracks.push([candidate]); });
-  }
-  return tracks.filter(track => track.length * scanStep > Math.max(expectedStep * 1.8, (longitudinalRange[1] - longitudinalRange[0]) * 0.28));
-}
-
-function interpolateTrack(track, longitudinal) {
-  if (longitudinal < track[0].longitudinal || longitudinal > track.at(-1).longitudinal) return null;
-  let low = 0;
-  let high = track.length - 1;
-  while (high - low > 1) {
-    const middle = (low + high) >> 1;
-    if (track[middle].longitudinal < longitudinal) low = middle;
-    else high = middle;
-  }
-  const fraction = (longitudinal - track[low].longitudinal) / (track[high].longitudinal - track[low].longitudinal || 1);
-  return track[low].position * (1 - fraction) + track[high].position * fraction;
-}
-
-function orderTracks(tracks, center, expectedStep) {
-  const ordered = tracks.map(track => ({ track, center: interpolateTrack(track, center) ?? median(track.map(point => point.position)) }))
-    .sort((first, second) => first.center - second.center);
-  const unique = [];
-  for (const entry of ordered) {
-    const previous = unique.at(-1);
-    if (previous && entry.center - previous.center < expectedStep * 0.4) {
-      if (entry.track.length > previous.track.length) unique[unique.length - 1] = entry;
-    } else unique.push(entry);
-  }
-  return unique.map(entry => entry.track);
-}
-
 function checkTopology(points) {
   const byRow = new Map();
   const byCol = new Map();
@@ -166,42 +87,11 @@ function checkTopology(points) {
     const below = lookup.get(`${point.col},${point.row + 1}`);
     if (!right || !below) continue;
     const area = (right.x - point.x) * (below.y - point.y) - (right.y - point.y) * (below.x - point.x);
-    if (area <= 0) return 'Rasterlinien kreuzen sich inkonsistent oder die Haendigkeit ist gespiegelt.';
+    if (area <= 0) return 'Checkerboard-Zellen sind inkonsistent angeordnet oder die Haendigkeit ist gespiegelt.';
     cells++;
   }
   if (cells < 4) return 'Keine ausreichend zusammenhaengende zweidimensionale Rastertopologie.';
   return { step: median(distances), rows: byRow.size, cols: byCol.size };
-}
-
-function refineCrossing(sample, px, py, cosine, sine, radius) {
-  let currentX = px;
-  let currentY = py;
-  for (let iteration = 0; iteration < 3; iteration++) {
-    for (const [axisX, axisY] of [[cosine, sine], [-sine, cosine]]) {
-      let weightSum = 0;
-      let moment = 0;
-      for (let offset = -radius; offset <= radius; offset += 0.5) {
-        const candidateX = currentX + offset * axisX;
-        const candidateY = currentY + offset * axisY;
-        let response = 0;
-        for (const side of [-1, 1]) {
-          const along = radius * 1.5 * side;
-          const center = sample(candidateX - along * axisY, candidateY + along * axisX);
-          const low = sample(candidateX - radius * axisX - along * axisY, candidateY - radius * axisY + along * axisX);
-          const high = sample(candidateX + radius * axisX - along * axisY, candidateY + radius * axisY + along * axisX);
-          if (Number.isFinite(center + low + high)) response += Math.max(0, Math.min(low, high) - center);
-        }
-        weightSum += response;
-        moment += offset * response;
-      }
-      if (weightSum > 0) {
-        const offset = clamp(moment / weightSum, -radius / 2, radius / 2);
-        currentX += offset * axisX;
-        currentY += offset * axisY;
-      }
-    }
-  }
-  return { x: currentX, y: currentY };
 }
 
 function chessboardPoints(sample, width, height, roi, angle, expectedStep, threshold, preparedCandidates = null, preparedCorners = null) {
@@ -329,7 +219,7 @@ export function detectGrid(image, options = {}) {
         const center = rotated(across, along);
         const low = rotated(across - 6, along);
         const high = rotated(across + 6, along);
-        profile[index] = options.pattern === 'chessboard' ? Math.abs(high - low) : Math.max(0, Math.min(low, high) - center);
+        profile[index] = Math.abs(high - low);
       }
       const candidates = peaks(profile, threshold, 4);
       for (let index = 1; index < candidates.length; index++) gaps.push(candidates[index].position - candidates[index - 1].position);
@@ -338,48 +228,10 @@ export function detectGrid(image, options = {}) {
   }
   const result = { points: [], lines: [], rejected: [], roi, angle, success: false, reason: '', confidence: 0, coverage: 0 };
   if (!(expectedStep >= 10)) return { ...result, reason: 'Kein periodisches Raster gefunden. Rasterabstand in Pixeln angeben oder Kontrast pruefen.' };
-  const radius = clamp(options.lineRadius || expectedStep * 0.15, 3, 16);
-  if (options.pattern === 'chessboard') {
-    const chessboard = chessboardPoints(sample, width, height, roi, angle, expectedStep, threshold,
-      options.precomputedCandidates, options.precomputedCorners);
-    result.points = chessboard.points;
-    result.detectorTiming = chessboard.timing;
-  } else {
-    const columns = orderTracks(traceFamily(rotated, rangeU, rangeV, radius, threshold, expectedStep), (rangeV[0] + rangeV[1]) / 2, expectedStep);
-    const rows = orderTracks(traceFamily((along, across) => rotated(across, along), rangeV, rangeU, radius, threshold, expectedStep), (rangeU[0] + rangeU[1]) / 2, expectedStep);
-    result.lines = columns.map((track, index) => ({ family: 'col', index, points: track.map(point => ({
-      x: cosine * point.position - sine * point.longitudinal, y: sine * point.position + cosine * point.longitudinal
-    })) })).concat(rows.map((track, index) => ({ family: 'row', index, points: track.map(point => ({
-      x: cosine * point.longitudinal - sine * point.position, y: sine * point.longitudinal + cosine * point.position
-    })) })));
-    columns.forEach((column, col) => rows.forEach((rowTrack, row) => {
-      let across = median(column.map(point => point.position));
-      let along = median(rowTrack.map(point => point.position));
-      for (let iteration = 0; iteration < 12; iteration++) {
-        const nextU = interpolateTrack(column, along);
-        if (nextU === null) return;
-        const nextV = interpolateTrack(rowTrack, nextU);
-        if (nextV === null) return;
-        const change = Math.hypot(nextU - across, nextV - along);
-        across = nextU; along = nextV;
-        if (change < 0.005) break;
-      }
-      const px = cosine * across - sine * along;
-      const py = sine * across + cosine * along;
-      if (px < roi.x + 2 * radius || py < roi.y + 2 * radius || px >= roi.x + roi.width - 2 * radius || py >= roi.y + roi.height - 2 * radius) return;
-      const refined = refineCrossing(sample, px, py, cosine, sine, radius);
-      const center = sample(refined.x, refined.y);
-      const backgrounds = [[-1, -1], [-1, 1], [1, -1], [1, 1]].map(([acrossSign, alongSign]) =>
-        sample(refined.x + radius * (acrossSign * cosine - alongSign * sine),
-          refined.y + radius * (acrossSign * sine + alongSign * cosine)));
-      const contrast = Math.min(...backgrounds) - center;
-      if (!(contrast > threshold && Math.hypot(refined.x - px, refined.y - py) < radius)) {
-        result.rejected.push({ x: px, y: py, reason: 'Kreuzungskontrast oder Subpixelkorrektur unplausibel' });
-        return;
-      }
-      result.points.push({ ...refined, col, row, confidence: clamp(contrast / 160, 0.1, 1) });
-    }));
-  }
+  const chessboard = chessboardPoints(sample, width, height, roi, angle, expectedStep, threshold,
+    options.precomputedCandidates, options.precomputedCorners);
+  result.points = chessboard.points;
+  result.detectorTiming = chessboard.timing;
   const topology = checkTopology(result.points);
   if (typeof topology === 'string') return { ...result, reason: topology };
   if (options.columns && topology.cols > options.columns || options.rows && topology.rows > options.rows) {

@@ -7,10 +7,10 @@ import { poseFor } from './solver.js';
 import { Field3DView } from './field-3d.js';
 import { VideoExporter } from './video-exporter.js';
 import { relativeCoverageScale } from './maps.js';
-import { createPatchMask, MASK_FORBIDDEN, MASK_NEUTRAL, MASK_SEARCH, maskIncludes, paintPatchMask, patchAllowed, remapInclusionMask, validatePointsAgainstMask } from './patch-mask.js';
+import { createPatchMask, MASK_FORBIDDEN, MASK_NEUTRAL, MASK_SEARCH, maskIncludes, paintPatchMask, remapInclusionMask } from './patch-mask.js';
 import { analyzeObservations, selectConsistentFrames } from './observation-diagnostics.js';
 import { fitCameraPose, stabilizePose } from './motion-tracking.js';
-import { frameGeometry, localSelectionMask, localSelectionDistance, localSelectionSupport, supportColor, applyPixelMask, edgeFeatherMask, applyEdgeFeather, accumulateFrame, approximateTopFrames, averagedFrames, sharpestFramesFirst } from './path-support.js';
+import { frameGeometry, localSelectionMask, localSelectionDistance, localSelectionSupport, supportColor, applyPixelMask, edgeFeatherMask, edgeFeatherWeight, applyEdgeFeather, accumulateFrame, approximateTopFrames, averagedFrames, sharpestFramesFirst, sparsePathFrames } from './path-support.js';
 import { FrameReader } from './frame-reader.js';
 import { installTrackingInspector } from './tracking-inspector.js';
 import { installCheckerboardView } from './checkerboard-view.js';
@@ -20,8 +20,7 @@ import { renderTiledOverlay, closeOverlayTiles, overlayTiles, overlayTileSize } 
 import { applyPoseCorrection, buildPoseGraph, localRefitGroups, searchLocalRefit } from './pose-graph-refit.js';
 import { refitColorMatrix } from './refit-preprocess.js';
 import { brightnessDisplayRange, brightnessFieldPixels, decodeBrightnessCalibration, encodeBrightnessCalibration } from './brightness-calibration.js';
-import { pixelBrightnessSample, planPixelBrightnessPairs } from './pixel-brightness.js';
-import { fitCheckerboardBrightness, sampleCheckerboardBrightness } from './uniform-brightness.js';
+import { fitCheckerboardBrightness, sampleCheckerboardBrightness } from './checkerboard-brightness.js';
 import { mergeBounds, mergeEstimate, selectMergeFrames } from './merge-plan.js';
 import { beginBigTiff } from './bigtiff-writer.js';
 
@@ -80,13 +79,9 @@ let measurements = [];
 let rawReady = false;
 let rectifiedReady = false;
 let rectifiedPlayback = false;
-let patchMask = null;
 let observationDiagnostics = null;
 let observationDiagnosticsDirty = true;
 let geometrySelection = null;
-let maskTool = 'pan';
-let maskImageRevision = -1;
-const maskImage = document.createElement('canvas');
 const transforms = new Map();
 const previewFilter = 'url(#imageAdjustmentFilter)';
 const refitPreviewFilter = 'url(#refitAdjustmentFilter)';
@@ -137,16 +132,15 @@ let brightnessRunning = false;
 let brightnessPaused = false;
 let brightnessSession = null;
 let trackingNextIndex = 0;
+let trackingNeedsSeed = false;
 let trackingPath = [];
 let trackingFailures = [];
 let trackingDataset = null;
 let trackingPreviewTransform = null;
-let trackingPreviewPoints = [];
 let trackingPreviewRequest = 0;
 let trackingProfile = null;
 let trackingZoom = 1;
 let trackingPan = { x: 0, y: 0 };
-let selectedTrackingPatch = null;
 let trackingRectangle = null;
 let selectingTrackingWindow = false;
 let trackingPreviewBusy = false;
@@ -155,6 +149,11 @@ let trackingLost = false;
 let pathProject = null;
 let pathHover = null;
 let pathSelection = null;
+let trackingMosaicImage = document.createElement('canvas');
+let trackingMosaicBounds = null;
+let trackingMosaicRequest = 0;
+let trackingMosaicTimer = 0;
+let trackingMosaicBusy = false;
 let overlayRequest = 0;
 let overlayGpuIdle = Promise.resolve();
 let pathOverlay = document.createElement('canvas');
@@ -193,7 +192,6 @@ let trackingMaskTransform = null;
 let mergeRunning = false;
 let mergeCancelled = false;
 let mergeTilePlan = null;
-const windowTracking = () => element('trackingMode').value === 'window';
 const checkerboardView = installCheckerboardView({ canvas: resultCanvas, redraw: () => draw(),
   getState: () => ({ visible: view === 'rectified', ready: rectifiedReady && Boolean(calibration) && video.paused && !rectifiedPlayback && !taskBusy && !navigationBusy && !trackingRunning,
     key: `${currentIndex}:${displayRevision}:${calibration?.version}`, image: rectifiedImage, step: calibration?.step }) });
@@ -312,12 +310,6 @@ function operationProgress(status, value, key = status) {
 }
 
 function showProgress(progress) {
-  if (progress.operation === 'brightness-fit') {
-    const status = `Helligkeitssolver | Frame ${progress.frame + 1}/${progress.frames} | Bildpaare ${progress.pairs}/${progress.totalPairs} | Training ${progress.trainingEquations} | Validierung ${progress.validationEquations}`;
-    text('brightnessStatus', status);
-    operationProgress(status, (progress.frame + 1) / progress.frames, 'brightness-fit');
-    return;
-  }
   const names = { index: 'MP4-Index', forward: 'Dichte Vorwaertsmap', inverse: 'Inverse Map', fit: 'Gemeinsamer Fit' };
   const accelerator = progress.accelerator ? ` | ${progress.accelerator}` : '';
   const speed = Number.isFinite(progress.iterationsPerSecond) && Number.isFinite(progress.iterationSeconds) ?
@@ -498,29 +490,23 @@ function renderPatchProfile(detection) {
   section.dataset.summary = `Erkennung ${fixed(total, 1)} ms`;
   text('patchProfileNote', detection.accelerator === 'WebGPU-Hybrid' ?
     `${detection.accelerator} | Frame ${currentIndex} | ${detection.points.length} Punkte | Arbeitsaufloesung ${fixed(timing.scale * 100, 0)}% je Achse` :
-    `${detection.accelerator || 'CPU'} | Frame ${currentIndex} | ${detection.points.length} Patches | ${detection.patchSize} px`);
+    `${detection.accelerator || 'CPU'} | Frame ${currentIndex} | ${detection.points.length} Checkerboard-Ecken`);
   updateTimeProfiles();
 }
 
 function parameters() {
   const width = videoInfo?.width ?? calibration?.field.width;
   const height = videoInfo?.height ?? calibration?.field.height;
-  const settings = { width, height, pattern: element('pattern').value, gridMm: number('gridMm', null), step: number('step', 0),
+  const settings = { width, height, gridMm: number('gridMm', null), step: number('step', 0),
     approxStep: number('approxStep', 0), columns: number('columns', null), rows: number('rows', null),
-    threshold: number('threshold', 16), lineRadius: number('lineRadius', 0), spacing: number('spacing', Math.round(Math.max(width || 640, height || 480) / 4)),
-    patchSize: number('patchSize', 32), patchSearchRadius: number('patchSearchRadius', 16),
+    threshold: number('threshold', 16), spacing: number('spacing', Math.round(Math.max(width || 640, height || 480) / 4)),
     lambda: number('lambda', 0.01), sigma: number('sigma', 1), delta: number('delta', 1.5), tau: number('tau', 0.12),
     iterations: number('iterations', 35), acceptance: number('acceptance', 1), useWebGpu: useWebGpu(), interval: 0,
     minMotion: number('minMotion', 0), updateEvery: number('updateEvery', 4), validationFrom: number('validationFrom', 80),
     startPercent: number('startPercent', 0), endPercent: number('endPercent', 100) };
-  if (settings.pattern === 'patches') {
-    settings.step = 1; settings.gridMm = null; settings.approxStep = 0; settings.columns = null; settings.rows = null; settings.lineRadius = 0;
-    if (width && height) ensurePatchMask(width, height);
-    if (patchMask) settings.patchMask = { ...patchMask, data: patchMask.data.slice() };
-  }
   if (!(settings.spacing >= 16 && settings.minMotion >= 0 && settings.endPercent > settings.startPercent &&
     settings.sigma > 0 && settings.delta > 0 && settings.lambda >= 0 && settings.tau > 0 && settings.iterations >= 5 && settings.iterations <= 300 &&
-    settings.threshold > 0 && settings.patchSize >= 16 && settings.patchSize <= 256 && settings.patchSearchRadius >= 4 && settings.patchSearchRadius <= 128 && settings.acceptance > 0 && settings.updateEvery >= 2 &&
+    settings.threshold > 0 && settings.acceptance > 0 && settings.updateEvery >= 2 &&
     (settings.gridMm === null || settings.gridMm > 0))) throw new Error('Ungueltige Parameter. Positive Werte und gueltigen Zeitbereich verwenden.');
   if (Math.ceil(width / settings.spacing) * Math.ceil(height / settings.spacing) > 700) throw new Error('Kontrollgitter zu fein fuer den lokalen Solver. Groebere Splineweite waehlen.');
   return settings;
@@ -534,58 +520,6 @@ function applyParameters(settings) {
     }
   }
   for (const key of ['gridMm', 'columns', 'rows']) if (settings?.[key] == null) element(key).value = '';
-  patchMask = settings?.patchMask || null;
-  maskImageRevision = -1;
-  updatePatternControls();
-}
-
-function updatePatternControls() {
-  const patches = element('pattern').value === 'patches';
-  element('patchControls').hidden = !patches;
-  element('gridGeometryControls').hidden = patches;
-  element('lineRadiusControl').hidden = patches;
-  if (patches) {
-    element('step').value = '1';
-    const width = videoInfo?.width ?? calibration?.field.width;
-    const height = videoInfo?.height ?? calibration?.field.height;
-    if (width && height) ensurePatchMask(width, height);
-  }
-}
-
-function ensurePatchMask(width, height) {
-  if (!patchMask || patchMask.sourceWidth !== width || patchMask.sourceHeight !== height) {
-    patchMask = createPatchMask(width, height);
-    maskImageRevision = -1;
-  }
-  return patchMask;
-}
-
-function revalidatePatchFrames(frameList, mask = patchMask) {
-  let invalid = 0;
-  for (const frame of frameList) {
-    if (!frame.patchSize) continue;
-    invalid += validatePointsAgainstMask(frame.points, mask, frame.patchSize);
-  const trackingSection = element('trackingProfileSection');
-    if (frame.points.length < 6) {
-      frame.enabled = false;
-      frame.accepted = false;
-  if (!trackingSection.hidden) summaries.push(trackingSection.dataset.summary);
-    }
-  }
-  return invalid;
-}
-
-function commitMaskEdit() {
-  const invalid = revalidatePatchFrames(frames.values());
-  parameterRevision++;
-  stale = Boolean(calibration);
-  detectionsStale = false;
-  phaseChecked = [...frames.values()].some(frame => frame.accepted);
-  detections.clear();
-  currentDetection = detectionFromFrame(frames.get(currentIndex));
-  updateTable(); updateMetrics(); updateControls(); draw();
-  message(invalid ? `${invalid} Patch-Vektoren beruehrten die rote Maske und wurden verworfen. Nur neu fitten erforderlich.` :
-    'Patch-Maske geaendert. Vorhandene Vektoren wurden direkt geprueft; nur neu fitten erforderlich.');
 }
 
 function updateCorrectionDataStatus() {
@@ -622,7 +556,14 @@ function restoreTracking(tracking) {
   trackingDataset = tracking;
   trackingPath = tracking.path;
   trackingFailures = Array.isArray(tracking.failures) ? tracking.failures : [];
-  trackingRunOptions = tracking.options ?? null;
+  const last = [...trackingPath].reverse().find(entry => entry.pose);
+  if (!last) return;
+  trackingRectangle = last.rectangle ?? tracking.rectangle ?? tracking.options?.rectangle ?? trackingRectangle;
+  trackingRunOptions = { ...(tracking.options ?? {}), mode: 'window', rectangle: trackingRectangle };
+  trackingNextIndex = last.frame + 1;
+  trackingNeedsSeed = true;
+  trackingLost = false;
+  if (videoInfo && number('trackingEnd', 0) < trackingNextIndex) element('trackingEnd').value = videoInfo.frameCount - 1;
     const storedMask = tracking.options?.sourceImageMask ?? tracking.options?.patchMask;
     const sourceWidth = videoInfo?.width ?? calibration?.field.width;
     const sourceHeight = videoInfo?.height ?? calibration?.field.height;
@@ -636,9 +577,10 @@ function restoreTracking(tracking) {
       trackingMaskHasSelection = data.includes(MASK_SEARCH);
     }
   }
-  // A stored path can be inspected/exported; decoder and tracker history are not stored.
-  trackingPaused = false;
+  // Legacy packages need only their final pose and frame; context history is rebuilt after resuming.
+  trackingPaused = true;
   renderTrackingResults(trackingPath.at(-1));
+  scheduleTrackingMosaic();
   updateTrackingControls();
   updateCorrectionDataStatus();
 }
@@ -739,7 +681,6 @@ function setRaw(bitmap, index, sharpness = null) {
   rawImage.height = bitmap.height;
   rawImage.getContext('2d').drawImage(bitmap, 0, 0);
   rawReady = true;
-  if (element('pattern').value === 'patches') ensurePatchMask(bitmap.width, bitmap.height);
   currentIndex = index;
   currentSharpness = sharpness;
   currentDetection = detections.get(index) || detectionFromFrame(frames.get(index));
@@ -826,7 +767,7 @@ async function detectIndex(index, display = true) {
   if (display) setRaw(result.bitmap, index, result.sharpness);
   const settings = parameters();
   let detection;
-  if (settings.pattern === 'chessboard' && settings.useWebGpu) {
+  if (settings.useWebGpu) {
     detection = await computer.call('detect-bitmap', { bitmap: result.bitmap, index, options: settings }, [result.bitmap]);
   } else {
     const image = frameReader.toRgba(result.bitmap);
@@ -867,8 +808,7 @@ async function evaluateIndex(index, display = true, force = false, status = '', 
   const settings = parameters();
   const previous = frames.get(index);
   const retryMotionRejection = settings.minMotion === 0 && previous && !previous.accepted && previous.points.length > 0;
-  const retryInterruptedPatch = previous && !previous.accepted && previous.reason.startsWith('Image-Patch-Sequenz');
-  if (frames.has(index) && !detectionsStale && !force && !retryMotionRejection && !retryInterruptedPatch) {
+  if (frames.has(index) && !detectionsStale && !force && !retryMotionRejection) {
     if (display) {
       const result = await readFrame(index);
       setRaw(result.bitmap, index, result.sharpness);
@@ -887,9 +827,9 @@ async function evaluateIndex(index, display = true, force = false, status = '', 
   const oldFrame = frames.get(index);
   const frame = { id: index, timestamp: videoInfo.timestamps[index], role: oldFrame?.role || role,
     enabled: !reason, accepted: !reason, points: detection.success ? detection.points : [], roi: settings.roi || null,
-    patchSize: detection.patchSize || null, confidence: detection.confidence, accelerator: detection.accelerator,
+    confidence: detection.confidence, accelerator: detection.accelerator,
     sharpness: detection.sharpness, timing: detection.timing,
-    reason: reason || (detection.patchSize ? 'Brauchbare Image-Patches' : 'Brauchbares Raster') };
+    reason: reason || 'Brauchbares Checkerboard' };
   frames.set(index, frame);
   geometrySelection = null;
   observationDiagnosticsDirty = true;
@@ -1221,42 +1161,9 @@ function drawCanvas(canvas, image, width, height, overlay = null, adjustImage = 
   if (overlay) overlay(context, scale);
 }
 
-function drawPatchMask(context) {
-  if (!patchMask || element('pattern').value !== 'patches') return;
-  if (maskImageRevision !== patchMask.revision) {
-    maskImage.width = patchMask.width;
-    maskImage.height = patchMask.height;
-    const pixels = maskImage.getContext('2d').createImageData(patchMask.width, patchMask.height);
-    for (let index = 0; index < patchMask.data.length; index++) {
-      const offset = 4 * index;
-      if (patchMask.data[index] === MASK_SEARCH) pixels.data.set([20, 184, 110, 82], offset);
-      else if (patchMask.data[index] === MASK_FORBIDDEN) pixels.data.set([223, 53, 69, 105], offset);
-    }
-    maskImage.getContext('2d').putImageData(pixels, 0, 0);
-    maskImageRevision = patchMask.revision;
-  }
-  context.save();
-  context.imageSmoothingEnabled = false;
-  context.drawImage(maskImage, 0, 0, patchMask.sourceWidth, patchMask.sourceHeight);
-  context.restore();
-}
-
 function drawOverlay(context, scale) {
-  drawPatchMask(context);
   if (!element('overlay').checked || !currentDetection) return;
   const detection = currentDetection;
-  if (detection.patchSize) {
-    context.lineWidth = 1 / scale;
-    for (const point of detection.points || []) {
-      const size = detection.patchSize;
-      if (!patchAllowed(patchMask, point.x, point.y, size)) continue;
-      context.strokeStyle = `rgba(39, 234, 182, ${0.35 + 0.65 * point.confidence})`;
-      context.strokeRect(point.x - size / 2, point.y - size / 2, size, size);
-      context.fillStyle = '#ffd047';
-      context.fillRect(point.x - 1.5 / scale, point.y - 1.5 / scale, 3 / scale, 3 / scale);
-    }
-    return;
-  }
   context.lineWidth = 1 / scale;
   for (const line of detection.lines || []) {
     context.strokeStyle = line.family === 'col' ? '#27eab6' : '#ffd047';
@@ -1317,11 +1224,13 @@ function draw() {
 }
 
 function updateTrackingControls() {
-  element('trackingSearchRadius').max = windowTracking() ? '1024' : '128';
+  element('trackingSearchRadius').max = '1024';
   const ready = Boolean(videoInfo && calibration && videoInfo.width === calibration.field.width && videoInfo.height === calibration.field.height && !taskBusy && !continuous && !rectifiedPlayback);
-  element('trackingStartButton').disabled = !ready || trackingRunning || trackingPreviewBusy || (windowTracking() && !trackingRectangle);
+  const canContinue = trackingPath.some(entry => entry.pose) && trackingNextIndex <= number('trackingEnd', 0);
+  element('trackingStartButton').disabled = !ready || trackingRunning || trackingPreviewBusy || !trackingRectangle;
   element('trackingPauseButton').disabled = !trackingRunning;
-  element('trackingResumeButton').disabled = !ready || trackingRunning || trackingPreviewBusy || trackingLost || !trackingPaused || trackingNextIndex > number('trackingEnd', 0);
+  element('trackingResumeButton').disabled = !ready || trackingRunning || trackingPreviewBusy || !trackingRectangle ||
+    trackingLost || (!trackingPaused && !canContinue) || trackingNextIndex > number('trackingEnd', 0);
   element('trackingResetButton').disabled = trackingRunning || trackingPreviewBusy;
   element('trackingExportButton').disabled = !trackingPath.some(entry => entry.pose);
   for (const control of document.querySelectorAll('.tracking-settings input, .tracking-settings select')) control.disabled = trackingRunning || trackingPreviewBusy;
@@ -1342,6 +1251,8 @@ function resetTrackingWorker() {
 function clearTrackingResults(preserveRectangle = false) {
   trackingInspector.clear();
   overlayRequest++;
+  trackingMosaicRequest++; clearTimeout(trackingMosaicTimer);
+  trackingMosaicImage.width = trackingMosaicImage.height = 0; trackingMosaicBounds = null;
   pathHover = null; pathSelection = null; pathProject = null;
   pathRefitProposal = null; pathRefitBusy = false;
   clearPathOverlay();
@@ -1350,6 +1261,7 @@ function clearTrackingResults(preserveRectangle = false) {
   trackingRunning = false;
   trackingPaused = false;
   trackingNextIndex = number('trackingStart', 0);
+  trackingNeedsSeed = false;
   trackingPath = [];
   trackingFailures = [];
   trackingDataset = null;
@@ -1364,10 +1276,8 @@ function clearTrackingResults(preserveRectangle = false) {
   text('trackingMatchQuality', 'Korrelation: -');
   element('trackingMatchQuality').title = '';
   trackingPreviewTransform = null;
-  trackingPreviewPoints = [];
   trackingZoom = 1;
   trackingPan = { x: 0, y: 0 };
-  selectedTrackingPatch = null;
   trackingPreviewImage.width = 0;
   trackingPreviewImage.height = 0;
   resetTrackingWorker();
@@ -1488,15 +1398,7 @@ function renderTrackingPreview() {
   drawAdjustedImage(context, trackingPreviewImage, left, top, trackingPreviewImage.width * scale, trackingPreviewImage.height * scale);
   trackingPreviewTransform = { scale, left, top };
   element('trackingPreviewEmpty').hidden = true;
-  context.fillStyle = '#19d6a0'; context.strokeStyle = '#063d34'; context.lineWidth = 1;
-  for (const point of trackingPreviewPoints) {
-    const px = left + point.x * scale;
-    const py = top + point.y * scale;
-    const selected = point === selectedTrackingPatch;
-    context.beginPath(); context.arc(px, py, selected ? 5 : 2.5, 0, Math.PI * 2); context.fill(); context.stroke();
-    if (selected) { context.strokeStyle = '#ffd74b'; context.lineWidth = 2; context.beginPath(); context.arc(px, py, 8, 0, Math.PI * 2); context.stroke(); context.strokeStyle = '#063d34'; context.lineWidth = 1; }
-  }
-  if (windowTracking() && trackingRectangle) {
+  if (trackingRectangle) {
     context.strokeStyle = '#ffd74b'; context.lineWidth = 2;
     context.strokeRect(left + trackingRectangle.x * scale, top + trackingRectangle.y * scale,
       trackingRectangle.width * scale, trackingRectangle.height * scale);
@@ -1509,36 +1411,7 @@ function drawTrackingFrame(bitmap) {
   trackingPreviewImage.width = bitmap.width;
   trackingPreviewImage.height = bitmap.height;
   trackingPreviewImage.getContext('2d').drawImage(bitmap, 0, 0);
-  trackingPreviewPoints = [];
   renderTrackingPreview();
-}
-
-function drawTrackingPatches(points) {
-  trackingPreviewPoints = points;
-  if (!points.includes(selectedTrackingPatch)) selectedTrackingPatch = null;
-  renderTrackingPreview();
-}
-
-function renderTrackingPatchDetail() {
-  const point = selectedTrackingPatch;
-  if (!point || !trackingPreviewImage.width) return;
-  const patchSize = number('trackingPatchSize', 64);
-  const cropSize = Math.max(128, patchSize * 2);
-  const canvas = element('trackingPatchCanvas');
-  canvas.width = cropSize; canvas.height = cropSize;
-  const context = canvas.getContext('2d');
-  context.imageSmoothingEnabled = false;
-  drawAdjustedImage(context, trackingPreviewImage, point.x - cropSize / 2, point.y - cropSize / 2, cropSize, cropSize, 0, 0, cropSize, cropSize);
-  context.strokeStyle = '#ffd74b'; context.lineWidth = Math.max(1, cropSize / 192);
-  context.strokeRect(cropSize / 2 - patchSize / 2, cropSize / 2 - patchSize / 2, patchSize, patchSize);
-  context.strokeStyle = '#c6404a'; context.beginPath(); context.moveTo(cropSize / 2 - 7, cropSize / 2); context.lineTo(cropSize / 2 + 7, cropSize / 2); context.moveTo(cropSize / 2, cropSize / 2 - 7); context.lineTo(cropSize / 2, cropSize / 2 + 7); context.stroke();
-  text('trackingPatchInfo', `Frame-Patch bei (${fixed(point.x, 1)}, ${fixed(point.y, 1)}) | gelb: ${patchSize} x ${patchSize} px`);
-}
-
-function selectTrackingPatch(point) {
-  selectedTrackingPatch = point;
-  renderTrackingPreview(); renderTrackingPatchDetail();
-  element('trackingPatchDialog').showModal();
 }
 
 async function showTrackedFrame(entry) {
@@ -1547,11 +1420,9 @@ async function showTrackedFrame(entry) {
   const request = ++trackingPreviewRequest;
   trackingPreviewBusy = true; updateTrackingControls();
   try {
-    const decoded = await readTrackingFrame(entry.frame, { rectified: entry.mode === 'window' });
+    const decoded = await readTrackingFrame(entry.frame, { rectified: true });
     if (request !== trackingPreviewRequest) { decoded.bitmap.close(); return; }
-    if (entry.mode === 'window') {
-      trackingRectangle = entry.rectangle; drawTrackingFrame(decoded.bitmap); decoded.bitmap.close();
-    } else { drawTrackingFrame(decoded.bitmap); decoded.bitmap.close(); drawTrackingPatches(entry.patchPoints ?? []); }
+    trackingRectangle = entry.rectangle ?? trackingRectangle; drawTrackingFrame(decoded.bitmap); decoded.bitmap.close();
     renderTrackingResults(entry);
   } finally { trackingPreviewBusy = false; updateTrackingControls(); }
 }
@@ -1601,13 +1472,6 @@ function installTrackingPreviewInteraction() {
       trackingPaused = false;
       text('trackingWindowInfo', trackingRectangle ? `${trackingRectangle.width} x ${trackingRectangle.height} px | (${trackingRectangle.x}, ${trackingRectangle.y})` : 'Fenster mindestens 32 x 32 px');
       updateTrackingControls(); renderTrackingPreview();
-    } else if (drag && !drag.moved) {
-      const sourcePoint = pointAt(event);
-      if (sourcePoint && trackingPreviewPoints.length) {
-        const closest = trackingPreviewPoints.reduce((nearest, point) =>
-          Math.hypot(point.x - sourcePoint.x, point.y - sourcePoint.y) < Math.hypot(nearest.x - sourcePoint.x, nearest.y - sourcePoint.y) ? point : nearest);
-        if (Math.hypot(closest.x - sourcePoint.x, closest.y - sourcePoint.y) <= 14 / trackingPreviewTransform.scale) selectTrackingPatch(closest);
-      }
     }
     drag = null;
   });
@@ -1620,22 +1484,81 @@ function installTrackingPreviewInteraction() {
 }
 
 async function previewTrackingStartFrame() {
-  if (!videoInfo || trackingRunning || trackingPreviewBusy || taskBusy || (windowTracking() && !calibration)) return;
+  if (!videoInfo || !calibration || trackingRunning || trackingPreviewBusy || taskBusy) return;
   const index = Math.max(0, Math.min(videoInfo.frameCount - 1, Math.round(number('trackingStart', 0))));
   const request = ++trackingPreviewRequest;
   trackingPreviewBusy = true; updateTrackingControls();
   text('trackingPreviewState', `Lade Frame ${index}...`);
   try {
-    const decoded = await readTrackingFrame(index, { rectified: windowTracking() });
+    const decoded = await readTrackingFrame(index, { rectified: true });
     if (request !== trackingPreviewRequest || trackingRunning) { decoded.bitmap.close(); return; }
-    if (windowTracking()) {
-      drawTrackingFrame(decoded.bitmap); decoded.bitmap.close();
-    } else { drawTrackingFrame(decoded.bitmap); decoded.bitmap.close(); }
+    drawTrackingFrame(decoded.bitmap); decoded.bitmap.close();
     text('trackingFrameState', `Vorschau Frame ${index} / PTS ${(decoded.timestamp / 1e6).toFixed(6)} s`);
-    text('trackingPreviewState', windowTracking() ? 'Entzerrter Startframe' : 'Startframe-Vorschau');
+    text('trackingPreviewState', 'Entzerrter Startframe');
   } catch (error) {
     if (request === trackingPreviewRequest) text('trackingPreviewState', `Vorschau fehlgeschlagen: ${error.message}`);
   } finally { trackingPreviewBusy = false; updateTrackingControls(); }
+}
+
+async function renderTrackingMosaic() {
+    if (trackingMosaicBusy || !videoInfo || !calibration?.maps || !trackingPath.some(entry => entry.pose)) return;
+    trackingMosaicBusy = true;
+    const request = trackingMosaicRequest;
+    const geometries = trackingPath.map(trackingGeometry).filter(Boolean);
+    const bounds = mergeBounds(geometries);
+    const selected = sparsePathFrames(geometries, 96);
+    try {
+      if (!bounds || !selected.length) return;
+      const scale = Math.min(1, 640 / Math.max(bounds.width, bounds.height));
+      const composite = document.createElement('canvas');
+      composite.width = Math.max(1, Math.ceil(bounds.width * scale));
+      composite.height = Math.max(1, Math.ceil(bounds.height * scale));
+      const context = composite.getContext('2d');
+      const local = document.createElement('canvas');
+      for (const geometry of selected) {
+        const decoded = await readTrackingFrame(geometry.entry.frame, { rectified: true });
+        try {
+          const localScale = Math.min(1, scale);
+          local.width = Math.max(1, Math.ceil(geometry.width * localScale));
+          local.height = Math.max(1, Math.ceil(geometry.height * localScale));
+          const localContext = local.getContext('2d', { willReadFrequently: true });
+          localContext.clearRect(0, 0, local.width, local.height);
+          localContext.drawImage(decoded.bitmap, 0, 0, local.width, local.height);
+          const image = localContext.getImageData(0, 0, local.width, local.height);
+          for (let y = 0; y < local.height; y++) for (let x = 0; x < local.width; x++) {
+            const sourceX = (x + 0.5) / localScale;
+            const sourceY = (y + 0.5) / localScale;
+            const alpha = (y * local.width + x) * 4 + 3;
+            const weight = trackingPixelAllowed(sourceX, sourceY) ?
+              edgeFeatherWeight(sourceX, sourceY, geometry.width, geometry.height, 0.1) : 0;
+            image.data[alpha] = Math.round(image.data[alpha] * weight);
+          }
+          localContext.putImageData(image, 0, 0);
+          const origin = geometry.world(0, 0);
+          const factor = scale / localScale;
+          context.setTransform(factor * geometry.c, factor * geometry.s, -factor * geometry.s, factor * geometry.c,
+            scale * (origin.x - bounds.minX), scale * (origin.y - bounds.minY));
+          context.drawImage(local, 0, 0);
+        } finally { decoded.bitmap.close(); }
+      }
+      if (!trackingPath.length) return;
+      trackingMosaicImage = composite; trackingMosaicBounds = bounds;
+      drawTrackingPath();
+    } catch (error) {
+      if (request === trackingMosaicRequest) console.warn('Tracking-Mosaik:', error.message);
+    } finally {
+      trackingMosaicBusy = false;
+      if (request !== trackingMosaicRequest && trackingPath.length) {
+        clearTimeout(trackingMosaicTimer);
+        trackingMosaicTimer = setTimeout(() => void renderTrackingMosaic(), 100);
+      }
+    }
+}
+
+function scheduleTrackingMosaic() {
+  trackingMosaicRequest++;
+  clearTimeout(trackingMosaicTimer);
+  trackingMosaicTimer = setTimeout(() => void renderTrackingMosaic(), 250);
 }
 
 function drawTrackingPath() {
@@ -1659,6 +1582,14 @@ function drawTrackingPath() {
   pathProject = project;
   pathProject.invert = point => ({ x: minimumX + (point.x - padding) / scale,
     y: minimumY + (height - padding - point.y) / scale });
+  if (trackingMosaicImage.width && trackingMosaicBounds) {
+    const topLeft = project({ x: trackingMosaicBounds.minX, y: trackingMosaicBounds.maxY });
+    const bottomRight = project({ x: trackingMosaicBounds.maxX, y: trackingMosaicBounds.minY });
+    context.save(); context.globalAlpha = 0.82;
+    context.translate(topLeft.x, bottomRight.y); context.scale(1, -1);
+    context.drawImage(trackingMosaicImage, 0, 0, bottomRight.x - topLeft.x, bottomRight.y - topLeft.y);
+    context.restore();
+  }
   const selected = pathHover ?? pathSelection;
   const supporting = selected ? geometries.filter(geometry => geometry.supports(selected, trackingPixelAllowed)) : [];
   for (const geometry of supporting) {
@@ -1891,123 +1822,15 @@ function drawBrightnessCalibration() {
   const frameRange = Number.isSafeInteger(metrics.firstFrame) && Number.isSafeInteger(metrics.lastFrame) ?
     `${metrics.frames} Frames #${metrics.firstFrame} bis #${metrics.lastFrame} | ` : '';
   text('brightnessMetrics', `${metrics.accelerator ?? 'CPU'} | ` + frameRange + `${metrics.trainingFrames} Training / ${metrics.validationFrames} Validierung | ` +
-    `${metrics.framePairs ?? '-'} Bildpaare / ${metrics.equations} Ueberlappungen | Validierung ${fixed(metrics.baselineValidationRms, 3)} -> ${fixed(metrics.validationRms, 3)} log | ` +
+    `${metrics.equations} weisse Bloecke | Validierung ${fixed(metrics.baselineValidationRms, 3)} -> ${fixed(metrics.validationRms, 3)} log | ` +
     `${(metrics.covered * 100).toFixed(0)}% gestuetzt` +
-    (brightnessCalibration.model?.completion === 'regularized-cubic-b-spline' ? ' | Rest kubisch ergaenzt' : ''));
-}
-
-function brightnessGeometryDescriptor(geometry) {
-  return { c: geometry.c, s: geometry.s, origin: geometry.world(0, 0) };
+    (brightnessCalibration.model?.completion ? ' | Rest geglaettet ergaenzt' : ''));
 }
 
 async function discardBrightnessSession() {
-  if (brightnessSession?.backend === 'pixel') await computer.call('brightness-pixel-discard');
   brightnessSession = null;
   brightnessRunning = false;
   brightnessPaused = false;
-}
-
-async function startBrightnessBackend(session) {
-  const backend = await computer.call('brightness-pixel-start', { options: { width: session.width, height: session.height,
-    passes: session.passes, maxGain: session.maxGain, useWebGpu: session.useWebGpu } });
-  session.accelerator = backend?.accelerator || 'CPU';
-  session.fallbackReason ||= backend?.fallbackReason || '';
-}
-
-function addBrightnessFrames(session, selected) {
-  const additions = [];
-  for (const entry of selected) if (!session.geometries.has(entry.frame)) {
-    const geometry = frameGeometry(entry, calibration.field, calibration.maps);
-    session.geometries.set(entry.frame, geometry);
-    additions.push(entry.frame);
-  }
-  if (!session.validationFrames.size) {
-    const geometries = [...session.geometries.values()].sort((first, second) => first.entry.frame - second.entry.frame);
-    const initial = planPixelBrightnessPairs(geometries, trackingPixelAllowed);
-    for (const index of initial.heldOut) session.validationFrames.add(geometries[index].entry.frame);
-  } else {
-    for (const frame of additions) if (frame % 5 === 4) session.validationFrames.add(frame);
-  }
-  return additions.length;
-}
-
-async function processBrightnessPair(session, geometries, pair, pass, validation = false) {
-  const current = geometries[pair.current], reference = geometries[pair.reference];
-  const currentFrame = current.entry.frame, referenceFrame = reference.entry.frame;
-  const invoke = async (type, data, transfer) => {
-    const started = performance.now();
-    try { return await computer.call(type, data, transfer); }
-    finally { session.timings.workerMs += performance.now() - started; }
-  };
-  const missing = await invoke('brightness-pixel-prepare', { indices: [currentFrame, referenceFrame] });
-  for (const frame of missing) {
-    const geometry = session.geometries.get(frame);
-    let started = performance.now();
-    const image = await readTrackingFrame(frame, { gpu: false, rectified: true, output: 'rgba', brightness: false });
-    session.timings.readMs += performance.now() - started;
-    if (image.width !== session.width || image.height !== session.height) throw new Error('Abweichende entzerrte Bildgroesse.');
-    started = performance.now();
-    const gray = pixelBrightnessSample(image, trackingPixelAllowed);
-    session.timings.sampleMs += performance.now() - started;
-    await invoke('brightness-pixel-frame', { index: frame, gray }, [gray.buffer]);
-    if (!geometry) throw new Error(`Keine Geometrie fuer Frame #${frame}.`);
-  }
-  return invoke('brightness-pixel-pair', { current: currentFrame, reference: referenceFrame,
-    currentGeometry: brightnessGeometryDescriptor(current), referenceGeometry: brightnessGeometryDescriptor(reference), pass, validation });
-}
-
-async function continueBrightnessSession(session) {
-  const geometries = [...session.geometries.values()].sort((first, second) => first.entry.frame - second.entry.frame);
-  const heldOut = new Set(geometries.map((geometry, index) => session.validationFrames.has(geometry.entry.frame) ? index : -1).filter(index => index >= 0));
-  const plan = planPixelBrightnessPairs(geometries, trackingPixelAllowed, 6, heldOut);
-  const training = plan.pairs.filter(pair => !pair.validation), validation = plan.pairs.filter(pair => pair.validation);
-  if (!training.length || !validation.length) throw new Error('Keine ausreichenden Tracking-Ueberlappungen fuer Training und Validierung.');
-  const pending = [];
-  for (let pass = 0; pass < session.passes; pass++) {
-    const pairs = pass % 2 ? [...training].reverse() : training;
-    for (const pair of pairs) {
-      const current = geometries[pair.current].entry.frame, reference = geometries[pair.reference].entry.frame;
-      const key = `${pass}:${current}:${reference}`;
-      if (!session.processed.has(key)) pending.push({ pair, pass, key });
-    }
-  }
-  let completed = 0;
-  for (let pass = 0; pass < session.passes; pass++) {
-    const work = pending.filter(item => item.pass === pass);
-    let changed = false, paused = false;
-    try {
-      for (const item of work) {
-        const current = geometries[item.pair.current].entry.frame, reference = geometries[item.pair.reference].entry.frame;
-        text('brightnessStatus', `${session.accelerator} | Pixel-Ausgleich ${pass + 1}/${session.passes} | Paar #${current} / #${reference}`);
-        operationProgress('Pixel-Helligkeitsausgleich', pending.length ? completed / pending.length : 1, 'brightness-pixel');
-        await processBrightnessPair(session, geometries, item.pair, pass);
-        session.processed.add(item.key);
-        completed++;
-        changed = true;
-        if (!brightnessRunning) { paused = true; break; }
-      }
-    } finally {
-      if (changed) await computer.call('brightness-pixel-normalize');
-    }
-    if (paused) {
-      text('brightnessStatus', `Pausiert | ${session.geometries.size} Frames gespeichert | ${session.processed.size} Paar-Durchlaeufe verarbeitet.`);
-      return null;
-    }
-  }
-  await computer.call('brightness-pixel-validation-reset');
-  for (let index = 0; index < validation.length; index++) {
-    const pair = validation[index], current = geometries[pair.current].entry.frame, reference = geometries[pair.reference].entry.frame;
-    text('brightnessStatus', `${session.accelerator} | Pixel-Validierung | Paar #${current} / #${reference}`);
-    operationProgress('Pixel-Helligkeitsvalidierung', validation.length ? index / validation.length : 1, 'brightness-pixel');
-    await processBrightnessPair(session, geometries, pair, session.passes, true);
-  }
-  const frames = geometries.map(geometry => geometry.entry.frame);
-  const result = await computer.call('brightness-pixel-snapshot', { metrics: { frames: frames.length,
-    fallbackReason: session.fallbackReason, firstFrame: Math.min(...frames), lastFrame: Math.max(...frames),
-    trainingFrames: plan.trainingFrames, validationFrames: plan.validationFrames } });
-  result.metrics.timings = { ...session.timings, totalMs: session.timings.totalMs + performance.now() - session.runStarted };
-  operationProgress('Pixelweise Helligkeitskarte berechnet', 1, 'brightness-pixel');
-  return result;
 }
 
 async function fitBrightnessCalibration(restart = false) {
@@ -2086,6 +1909,7 @@ async function fitBrightnessCalibration(restart = false) {
     const workerCalibration = { ...result, gain: result.gain.slice(), supported: result.supported.slice() };
     await computer.call('brightness-set', { calibration: workerCalibration }, [workerCalibration.gain.buffer, workerCalibration.supported.buffer]);
     await frameReader.dispose(); trackingComputer.nativeMaps = null;
+    scheduleTrackingMosaic();
     text('brightnessStatus', `Weisses Checkerboard-Papier: ${result.metrics.acceptedCells.toLocaleString('de-DE')} Zellen / ` +
       `${result.metrics.acceptedBlocks.toLocaleString('de-DE')} Bloecke | ${sampledFrames.length} Frames | ` +
       `Validierung ${fixed(result.metrics.baselineValidationRms, 3)} -> ${fixed(result.metrics.validationRms, 3)} log | ` +
@@ -2110,6 +1934,7 @@ async function disableBrightnessCalibration() {
   brightnessCalibration = null;
   await computer.call('brightness-set', { calibration: null });
   await frameReader.dispose(); trackingComputer.nativeMaps = null;
+  scheduleTrackingMosaic();
   text('brightnessStatus', 'Helligkeitskorrektur deaktiviert.');
   text('brightnessState', 'Kein Feld'); element('brightnessState').className = 'tag';
   text('brightnessMetrics', 'Keine Messung'); drawBrightnessCalibration(); updateControls();
@@ -2144,6 +1969,7 @@ async function loadBrightnessCalibration(file) {
   const workerCalibration = { ...brightnessCalibration, gain: brightnessCalibration.gain.slice(), supported: brightnessCalibration.supported.slice() };
   await computer.call('brightness-set', { calibration: workerCalibration }, [workerCalibration.gain.buffer, workerCalibration.supported.buffer]);
   await frameReader.dispose(); trackingComputer.nativeMaps = null; drawBrightnessCalibration();
+  scheduleTrackingMosaic();
   text('brightnessStatus', 'Geladenes Helligkeitsfeld ist aktiv.'); updateControls();
 }
 
@@ -2358,6 +2184,7 @@ function applyTrackingPathRefit() {
   pathRefitProposal = null; clearPathOverlay();
   text('trackingPathRefitInfo', `Refit uebernommen | RMS ${fixed(summary.beforeRms, 2)} -> ${fixed(summary.afterRms, 2)} px.`);
   updatePathRefitControls(); renderTrackingResults(trackingPath.at(-1));
+  scheduleTrackingMosaic();
   if (pathSelection) void loadPathOverlay(pathSelection);
 }
 
@@ -2632,6 +2459,7 @@ function installTrackingMaskInteraction() {
     painting = false;
     trackingMaskHasSelection = trackingImageMask?.data.includes(MASK_SEARCH) ?? false;
     updateTrackingMaskInfo();
+    scheduleTrackingMosaic();
     if (pathSelection) void loadPathOverlay(pathSelection);
   };
   canvas.addEventListener('pointerup', finish);
@@ -2652,6 +2480,7 @@ function installTrackingMaskInteraction() {
     trackingMaskHasSelection = false;
     updateTrackingMaskInfo();
     renderTrackingMask(); drawTrackingPath();
+    scheduleTrackingMosaic();
     if (pathSelection) void loadPathOverlay(pathSelection);
   };
   new ResizeObserver(renderTrackingMask).observe(canvas.parentElement);
@@ -2709,38 +2538,31 @@ function renderTrackingResults(entry) {
 }
 
 function trackingOptions() {
-  const patchSize = number('trackingPatchSize', 64);
   const patchSearchRadius = number('trackingSearchRadius', 32);
-  const threshold = number('trackingThreshold', 16);
   const windowSize = number('trackingWindow', 1);
-  const maximumSearchRadius = windowTracking() ? 1024 : 128;
-  if (!Number.isFinite(patchSearchRadius) || patchSearchRadius < 4 || patchSearchRadius > maximumSearchRadius) {
-    throw new Error(`Suchradius muss zwischen 4 und ${maximumSearchRadius} px liegen.`);
+  if (!Number.isFinite(patchSearchRadius) || patchSearchRadius < 4 || patchSearchRadius > 1024) {
+    throw new Error('Suchradius muss zwischen 4 und 1024 px liegen.');
   }
   if (!(windowSize >= 1 && windowSize <= 240)) throw new Error('Stabilisierungsfenster muss zwischen 1 und 240 Frames liegen.');
-  if (!windowTracking() && !(patchSize >= 16 && patchSize <= 256 && Number.isFinite(threshold) && threshold > 0)) {
-    throw new Error('Patchgroesse muss zwischen 16 und 256 px liegen; Mindestkontrast muss positiv und endlich sein.');
-  }
   const maxRotation = number('trackingMaxRotation', 5);
   const contextRecent = number('trackingContextRecent', 2); const contextSpatial = number('trackingContextSpatial', 2);
   const contextRadius = number('trackingContextRadius', 32); const contextAngle = number('trackingContextAngle', 1);
   const contextCycleStrict = number('trackingContextCycleStrict', 1.5);
   const contextCycleConditional = number('trackingContextCycleConditional', 7.5);
-  if (windowTracking() && (![contextRecent, contextSpatial].every(value => Number.isInteger(value) && value >= 0 && value <= 8) ||
+  if (![contextRecent, contextSpatial].every(value => Number.isInteger(value) && value >= 0 && value <= 8) ||
     !Number.isFinite(contextRadius) || contextRadius < 4 || contextRadius > 256 || !Number.isFinite(contextAngle) || contextAngle < 0.1 || contextAngle > 5 ||
     !Number.isFinite(contextCycleStrict) || contextCycleStrict <= 0 || !Number.isFinite(contextCycleConditional) ||
-    contextCycleConditional < contextCycleStrict || contextCycleConditional > 50)) {
+    contextCycleConditional < contextCycleStrict || contextCycleConditional > 50) {
     throw new Error('Umfeld: n/m 0 bis 8, Radius 4 bis 256 px, Winkel 0.1 bis 5 Grad; Zyklusgrenzen positiv, aufsteigend und maximal 50 px.');
   }
-  if (windowTracking() && (!trackingRectangle || !Number.isFinite(maxRotation) || maxRotation < 1 || maxRotation > 10)) throw new Error('Fenster auswaehlen und Rotationsgrenze zwischen 1 und 10 Grad setzen.');
+  if (!trackingRectangle || !Number.isFinite(maxRotation) || maxRotation < 1 || maxRotation > 10) throw new Error('Fenster auswaehlen und Rotationsgrenze zwischen 1 und 10 Grad setzen.');
   const sourceImageMask = trackingMaskHasSelection && trackingImageMask ?
     { ...trackingImageMask, coordinateSystem: 'oriented source pixels', data: Array.from(trackingImageMask.data) } : null;
-  const imageMask = windowTracking() && sourceImageMask ? remapInclusionMask(trackingImageMask, calibration?.maps) : null;
-  return { mode: element('trackingMode').value, rectangle: trackingRectangle ? { ...trackingRectangle } : null, maxRotation,
+  const imageMask = sourceImageMask ? remapInclusionMask(trackingImageMask, calibration?.maps) : null;
+  return { mode: 'window', rectangle: { ...trackingRectangle }, maxRotation,
     contextRecent, contextSpatial, contextRadius, contextAngle, contextCycleStrict, contextCycleConditional,
     sourceImageMask, imageMask: imageMask ? { ...imageMask, data: Array.from(imageMask.data) } : null,
-    patchMask: !windowTracking() ? sourceImageMask : null,
-    pattern: 'patches', patchSize, patchSearchRadius, threshold, rediscoverPatches: true,
+    patchSearchRadius,
     useWebGpu: useWebGpu() };
 }
 
@@ -2751,11 +2573,9 @@ async function runTracking(restart = false) {
   const end = Math.max(start, Math.min(videoInfo.frameCount - 1, Math.round(number('trackingEnd', videoInfo.frameCount - 1))));
   if (trackingPreviewBusy) return;
   let options = !restart && trackingRunOptions ? trackingRunOptions : trackingOptions();
-  if (!restart && trackingRunOptions?.mode === 'window') {
+  if (!restart && trackingRunOptions) {
     const changed = trackingOptions();
-    options = { ...trackingRunOptions, patchSearchRadius: changed.patchSearchRadius, maxRotation: changed.maxRotation,
-      contextRadius: changed.contextRadius, contextAngle: changed.contextAngle,
-      contextCycleStrict: changed.contextCycleStrict, contextCycleConditional: changed.contextCycleConditional };
+    options = { ...trackingRunOptions, ...changed, mode: 'window' };
     trackingRunOptions = options;
   }
   message();
@@ -2763,6 +2583,8 @@ async function runTracking(restart = false) {
     await discardBrightnessSession();
     clearTrackingResults(true); trackingNextIndex = start;
     trackingRunOptions = options;
+  }
+  if (restart || !trackingProfile) {
     trackingProfile = { mode: options.mode, frames: 0, decodeMs: 0, sharpnessMs: 0, rgbaMs: 0, remapMs: 0, referenceMs: 0, workerTransferMs: 0, trackMs: 0, poseMs: 0,
       renderMs: 0, totalMs: 0, lastTotalMs: 0, accelerators: new Set(), tracker: { accelerator: 'CPU',
         grayscaleMs: 0, contextMs: 0, uploadMs: 0, forwardMs: 0, backwardMs: 0, postprocessMs: 0, sampleMs: 0, matchMs: 0, refinementMs: 0 } };
@@ -2770,7 +2592,7 @@ async function runTracking(restart = false) {
   trackingInspector.clear();
   video.pause(); trackingRunning = true; trackingPaused = false; updateControls();
   try {
-    const nativeTracking = options.mode === 'window' && options.useWebGpu && (options.contextRecent > 0 || options.contextSpatial > 0);
+    const nativeTracking = options.useWebGpu && (options.contextRecent > 0 || options.contextSpatial > 0);
     if (nativeTracking && trackingComputer.nativeMaps !== calibration.maps) {
       const { outputWidth, outputHeight, inverseX, inverseY, valid } = calibration.maps;
       await trackingComputer.call('tracking-maps', { maps: { outputWidth, outputHeight, inverseX, inverseY, valid,
@@ -2778,13 +2600,25 @@ async function runTracking(restart = false) {
           gain: brightnessCalibration.gain } : null } });
       trackingComputer.nativeMaps = calibration.maps;
     }
+    if (!restart && trackingNeedsSeed) {
+      const reference = [...trackingPath].reverse().find(entry => entry.pose && entry.frame < trackingNextIndex);
+      if (!reference) throw new Error('Legacy-Pfad enthaelt keine letzte gueltige Pose zum Fortsetzen.');
+      text('processingStatus', `Letzten Trackingframe #${reference.frame} als Referenz laden`);
+      const seeded = await readTrackingFrame(reference.frame, { gpu: options.useWebGpu, rectified: true, output: 'rgba' });
+      await trackingComputer.call('track-window-seed', { image: seeded, index: reference.frame,
+        rectangle: options.rectangle, searchRadius: options.patchSearchRadius, maxRotation: options.maxRotation,
+        pose: reference.pose }, [seeded.data.buffer]);
+      trackingNextIndex = reference.frame + 1;
+      trackingNeedsSeed = false;
+      trackingLost = false;
+    }
     while (trackingRunning && trackingNextIndex <= end) {
       const frameStarted = performance.now();
       const index = trackingNextIndex;
       text('processingStatus', `Tracking Frame ${index}/${end}`);
       element('progress').value = (index - start + 1) / (end - start + 1);
       const image = await readTrackingFrame(index, { gpu: options.useWebGpu,
-        rectified: !nativeTracking && options.mode === 'window', output: nativeTracking ? 'native' : 'rgba' });
+        rectified: !nativeTracking, output: nativeTracking ? 'native' : 'rgba' });
       const { decodeMs, sharpnessMs, rgbaMs, remapMs } = image.frameTiming;
       const renderStarted = performance.now();
       if (!nativeTracking) {
@@ -2804,7 +2638,7 @@ async function runTracking(restart = false) {
           trackingPreviewImage.getContext('2d').drawImage(detection.preview, 0, 0);
         } finally { detection.preview?.close(); delete detection.preview; }
         nativeRenderMs = performance.now() - previewStarted; renderMs += nativeRenderMs;
-      } else detection = await trackingComputer.call(options.mode === 'window' ? 'track-window' : 'detect', { image, index, options }, [image.data.buffer]);
+      } else detection = await trackingComputer.call('track-window', { image, index, options }, [image.data.buffer]);
       let referenceMs = 0;
       if (detection.contextPending) {
         for (const referenceIndex of detection.references) {
@@ -2829,15 +2663,14 @@ async function runTracking(restart = false) {
       }
       const workerRoundtripMs = performance.now() - workerStarted - referenceMs - nativeRenderMs;
       const poseStarted = performance.now();
-      const raw = options.mode === 'window' ? detection.raw ?? null : detection.success && detection.points.length >= 3 ? fitCameraPose(detection.points, calibration.field) : null;
+      const raw = detection.raw ?? null;
       const entry = { frame: index, timestamp: videoInfo.timestamps[index], sharpness: image.sharpness, raw, pose: null,
-        mode: options.mode, rectangle: options.rectangle, score: detection.score, iterations: detection.iterations, resolution: detection.resolution,
+        mode: 'window', rectangle: options.rectangle, score: detection.score, iterations: detection.iterations, resolution: detection.resolution,
         incremental: detection.incremental, incrementalMatch: detection.incrementalMatch, context: detection.context,
-        points: options.mode === 'window' ? (detection.success ? 1 : 0) : detection.points.length, patchPoints: detection.points,
-        rediscovered: detection.rediscovered || 0,
-        success: detection.success && Boolean(raw), reason: detection.reason || (raw ? '' : 'Zu wenige gueltige Patch-Paare im Kalibrierbereich.'),
+        points: detection.success ? 1 : 0,
+        success: detection.success && Boolean(raw), reason: detection.reason || (raw ? '' : 'Fensterregistrierung lieferte keine Pose.'),
         accelerator: detection.accelerator || 'CPU' };
-      if (options.mode === 'window' && !detection.success) {
+      if (!detection.success) {
         trackingFailures.push(entry);
         renderTrackingResults(entry); trackingInspector.show(entry);
         trackingPaused = true;
@@ -2849,7 +2682,8 @@ async function runTracking(restart = false) {
       entry.pose = stabilizePose(trackingPath, number('trackingWindow', 1));
       const poseMs = performance.now() - poseStarted;
       const overlayStarted = performance.now();
-      drawTrackingPatches(detection.points); renderTrackingResults(entry);
+      renderTrackingPreview(); renderTrackingResults(entry);
+      scheduleTrackingMosaic();
       renderMs += performance.now() - overlayStarted;
       const workerMs = detection.timing?.totalMs ?? workerRoundtripMs;
       const profile = trackingProfile;
@@ -2875,7 +2709,7 @@ async function runTracking(restart = false) {
       await new Promise(resolve => setTimeout(resolve, 0));
     }
   } catch (error) {
-    if (options.mode === 'window') trackingLost = true;
+    trackingLost = !trackingNeedsSeed;
     throw error;
   } finally {
     const completed = trackingNextIndex > end;
@@ -2915,25 +2749,13 @@ function inspect(event, canvas) {
 
 function installPan(canvas) {
   let drag = null;
-  const painting = () => canvas === rawCanvas && element('pattern').value === 'patches' && maskTool !== 'pan';
-  const paint = event => {
-    const point = canvasPoint(event, canvas);
-    if (!point) return;
-    ensurePatchMask(rawImage.width, rawImage.height);
-    const value = maskTool === 'search' ? MASK_SEARCH : maskTool === 'forbidden' ? MASK_FORBIDDEN : MASK_NEUTRAL;
-    paintPatchMask(patchMask, point.x, point.y, number('maskBrushSize', 48) / 2, value);
-    maskImageRevision = -1;
-    draw();
-  };
   canvas.addEventListener('pointerdown', event => {
-    drag = { x: event.clientX, y: event.clientY, pan: { ...pan }, moved: false, painting: painting() };
+    drag = { x: event.clientX, y: event.clientY, pan: { ...pan }, moved: false };
     canvas.setPointerCapture(event.pointerId);
-    if (drag.painting) paint(event);
   });
   canvas.addEventListener('pointermove', event => {
     inspect(event, canvas);
     if (!drag) return;
-    if (drag.painting) { paint(event); return; }
     const deltaX = event.clientX - drag.x;
     const deltaY = event.clientY - drag.y;
     if (Math.hypot(deltaX, deltaY) > 4) drag.moved = true;
@@ -2944,11 +2766,6 @@ function installPan(canvas) {
     }
   });
   canvas.addEventListener('pointerup', event => {
-    if (drag?.painting) {
-      commitMaskEdit();
-      drag = null;
-      return;
-    }
     if (drag && !drag.moved && canvas === resultCanvas && view === 'rectified' && rectifiedReady) {
       const point = canvasPoint(event, canvas);
       if (point && calibration.maps.valid[Math.floor(point.y) * calibration.maps.outputWidth + Math.floor(point.x)]) {
@@ -2964,7 +2781,7 @@ function installPan(canvas) {
     }
     drag = null;
   });
-  canvas.addEventListener('pointercancel', () => { if (drag?.painting) commitMaskEdit(); drag = null; });
+  canvas.addEventListener('pointercancel', () => { drag = null; });
   canvas.addEventListener('wheel', event => { event.preventDefault(); zoom = Math.max(0.5, Math.min(20, zoom * Math.exp(-event.deltaY * 0.001))); draw(); }, { passive: false });
 }
 
@@ -2996,7 +2813,6 @@ async function resetCalibration() {
   observationDiagnostics = null; observationDiagnosticsDirty = true; geometrySelection = null;
   detections.clear(); currentDetection = null; phaseChecked = false; phaseStarted = false; stale = false; detectionsStale = false;
   detectedOnce = false; acceptedSinceFit = 0; nextProcessingIndex = 0; measurements = []; rectifiedReady = false;
-  patchMask = null; maskImageRevision = -1;
   text('measurement', 'Abstand -'); text('detectionStatus', 'Noch nicht geprueft.'); text('qualityDetails', 'Noch keine Kalibrierung.');
   renderExportProfile(null); renderPatchProfile(null); renderFitProfile(null);
   updateMetrics(); updateTable(); updateControls(); draw();
@@ -3081,13 +2897,6 @@ element('playButton').onclick = async () => {
 element('speed').onchange = () => { video.playbackRate = Number(element('speed').value); saveVideoOptions(); };
 element('overlay').onchange = () => { saveVideoOptions(); draw(); };
 element('trackingStart').onchange = () => { void previewTrackingStartFrame(); void loadTrackingMaskPreview(); };
-element('trackingMode').onchange = () => {
-  clearTrackingResults();
-  element('trackingWindowControls').hidden = !windowTracking();
-  for (const id of ['trackingPatchSize', 'trackingThreshold']) element(id).closest('label').hidden = windowTracking();
-  void previewTrackingStartFrame();
-  void loadTrackingMaskPreview();
-};
 element('previewBrightness').closest('details').addEventListener('toggle', event => {
   if (event.currentTarget.open) void loadTrackingMaskPreview();
 });
@@ -3112,7 +2921,6 @@ function updatePreviewAdjustments(save = true) {
   renderTrackingPreview();
   renderPathOverlay();
   renderTrackingMask();
-  if (element('trackingPatchDialog').open) renderTrackingPatchDetail();
   if (!trackingPreviewImage.width && videoInfo && !taskBusy && !continuous && !rectifiedPlayback && !trackingRunning) {
     void previewTrackingStartFrame();
   }
@@ -3129,28 +2937,12 @@ element('resetPreviewAdjustments').onclick = () => {
   element('previewGamma').value = 1;
   updatePreviewAdjustments();
 };
-for (const button of document.querySelectorAll('[data-mask-tool]')) button.onclick = () => {
-  maskTool = button.dataset.maskTool;
-  for (const tool of document.querySelectorAll('[data-mask-tool]')) tool.setAttribute('aria-pressed', String(tool === button));
-  rawCanvas.style.cursor = maskTool === 'pan' ? 'grab' : 'crosshair';
-};
-element('maskBrushSize').oninput = () => text('maskBrushValue', `${element('maskBrushSize').value} px`);
-element('clearPatchMask').onclick = () => {
-  const width = videoInfo?.width ?? calibration?.field.width;
-  const height = videoInfo?.height ?? calibration?.field.height;
-  if (!width || !height) return;
-  ensurePatchMask(width, height).data.fill(MASK_NEUTRAL);
-  patchMask.revision++;
-  maskImageRevision = -1;
-  commitMaskEdit();
-};
 element('zoomIn').onclick = () => { zoom = Math.min(20, zoom * 1.25); draw(); };
 element('zoomOut').onclick = () => { zoom = Math.max(0.5, zoom / 1.25); draw(); };
 element('fitView').onclick = () => { zoom = 1; pan = { x: 0, y: 0 }; draw(); };
 element('trackingZoomIn').onclick = () => { trackingZoom = Math.min(20, trackingZoom * 1.25); renderTrackingPreview(); };
 element('trackingZoomOut').onclick = () => { trackingZoom = Math.max(0.5, trackingZoom / 1.25); renderTrackingPreview(); };
 element('trackingFitView').onclick = () => { trackingZoom = 1; trackingPan = { x: 0, y: 0 }; renderTrackingPreview(); };
-element('closeTrackingPatch').onclick = () => element('trackingPatchDialog').close();
 element('colorRange').oninput = element('hideRigid').onchange = () => { renderFieldImages(); draw(); };
 element('relativeCoverage').onchange = () => { renderCoverageImage(); draw(); };
 element('dataMode').onchange = () => { renderObservationDiagnostics(); draw(); };
@@ -3242,12 +3034,9 @@ for (const button of document.querySelectorAll('[data-view]')) button.onclick = 
   draw();
 };
 
-const detectionParameters = new Set(['pattern', 'patchSize', 'patchSearchRadius', 'approxStep', 'columns', 'rows', 'threshold', 'lineRadius']);
-const nonGeometric = new Set(['follow', 'opticalConfiguration', 'minMotion', 'updateEvery', 'startPercent', 'endPercent', 'maskBrushSize']);
+const detectionParameters = new Set(['approxStep', 'columns', 'rows', 'threshold']);
+const nonGeometric = new Set(['follow', 'opticalConfiguration', 'minMotion', 'updateEvery', 'startPercent', 'endPercent']);
 for (const control of document.querySelectorAll('.settings input, .settings select')) control.addEventListener('change', () => {
-  if (control.id === 'pattern') {
-    updatePatternControls();
-  }
   if (nonGeometric.has(control.id)) return;
   parameterRevision++; stale = Boolean(calibration); observationDiagnosticsDirty = true;
   if (detectionParameters.has(control.id)) { detectionsStale = frames.size > 0; phaseChecked = false; detections.clear(); }
@@ -3265,11 +3054,15 @@ for (const control of document.querySelectorAll('.settings input, .settings sele
 element('exportButton').onclick = () => void task(async () => {
   if (stale && !confirm(`Die aktuellen Eingaben sind noch nicht eingerechnet. Konsistente Feldversion ${calibration.version} mit ihren damaligen Parametern und Beobachtungen speichern?`)) return;
   const tracking = trackingForExport();
+  const brightness = brightnessCalibration ? { ...brightnessCalibration,
+    gain: brightnessCalibration.gain.slice(), supported: brightnessCalibration.supported.slice() } : null;
   const bytes = await computer.call('export', { frames: snapshotFrames, video: expectedVideo, parameters: snapshotParameters,
-    opticalConfiguration: element('opticalConfiguration').value, tracking });
+    opticalConfiguration: element('opticalConfiguration').value, tracking, brightness },
+  brightness ? [brightness.gain.buffer, brightness.supported.buffer] : []);
   const url = URL.createObjectURL(new Blob([bytes], { type: 'application/zip' }));
   const anchor = document.createElement('a'); anchor.href = url; anchor.download = `kalibrierung-v${calibration.version}-${calibration.quality}.zip`; anchor.click();
   setTimeout(() => URL.revokeObjectURL(url), 10000);
+  message(brightnessCalibration ? 'Gesamtkalibrierung inklusive Helligkeitskorrektur gespeichert.' : 'Gesamtkalibrierung ohne Helligkeitskorrektur gespeichert.');
 });
 element('correctedVideoButton').onclick = () => void task(async () => {
   message();
@@ -3361,13 +3154,12 @@ element('calibrationFile').onchange = () => void task(async () => {
   clearTrackingResults();
   restoreTracking(imported.tracking);
   applyParameters(imported.parameters);
-  const invalidMaskPoints = revalidatePatchFrames(imported.observations, patchMask);
   frames = new Map(imported.observations.map(frame => [frame.id, frame]));
   observationDiagnostics = null; observationDiagnosticsDirty = true; geometrySelection = null;
   snapshotFrames = imported.observations; snapshotParameters = imported.parameters; expectedVideo = imported.video;
   element('opticalConfiguration').value = imported.opticalConfiguration || '';
   phaseStarted = true; phaseChecked = [...frames.values()].some(frame => frame.accepted);
-  stale = invalidMaskPoints > 0; detectionsStale = false; rectifiedReady = false; detections.clear(); currentDetection = null;
+  stale = false; detectionsStale = false; rectifiedReady = false; detections.clear(); currentDetection = null;
   nextProcessingIndex = 0; measurements = [];
   if (brightnessCalibration) drawBrightnessCalibration();
   else {
@@ -3375,8 +3167,7 @@ element('calibrationFile').onchange = () => void task(async () => {
     text('brightnessMetrics', 'Keine Messung'); drawBrightnessCalibration();
   }
   renderFieldImages(); updateTable(); updateMetrics(); updateControls(); draw();
-  message(invalidMaskPoints ? `Kalibrierung geladen. ${invalidMaskPoints} gespeicherte Patch-Vektoren beruehrten die rote Maske und wurden verworfen; neu fitten erforderlich.` :
-    videoNameMismatch ? 'Kalibrierung geladen. Der Videodateiname weicht ab; Video und Kalibrierungsdaten bleiben erhalten.' :
+  message(videoNameMismatch ? 'Kalibrierung geladen. Der Videodateiname weicht ab; Video und Kalibrierungsdaten bleiben erhalten.' :
     brightnessCalibration ? 'Kalibrierung geladen. Geometrie und Helligkeitskorrektur sind aktiv.' :
     'Kalibrierung geladen. Feld und Metadaten sind lokal verfuegbar.');
   setTimeout(() => { void loadTrackingMaskPreview(); }, 0);
@@ -3396,6 +3187,5 @@ restoreVideoOptions();
 video.playbackRate = Number(element('speed').value);
 text('trackingMaskBrushValue', `${element('trackingMaskBrush').value} px`);
 updatePreviewAdjustments(false);
-updatePatternControls();
 updateControls(); updateMetrics(); draw();
 setInterval(updateMemoryStats, 2000);

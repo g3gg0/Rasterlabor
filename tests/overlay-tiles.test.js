@@ -37,3 +37,10 @@ test('merge tile selection keeps only locally useful sharp frames', () => {
   const interior = tiles.filter(tile => tile.x === 0 || tile.x === 320);
   assert.deepEqual(interior.map(tile => tile.geometries.map(item => item.entry.frame)), [[0, 1, 2], [4]]);
 });
+
+test('merge tile selection retains narrow coverage crossing a tile boundary', () => {
+  const crossing = { width: 64, corners: [{ x: 0, y: 0 }, { x: 4.4, y: 0 }, { x: 4.4, y: 4 }, { x: 0, y: 4 }],
+    entry: { frame: 1, sharpness: { score: 1 } }, supports: point => point.x >= 0 && point.x < 4.4 };
+  const tiles = overlayTiles(8, 4, 0, 0, [crossing], 4, { maxFrames: 1, edgeFeather: 0.1 });
+  assert.deepEqual(tiles.map(tile => tile.geometries.map(item => item.entry.frame)), [[1], [1]]);
+});

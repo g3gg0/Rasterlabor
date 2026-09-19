@@ -1,7 +1,7 @@
 # Rasterlabor
 
 Lokales Browserwerkzeug zur Mikroskopkalibrierung aus einem bewegten ebenen
-Linienraster oder Schachbrett. Es berechnet ein gemeinsames kubisches
+Checkerboard. Es berechnet ein gemeinsames kubisches
 B-Spline-Entzerrungsfeld und inverse Resampling-Maps. PCB-Stitching ist nicht
 Bestandteil dieser Anwendung.
 
@@ -73,6 +73,94 @@ Window-Tracking registriert das ausgewaehlte entzerrte Fenster gegen den
 unmittelbar vorherigen Frame und akkumuliert X/Y/Rotation. Die experimentelle
 Loop-Korrektur inklusive Archiv und Diagnose ist entfernt.
 
+## Helligkeitskorrektur
+
+Die Arbeitsflaeche `Helligkeitskorrektur` schaetzt ein ortsfestes Feld nach der
+geometrischen Entzerrung. `Von Frame` und `Bis Frame` legen den verwendeten
+Bereich einschliesslich beider Grenzen fest. Ein leeres Endfeld bedeutet bis
+zum letzten akzeptierten Checkerboard-Frame. Aus den gespeicherten
+Kalibrierungsbeobachtungen wird eine zeitlich gleichmaessige Auswahl bis zur
+eingestellten Zahl `Ziel-Frames` gebildet. Mindestens fuenf Frames werden fuer
+Training und Validierung benoetigt.
+`Starten` beginnt eine neue Sitzung. `Pause` stoppt nach dem laufenden
+Frame; bereits extrahierte Blockstatistiken bleiben erhalten. Nach einer
+Aenderung des Framebereichs nimmt `Fortsetzen` weitere Boardpositionen in die
+Sitzung auf. `Zuruecksetzen` verwirft diese Zwischenstaende. Ziel-Frames und
+maximale Verstaerkung sind waehrend einer bestehenden Sitzung gesperrt.
+Die erkannte Checkerboard-Geometrie wird in das entzerrte Bild abgebildet. Pro
+Frame bestimmt der Helligkeitsunterschied der beiden Paritaeten, welche Felder
+weiss sind. Nur um 24 Prozent eingerueckte Innenflaechen dieser weissen
+Papierfelder werden in 8-mal-8-Pixel-Bloecken gemessen. Schwarze Felder,
+Feldkanten, transparente oder gesaettigte Pixel und lokal stark streuende
+Bloecke gehen nicht in den Fit ein. PCB-Inhalt und PCB-Tracking werden nicht
+verwendet. Die Helligkeitsanalyse arbeitet ausschliesslich aus den weissen
+Checkerboard-Papierfeldern; einen PCB- oder allgemeinen Bildueberlappungs-Fit
+gibt es nicht.
+
+Im linearen Farbraum wird abwechselnd ein Belichtungs-Offset je Frame und das
+sensorfeste lokale Log-Helligkeitsfeld geschaetzt. Eine schwache
+Nachbarschaftsregularisierung entfernt Blockrauschen, erhaelt aber lokale weiche
+Ringe und Flecken. Das Feld wird bilinear als Float32-Gain in voller entzerrter
+Aufloesung ausgewertet. Nur Bereiche mit Messungen aus mindestens zwei
+Trainingsframes werden angewendet; ungestuetzte Bereiche behalten Gain 1.
+
+Die globale Option `WebGPU-Beschleunigung` im Kopfmenue ist standardmaessig
+aktiviert und gilt gemeinsam fuer Kalibrierung, Tracking, Vorschau/Overlay und
+Helligkeitsanwendung. Der Helligkeitsfit auf den weissen Messbloecken selbst
+laeuft auf der CPU. Videodekodierung und Entzerrung bestimmten in den bisherigen
+Realtests den groessten Teil der Gesamtlaufzeit.
+
+Komplette Frames bleiben zur Validierung zurueck. Das Feld wird nur aktiviert,
+wenn deren weisse Innenflaechen nach der Korrektur ausreichend konsistenter sind.
+Die Validierung nutzt unabhaengige Frames und die tatsaechlich begrenzten
+Gain-Werte. Geringe Stuetzung allein verhindert die Aktivierung nicht.
+Die glatte Modellflaeche wird innerhalb der Bilddatenmaske ausgewertet. Die
+maximale Verstaerkung gilt weiterhin.
+Die einzige Bildansicht zeigt die
+relative Durchlaessigkeit `V(x)` mit einer robusten automatischen, um 0 Prozent
+symmetrischen Grauskala und unverzerrtem Seitenverhaeltnis. Ungemessene und
+maskierte Bereiche sind transparent. Alte Spline-Feldpakete bleiben lesbar
+und behalten ihr bisheriges Verhalten; neue Berechnungen sind pixelweise.
+
+Die begrenzte Verstarkung wird nach jedem entzerrten Frame auf CPU und WebGPU
+in linearem Licht angewendet, einschliesslich Window-Tracking, Inspektion,
+Ueberlagerung und Export. Das `.rbright`-Paket speichert Float32-Gain,
+Stuetzmaske, Solver-/Validierungsdaten, Normalisierung und Farbraumannahme. Ein
+SHA-256-Fingerprint bindet es an Quell- und Zielgeometrie,
+Entzerrungskoeffizienten, Crop-Origin und Optikbezeichnung; Abweichungen werden
+beim Laden abgelehnt.
+Beim Speichern der geometrischen Kalibrierung wird das aktive Helligkeitsfeld
+zusaetzlich in das ZIP eingebettet und beim Import automatisch aktiviert. Ein
+Paket ohne eingebettetes Feld deaktiviert eine zuvor aktive Korrektur. Der
+separate `.rbright`-Import und -Export bleibt fuer den gezielten Austausch
+zwischen passenden Geometrien erhalten.
+
+Die Methode setzt gleichmaessig weisses Papier und verlaesslich erkannte
+Checkerboard-Zellen voraus. Bewegte Schatten, Reflexe und automatische
+Belichtung sind keine statischen optischen Fehler und koennen das Feld
+verfaelschen. Die Validierung auf zurueckgehaltenen Checkerboard-Frames prueft
+deshalb, ob die weissen Innenflaechen nach der Korrektur konsistenter sind.
+
+## Merge-Grossbild
+
+Die Arbeitsflaeche `Merge` setzt alle gueltigen Tracking-Posen bei nativer
+entzerrter Aufloesung zu einem Bild zusammen. Linsenfeld, Tracking-Maske,
+Randueberblendung und eine aktive Helligkeitskorrektur werden genauso wie in der
+Tracking-Ueberlagerung angewendet. Die Frames laufen deterministisch von
+scharf nach unscharf. Der GPU-Pass nimmt je Ausgabepixel nur die ersten `n` und
+damit schaerfsten gueltigen Beitraege an. Wahlweise werden diese gewichtet
+gemittelt oder in umgekehrter Alpha-Richtung zusammengesetzt; das Ergebnis ist
+dabei identisch zu unscharf nach scharf, ohne alle Frames ein zweites Mal zu
+dekodieren.
+
+Die Ausgabe wird kachelweise auf der GPU berechnet und unmittelbar als
+unkomprimiertes RGBA-BigTIFF geschrieben. Weder ein Canvas noch ein RGBA-Puffer
+in Gesamtbildgroesse wird angelegt; dadurch sind auch Abmessungen oberhalb des
+GPU-Texturlimits und Dateien groesser als 4 GiB moeglich. Nicht belegte
+BigTIFF-Kacheln bleiben sparse. Abbrechen verwirft die unvollstaendige Datei.
+
+Ein inkrementeller Matchverlust wird weiterhin angehalten, nicht verdeckt.
+
 Die Bilddatenmaske im Videooptionen-Dialog wird auf einem orientierten Rohframe
 gemalt und benoetigt deshalb keine geladenen Korrekturdaten. Patch-Tracking nutzt
 sie direkt. Fuer Window-Tracking und Ueberlagerungen wird sie bei vorhandener
@@ -121,14 +209,38 @@ inkrementelle Pose erhalten.
 
 Nach Auswahl eines Punktes im XY-Pfad kann `Pfad nachoptimieren` die vorhandenen
 Frames aus zeitlich getrennten Besuchen dieser Flaeche lokal neu gegeneinander
-registrieren. Mehrere scharfe Vertreter werden kreuzweise vorwaerts und rueckwaerts
-geprueft. Die lokale Suche erweitert ihren Radius iterativ bis zur Bilddiagonale
-und uebernimmt gute Randtreffer als Startpunkt der naechsten Stufe. Nur eine
-konsistente Mehrheit aus mindestens zwei verschiedenen Frames auf beiden Seiten
-erzeugt neue lokale Graphkanten. Fuer diesen bestaetigten lokalen Konsens sind
-Zyklus- und Korrekturabweichungen bis 25 px zulaessig. Zusammen
-mit den vorhandenen inkrementellen und bestaetigten raeumlichen Paarmessungen wird
-die Korrektur danach ueber die gesamte verbundene Bildkomponente verteilt. Eine
+registrieren. Vor der Einzelbildsuche werden die zeitlich zusammenhaengenden Besuche
+getrennt zu lokalen Mischbildern aufgebaut. Auswahl der scharfen Bilder,
+Welttransformation, Pixelmaske, Kantenuebergang und Mittelung entsprechen der
+Mischbildanzeige; der Ausschnitt bleibt auf den gewaehlten lokalen Bereich begrenzt.
+Alle Gruppenpaare werden vorwaerts und rueckwaerts registriert. Bestaetigte
+Gruppenkorrekturen werden vom Besuch des ausgewaehlten Frames durch das verbundene
+Gruppennetz weitergegeben. Sie dienen ausschliesslich als Startlage fuer das
+anschliessende Einzelbild-Refinement und erzeugen selbst keine Loop-Closure-Kante.
+Mehrere scharfe Einzelbilder werden danach kreuzweise vorwaerts und rueckwaerts
+geprueft. Kandidaten brauchen mindestens 128 nutzbare Samples innerhalb der lokalen
+Maske. Die Suche arbeitet adaptiv mit bis zu 64 neuen Paaren pro Runde und insgesamt
+512 Paarversuchen. Ohne bestaetigten Match werden weitere Vertreter nachgezogen;
+Vorwaertstreffer ab NCC 0.9 werden mit benachbarten Frames beider Besuche geprueft.
+Hoechstens die Haelfte einer Runde wird fuer diese Nachbarpruefungen reserviert,
+damit die weitere Suche nicht stehen bleibt. Besuchspaare werden abwechselnd
+bedient, bereits gepruefte Paare nicht wiederholt. Pro Runde werden hoechstens
+32 Vollbilder geladen und danach freigegeben. Alle Rundenergebnisse fliessen in
+den gemeinsamen Konsens ein. Die Suche stoppt bei bestaetigten Graphkanten,
+ausgeschoepften Kandidaten oder erreichtem Suchbudget; der Status unterscheidet
+diese Faelle. Nach bestaetigten Graphkanten wird die Korrektur ueber die verbundene
+Bildkomponente verteilt. Mit den korrigierten Posen werden Kandidaten und Masken
+neu berechnet und weitere lokale Kanten gesucht. Bis zu drei solcher Refit-Iterationen
+werden ausgefuehrt; eine Iteration ohne neue bestaetigte Kante beendet den Vorgang.
+Die lokalen Suchgrenzen bleiben dabei unveraendert, und der gesamte Ablauf bleibt
+bis `Uebernehmen` eine Vorschau. Die lokale Registrierung erweitert ihren Radius iterativ bis zur
+Bilddiagonale und uebernimmt gute Randtreffer als Startpunkt der naechsten Stufe.
+Eine konsistente Mehrheit aus mindestens zwei verschiedenen Frames auf beiden
+Seiten erzeugt neue lokale Graphkanten. Alternativ darf ein einzelnes regulaer
+beidseitig akzeptiertes Paar mit NCC >= 0.98, Marge >= 0.002, mindestens 128 Samples
+je Richtung und Zyklusfehler <= 1.5 px eine Kante bilden. Die Grenzen werden bei
+weiteren Suchrunden nicht gelockert. Fuer Mehrpaar-Konsens liegt die Zyklus- und
+Korrekturgrenze je nach eingestellter bedingter Zyklusgrenze zwischen 25 und 50 px. Eine
 robuste Gewichtung begrenzt widerspruechliche Loop-Kanten. Der rot gestrichelte
 Pfad ist nur eine Vorschau und veraendert die Trackingdaten erst mit `Uebernehmen`;
 `Verwerfen` entfernt ihn. Der Refit optimiert X, Y und Rotation, aber keinen Massstab.
@@ -240,8 +352,9 @@ lassen Restgewicht fuer den naechsten Frame, sodass auch `Top 1` weich mischt.
 Bei Kacheln kann ein ausgewaehlter Frame mehrfach durchlaufen. Die Platzierung
 verwendet dieselbe stabilisierte Pose wie Pfad und Export, nicht die rohe Pose.
 Jeder entzerrte Frame wird an allen vier Bildraendern weich ausgeblendet. Die
-Rampentiefe betraegt 10 Prozent der entzerrten Bildbreite, auch oben und unten,
-und verwendet Smoothstep statt einer linearen Kante. Der Faktor gewichtet Farbe
+Rampentiefe bezieht sich auf die entzerrte Bildbreite und endet spaetestens in
+der Bildmitte, sodass auch bei 50 Prozent ein voll gewichteter Kern verbleibt.
+Sie verwendet Smoothstep statt einer linearen Kante. Der Faktor gewichtet Farbe
 und Alpha vor der Mittelung identisch. Die Gewichte steuern nur die Farbmischung:
 Jeder von mindestens einem Frame belegte Ausgabepixel bleibt deckend, damit an
 Bild- und Maskenraendern kein weisser Hintergrund durchscheint. Vollstaendig
@@ -312,19 +425,13 @@ temporaerer Puffer und weniger Frame-/Kachel-Wiederholungen in der Ueberlagerung
   Praesentationszeitstempel und Frameindex erscheinen nach der Indexierung.
   Play/Pause, Zeitleiste und die Einzelbildtasten sind davon
    unabhaengig. Einzelbildschritte dekodieren ab dem vorausgehenden Keyframe.
-2. Mustertyp waehlen und **Erkennung pruefen**. Optional Rasterabstand,
-   Linienradius, Kontrast und Erkennungsbereich anpassen. Spalten/Zeilen sind
-   Kreuzungspunkte bzw. innere Schachbrettecken, nicht Zellen. Die automatische
+2. **Erkennung pruefen**. Optional Rasterabstand, Kontrast und
+   Erkennungsbereich anpassen. Spalten/Zeilen sind innere Schachbrettecken,
+   nicht Zellen. Die automatische
    Abstandsschaetzung setzt den Startwert fuer Zielpixel pro Rasterweite.
    Bei der Kalibrierung bleibt dieser Massstab fest.
-  **Image-Patches** verwendet stattdessen die PCB selbst: Nur Bildbereiche mit
-  Gradienten in zwei Dimensionen werden gewaehlt; einzelne gerade Kanten werden
-  verworfen. Patchgroesse 16 bis 256 px bestimmt den Strukturkontext, der
-  Suchradius die maximal erwartete Bewegung zum jeweils naechsten Frame.
-  Patch-Tracking benoetigt deshalb fortlaufende Frames; ein Sprung initialisiert
-  neue Referenzpatches. Ein metrischer Rastermassstab gilt in diesem Modus nicht.
-3. Overlay an mehreren Stellen kontrollieren: eine Linie pro Rasterlinie,
-   zusammenhaengende Indizes und keine ausgelassenen Linien. Die gruene
+3. Overlay an mehreren Stellen kontrollieren: erkannte innere Ecken,
+   zusammenhaengende Indizes und keine ausgelassenen Ecken. Die gruene
    Phase-1-Anzeige bestaetigt nur eine brauchbare Detektion, keine Kalibrierung.
 4. **Kalibrierung starten** verarbeitet jeden Frame des gewaehlten Zeitbereichs
   in Praesentationsreihenfolge, ohne zeitbasierte Ausduennung. Standard:

@@ -20,11 +20,14 @@ export function overlayTiles(width, height, minX, minY, geometries, tileSize = 2
   const tiles = [];
   for (let y = 0; y < height; y += tileSize) for (let x = 0; x < width; x += tileSize) {
     const w = Math.min(tileSize, width - x), h = Math.min(tileSize, height - y);
-    let contributing = bounds.filter(b => b.left < minX + x + w && b.right > minX + x &&
-      b.top < minY + y + h && b.bottom > minY + y).map(b => b.geometry);
+    const margin = selection ? Math.max(2, Math.ceil((geometries[0]?.width || 1) * selection.edgeFeather)) : 0;
+    const selectionBounds = { minX: Math.max(minX, minX + x - margin), minY: Math.max(minY, minY + y - margin),
+      maxX: Math.min(minX + width, minX + x + w + margin), maxY: Math.min(minY + height, minY + y + h + margin) };
+    let contributing = bounds.filter(b => b.left < selectionBounds.maxX && b.right > selectionBounds.minX &&
+      b.top < selectionBounds.maxY && b.bottom > selectionBounds.minY).map(b => b.geometry);
     if (selection && contributing.length && contributing.every(geometry => typeof geometry.supports === 'function')) {
       contributing = selectMergeFrames(contributing, selection.maxFrames,
-      selection.pixelAllowed, selection.edgeFeather, { minX: minX + x, minY: minY + y, maxX: minX + x + w, maxY: minY + y + h });
+        selection.pixelAllowed, selection.edgeFeather, selectionBounds);
     }
     if (contributing.length) tiles.push({ x, y, width: w, height: h, geometries: contributing });
   }

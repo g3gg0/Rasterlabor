@@ -133,7 +133,7 @@ export function analyzeCheckerboard(image, { step, threshold = 10 } = {}) {
     for (let left = 0; left < image.width - step * 2; left += stride) {
       const roi = { x: left, y: top, width: Math.min(tileSize, image.width - left), height: Math.min(tileSize, image.height - top) };
       const detection = detectGrid({ width: image.width, height: image.height, data: gray },
-        { pattern: 'chessboard', approxStep: step, threshold, roi });
+        { approxStep: step, threshold, roi });
       regions++;
       for (const candidate of checkerboardCells(detection.points)) {
         const cell = refineCheckerboardCell(candidate, { width: image.width, height: image.height, data: gray }, threshold);

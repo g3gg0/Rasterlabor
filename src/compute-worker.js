@@ -14,12 +14,10 @@ import { buildInverseMapsGpu, mapBuilderGpuStatus } from './webgpu-map-builder.j
 import { createSpline } from './spline.js';
 import { optimizePoseGraph } from './pose-graph-refit.js';
 import { registerFeatureOverlap } from './feature-overlap.js';
-import { applyBrightnessCalibration, fitBrightnessCalibration } from './brightness-calibration.js';
-import { createPixelBrightnessJob } from './webgpu-pixel-brightness.js';
+import { applyBrightnessCalibration } from './brightness-calibration.js';
 
 let calibration = null;
 let brightnessCalibration = null;
-let brightnessJob = null;
 let cancelled = false;
 let active = false;
 const patchTracker = new PatchTracker();
@@ -238,6 +236,14 @@ self.onmessage = async ({ data }) => {
         transfer.push(preview);
       }
     }
+    else if (data.type === 'track-window-seed') {
+      if (contextDetection) throw new Error('Umfeldregistrierung noch offen.');
+      contextTracker.reset(); windowTracker.reset();
+      const seeded = windowTracker.process(data.image, data.index, data.rectangle, data.searchRadius, data.maxRotation);
+      if (!seeded.success) throw new Error(seeded.reason || 'Letzter Trackingframe konnte nicht als Referenz geladen werden.');
+      windowTracker.setPose(data.pose, data.image.width, data.image.height);
+      result = true;
+    }
     else if (data.type === 'context-reference') {
       const image = data.native ? { ...data.native, maps: trackingMaps, width: trackingMaps.outputWidth, height: trackingMaps.outputHeight } : data.image;
       await contextTracker.provide(data.index, image, data.error);
@@ -267,13 +273,6 @@ self.onmessage = async ({ data }) => {
             result.timing = { ...reduced.timing, detectMs: performance.now() - detectStarted, scale: reduced.width / data.bitmap.width };
           } else result = detectGrid(imageFromBitmap(data.bitmap), data.options);
         } finally { data.bitmap.close(); }
-      }
-      else if (data.options.pattern === 'patches') {
-        result = await patchTracker.processAsync(data.image, data.index, data.options);
-        if (result.interrupted) {
-          patchTracker.reset();
-          result = await patchTracker.processAsync(data.image, data.index, data.options);
-        }
       }
       else { patchTracker.reset(); result = detectGrid(data.image, data.options); }
       result.processingMs = performance.now() - started;
@@ -306,42 +305,12 @@ self.onmessage = async ({ data }) => {
       if (data.brightness !== false && brightnessCalibration) applyBrightnessCalibration(result, brightnessCalibration);
       result.processingMs = performance.now() - started;
       transfer = [result.data.buffer];
-    } else if (data.type === 'brightness-pixel-start') {
-      brightnessJob?.dispose();
-      brightnessJob = null;
-      brightnessJob = await createPixelBrightnessJob(data.options);
-      result = { accelerator: brightnessJob.accelerator, fallbackReason: brightnessJob.fallbackReason };
-    } else if (data.type === 'brightness-pixel-discard') {
-      brightnessJob?.dispose();
-      brightnessJob = null;
-      result = true;
-    } else if (data.type.startsWith('brightness-pixel-')) {
-      if (!brightnessJob) throw new Error('Kein aktiver pixelweiser Helligkeitslauf.');
-      if (data.type === 'brightness-pixel-prepare') result = brightnessJob.prepare(data.indices);
-      else if (data.type === 'brightness-pixel-frame') { brightnessJob.store(data.index, data.gray); result = true; }
-      else if (data.type === 'brightness-pixel-pair') result = await brightnessJob.addPair(data);
-      else if (data.type === 'brightness-pixel-normalize') result = await brightnessJob.normalize();
-      else if (data.type === 'brightness-pixel-validation-reset') { brightnessJob.resetValidation(); result = true; }
-      else if (data.type === 'brightness-pixel-snapshot') {
-        result = await brightnessJob.finish(data.metrics);
-        transfer = [result.gain.buffer, result.supported.buffer];
-      }
-      else if (data.type === 'brightness-pixel-finish') {
-        result = await brightnessJob.finish(data.metrics);
-        transfer = [result.gain.buffer, result.supported.buffer];
-        brightnessJob.dispose();
-        brightnessJob = null;
-      } else throw new Error(`Unbekannter Helligkeitsauftrag: ${data.type}`);
-    } else if (data.type === 'brightness-fit') {
-      result = fitBrightnessCalibration(data.frames, data.options, progress);
-      brightnessCalibration = null;
-      transfer = [result.gain.buffer, result.supported.buffer];
     } else if (data.type === 'brightness-set') {
       brightnessCalibration = data.calibration ?? null;
       result = true;
     } else if (data.type === 'export') {
       result = exportCalibration(calibration, data.frames, data.video, data.parameters, data.opticalConfiguration,
-        data.tracking, brightnessCalibration);
+        data.tracking, Object.hasOwn(data, 'brightness') ? data.brightness : brightnessCalibration);
       transfer = [result.buffer];
     } else if (data.type === 'import') {
       const imported = importCalibration(data.bytes);
@@ -356,13 +325,11 @@ self.onmessage = async ({ data }) => {
       result = { ...imported, calibration: response.value, brightness };
       transfer = response.transfer;
       if (brightness) transfer.push(brightness.gain.buffer, brightness.supported.buffer);
-    } else if (data.type === 'reset') { calibration = null; brightnessCalibration = null; brightnessJob?.dispose(); brightnessJob = null; trackingMaps = null; patchTracker.reset(); windowTracker.reset(); contextTracker.reset(); contextDetection = null; gpuRemapper.reset(); result = true; }
+    } else if (data.type === 'reset') { calibration = null; brightnessCalibration = null; trackingMaps = null; patchTracker.reset(); windowTracker.reset(); contextTracker.reset(); contextDetection = null; gpuRemapper.reset(); result = true; }
     else throw new Error(`Unbekannter Workerauftrag: ${data.type}`);
     self.postMessage({ id: data.id, result }, transfer);
   } catch (error) {
-    const gpuBrightness = data.type.startsWith('brightness-pixel-') && brightnessJob?.accelerator === 'WebGPU';
-    const message = gpuBrightness && !error.message.startsWith('WebGPU-Helligkeit:') ? `WebGPU-Helligkeit: ${error.message}` : error.message;
-    self.postMessage({ id: data.id, error: message });
+    self.postMessage({ id: data.id, error: error.message });
   }
   finally { data.native?.frame?.close(); active = false; }
 };

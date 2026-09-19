@@ -1,7 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { frameGeometry, localSelectionMask, localSelectionDistance, localSelectionSupport, nearestPathEntry, applyPixelMask, edgeFeatherMask, applyEdgeFeather, accumulateFrame, approximateTopFrames, averagedFrames, sharpestFramesFirst } from '../src/path-support.js';
+import { frameGeometry, localSelectionMask, localSelectionDistance, localSelectionSupport, nearestPathEntry, applyPixelMask, edgeFeatherMask, applyEdgeFeather, accumulateFrame, approximateTopFrames, averagedFrames, sharpestFramesFirst, sparsePathFrames } from '../src/path-support.js';
 import { contextImage } from '../src/context-tracker.js';
+
+test('sparse path frames retain endpoints and spatially distant coverage', () => {
+  const geometry = (frame, x, y) => ({ entry: { frame }, width: 10, height: 10,
+    world: () => ({ x, y }) });
+  const frames = [geometry(0, 0, 0), geometry(1, 1, 0), geometry(2, 2, 0),
+    geometry(3, 10, 10), geometry(4, 3, 0), geometry(5, 4, 0)];
+  assert.deepEqual(sparsePathFrames(frames, 3).map(item => item.entry.frame), [0, 3, 5]);
+  assert.deepEqual(sparsePathFrames(frames, 1).map(item => item.entry.frame), [5]);
+});
 
 test('local selection support agrees with the masked matcher sample grid', () => {
   const width = 2182, height = 3742;

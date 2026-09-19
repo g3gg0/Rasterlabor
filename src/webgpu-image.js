@@ -310,7 +310,7 @@ export async function gpuGrayscaleBitmap(bitmap, maximumEdge = 3840, options = {
     let refinedCorners = null;
     let cornerMs = 0;
     let refineMs = 0;
-    if (detectionOptions.pattern === 'chessboard' && detectionOptions.approxStep >= 10) {
+    if (detectionOptions.approxStep >= 10) {
       const cornerStarted = performance.now();
       const roi = detectionOptions.roi ?? { x: 0, y: 0, width, height };
       const radius = Math.max(2, Math.round(detectionOptions.approxStep * 0.18));

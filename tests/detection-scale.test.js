@@ -8,9 +8,9 @@ test('8K portrait detection is bounded to half resolution', () => {
 });
 
 test('detection options and results roundtrip between source and working pixels', () => {
-  const options = scaleDetectionOptions({ approxStep: 290, lineRadius: 12, roi: { x: 100, y: 200, width: 4000, height: 7000 } },
+  const options = scaleDetectionOptions({ approxStep: 290, roi: { x: 100, y: 200, width: 4000, height: 7000 } },
     4320, 7680, 2160, 3840);
-  assert.deepEqual(options, { approxStep: 145, lineRadius: 6, roi: { x: 50, y: 100, width: 2000, height: 3500 } });
+  assert.deepEqual(options, { approxStep: 145, roi: { x: 50, y: 100, width: 2000, height: 3500 } });
   const restored = restoreDetectionScale({ points: [{ x: 25.25, y: 50.5 }], rejected: [{ x: 2, y: 3 }],
     lines: [{ points: [{ x: 4, y: 5 }] }], roi: options.roi, step: 145 }, 4320, 7680, 2160, 3840);
   assert.deepEqual(restored.points, [{ x: 50.5, y: 101 }]);

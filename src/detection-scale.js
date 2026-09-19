@@ -9,7 +9,6 @@ export function scaleDetectionOptions(options, sourceWidth, sourceHeight, target
   const scale = (scaleX + scaleY) / 2;
   return { ...options,
     approxStep: options.approxStep ? options.approxStep * scale : options.approxStep,
-    lineRadius: options.lineRadius ? options.lineRadius * scale : options.lineRadius,
     roi: options.roi ? { x: options.roi.x * scaleX, y: options.roi.y * scaleY,
       width: options.roi.width * scaleX, height: options.roi.height * scaleY } : undefined };
 }
