@@ -17,7 +17,6 @@ let selectedFrame = null;
 const pendingFrames = new Map();
 let decoderError = null;
 let requiredDecodeIndices = [];
-let decodeLookahead = 2;
 let lastPresentationIndex = -1;
 let resolveSelected = null;
 let rejectSelected = null;
@@ -59,6 +58,27 @@ function startDecoder(sampleIndex) {
   });
   decoder.configure(configuration);
   decodedSampleIndex = sampleIndex - 1;
+}
+
+function waitForDecodeProgress(index) {
+  const activeDecoder = decoder;
+  return new Promise((resolve, reject) => {
+    const finish = error => {
+      clearTimeout(timer);
+      activeDecoder.removeEventListener('dequeue', progress);
+      resolveSelected = null;
+      rejectSelected = null;
+      if (error) reject(error);
+      else resolve();
+    };
+    const progress = () => finish();
+    const timer = setTimeout(() => finish(new Error(`Decoderstillstand bei Frame ${index}, Sample ${decodedSampleIndex}, Warteschlange ${activeDecoder.decodeQueueSize}.`)), 15000);
+    resolveSelected = progress;
+    rejectSelected = finish;
+    activeDecoder.addEventListener('dequeue', progress, { once: true });
+    if (decoderError) finish(decoderError);
+    else if (selectedFrame || activeDecoder.decodeQueueSize <= 12) finish();
+  });
 }
 
 async function createOrientedBitmap(frame) {
@@ -126,7 +146,6 @@ async function openVideo(source) {
   presentation = [...samples].sort((first, second) => first.timestamp - second.timestamp);
   if (new Set(presentation.map(sample => sample.timestamp)).size !== presentation.length) throw new Error('Mehrdeutige Praesentationszeitstempel in der Videospur.');
   requiredDecodeIndices = decodeFrontiers(presentation);
-  decodeLookahead = Math.max(2, ...presentation.map((sample, index) => Math.abs(sample.index - index))) + 2;
   const editEntries = trackBox.edts?.elst?.entries;
   if (editEntries && (editEntries.length > 1 || editEntries.some(edit => edit.media_rate_integer !== 1 || edit.media_rate_fraction !== 0 || edit.media_time < 0))) {
     throw new Error('Komplexe MP4-Editlisten werden fuer framegenaue Navigation nicht unterstuetzt.');
@@ -157,27 +176,33 @@ async function decodeFrame(index, native = false, useWebGpu = false, measureShar
   const restartCost = target.index - keyIndex + 1;
   if (!decoder || (!buffered && restartCost < continueCost)) startDecoder(keyIndex);
   requestedTimestamp = target.timestamp;
+  for (const [timestamp, frame] of pendingFrames) {
+    if (timestamp >= requestedTimestamp) continue;
+    frame.close();
+    pendingFrames.delete(timestamp);
+  }
   selectedFrame?.close();
   selectedFrame = pendingFrames.get(target.timestamp) || null;
   pendingFrames.delete(target.timestamp);
-  const selected = selectedFrame ? null : new Promise((resolve, reject) => {
-    resolveSelected = resolve;
-    rejectSelected = reject;
-  });
+  let flushed = false;
   try {
-    const decodeThrough = Math.min(samples.length - 1, requiredDecodeIndices[index] + decodeLookahead);
-    for (let sampleIndex = decodedSampleIndex + 1; !selectedFrame && sampleIndex <= decodeThrough; sampleIndex++) {
+    for (let sampleIndex = decodedSampleIndex + 1; !selectedFrame && sampleIndex < samples.length; sampleIndex++) {
       const sample = samples[sampleIndex];
       const bytes = await file.slice(sample.offset, sample.offset + sample.size).arrayBuffer();
       if (decoderError) throw decoderError;
       decoder.decode(new EncodedVideoChunk({ type: sample.key ? 'key' : 'delta', timestamp: sample.timestamp,
         duration: sample.duration, data: bytes }));
       decodedSampleIndex = sampleIndex;
-      if (decoder.decodeQueueSize > 12) await new Promise(resolve => { decoder.addEventListener('dequeue', resolve, { once: true }); });
+      if (decoder.decodeQueueSize > 12) await waitForDecodeProgress(index);
     }
     if (!selectedFrame) {
-      if (decodeThrough === samples.length - 1) await decoder.flush();
-      else await selected;
+      flushed = true;
+      let timer;
+      try {
+        await Promise.race([decoder.flush(), new Promise((resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(`Decoderstillstand beim Abschluss fuer Frame ${index}.`)), 15000);
+        })]);
+      } finally { clearTimeout(timer); }
     }
     if (decoderError) throw decoderError;
     if (!selectedFrame) throw new Error(`Decoder lieferte Frame ${index} mit PTS ${target.timestamp} nicht.`);
@@ -216,6 +241,7 @@ async function decodeFrame(index, native = false, useWebGpu = false, measureShar
     selectedFrame = null;
     resolveSelected = null;
     rejectSelected = null;
+    if (flushed) closeDecoder();
   }
 }
 

@@ -1,4 +1,4 @@
-import { applyLoopClosure, trackingReferenceCounts } from './tracking-data.js';
+import { applyLoopClosure, trackingReferenceCounts, trackingVideoCompatible } from './tracking-data.js';
 import './style.css';
 import { createIcons, icons } from 'lucide';
 import { WorkerClient } from './rpc.js';
@@ -10,7 +10,7 @@ import { relativeCoverageScale } from './maps.js';
 import { createPatchMask, MASK_FORBIDDEN, MASK_NEUTRAL, MASK_SEARCH, maskIncludes, paintPatchMask, remapInclusionMask } from './patch-mask.js';
 import { analyzeObservations, selectConsistentFrames } from './observation-diagnostics.js';
 import { fitCameraPose, stabilizePose } from './motion-tracking.js';
-import { frameGeometry, localSelectionMask, localSelectionDistance, localSelectionSupport, supportColor, applyPixelMask, edgeFeatherMask, edgeFeatherWeight, applyEdgeFeather, accumulateFrame, approximateTopFrames, averagedFrames, sharpestFramesFirst, sparsePathFrames } from './path-support.js';
+import { frameGeometry, localSelectionMask, localSelectionDistance, localSelectionSupport, supportColor, applyPixelMask, edgeFeatherMask, edgeFeatherWeight, applyEdgeFeather, accumulateFrame, approximateTopFrames, averagedFrames, sharpestFramesFirst, sparsePathFrames, pointBounds, evenlySpaced } from './path-support.js';
 import { FrameReader } from './frame-reader.js';
 import { installTrackingInspector } from './tracking-inspector.js';
 import { installCheckerboardView } from './checkerboard-view.js';
@@ -182,6 +182,8 @@ let mergeZoom = 1;
 let mergePan = { x: 0, y: 0 };
 let pathRefitProposal = null;
 let pathRefitBusy = false;
+let pathRefitWorker = null;
+let pathRefitCancelRequested = false;
 let trackingImageMask = null;
 let trackingMaskHasSelection = false;
 let trackingMaskTool = 'include';
@@ -1501,7 +1503,7 @@ async function previewTrackingStartFrame() {
 }
 
 async function renderTrackingMosaic() {
-  if (trackingRunning || trackingMosaicBusy || !videoInfo || !calibration?.maps || !trackingPath.some(entry => entry.pose)) return;
+  if (trackingRunning || pathRefitBusy || trackingMosaicBusy || !videoInfo || !calibration?.maps || !trackingPath.some(entry => entry.pose)) return;
     trackingMosaicBusy = true;
     const request = trackingMosaicRequest;
     const geometries = trackingPath.map(trackingGeometry).filter(Boolean);
@@ -1549,7 +1551,7 @@ async function renderTrackingMosaic() {
       if (request === trackingMosaicRequest) console.warn('Tracking-Mosaik:', error.message);
     } finally {
       trackingMosaicBusy = false;
-      if (request !== trackingMosaicRequest && trackingPath.length && !trackingRunning) {
+      if (request !== trackingMosaicRequest && trackingPath.length && !trackingRunning && !pathRefitBusy) {
         clearTimeout(trackingMosaicTimer);
         trackingMosaicTimer = setTimeout(() => void renderTrackingMosaic(), 100);
       }
@@ -1559,7 +1561,7 @@ async function renderTrackingMosaic() {
 function scheduleTrackingMosaic() {
   trackingMosaicRequest++;
   clearTimeout(trackingMosaicTimer);
-  if (trackingRunning) return;
+  if (trackingRunning || pathRefitBusy) return;
   trackingMosaicTimer = setTimeout(() => void renderTrackingMosaic(), 250);
 }
 
@@ -1572,10 +1574,9 @@ function drawTrackingPath() {
   const geometries = trackingPath.map(entry => frameGeometry(entry, calibration?.field, calibration?.maps)).filter(Boolean);
   const corners = geometries.flatMap(geometry => geometry.corners);
   const proposed = pathRefitProposal ? [...pathRefitProposal.byFrame.values()].map(item => item.pose) : [];
-  const xs = [...poses.map(entry => entry.pose.x), ...proposed.map(pose => pose.x), ...corners.map(point => point.x)];
-  const ys = [...poses.map(entry => entry.pose.y), ...proposed.map(pose => pose.y), ...corners.map(point => point.y)];
-  const minimumX = Math.min(0, ...xs); const maximumX = Math.max(0, ...xs);
-  const minimumY = Math.min(0, ...ys); const maximumY = Math.max(0, ...ys);
+  const bounds = pointBounds([poses.map(entry => entry.pose), proposed, corners], { x: 0, y: 0 });
+  const minimumX = bounds.minX; const maximumX = bounds.maxX;
+  const minimumY = bounds.minY; const maximumY = bounds.maxY;
   const rangeX = Math.max(1, maximumX - minimumX);
   const rangeY = Math.max(1, maximumY - minimumY);
   const padding = 28;
@@ -1594,7 +1595,8 @@ function drawTrackingPath() {
   }
   const selected = pathHover ?? pathSelection;
   const supporting = selected ? geometries.filter(geometry => geometry.supports(selected, trackingPixelAllowed)) : [];
-  for (const geometry of supporting) {
+  const visibleSupporting = evenlySpaced(supporting, 96);
+  for (const geometry of visibleSupporting) {
     const points = geometry.corners.map(project);
     context.strokeStyle = supportColor(geometry.entry.frame); context.lineWidth = 1;
     context.beginPath(); points.forEach((point, index) => index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y));
@@ -1602,7 +1604,10 @@ function drawTrackingPath() {
     context.fillStyle = context.strokeStyle; context.font = '11px sans-serif';
     context.fillText(`#${geometry.entry.frame}`, points[0].x + 3, points[0].y - 3);
   }
-  text('trackingPathInfo', selected ? `Position (${fixed(selected.x, 1)}, ${fixed(selected.y, 1)}) | ${supporting.length} Bilder: ${supporting.map(item => `#${item.entry.frame}`).join(', ')}` : 'Maus im Canvas: Bildrechtecke anzeigen. Klicken: Frames an dieser Position ueberlagern.');
+  const frameLabels = visibleSupporting.slice(0, 12).map(item => `#${item.entry.frame}`).join(', ');
+  text('trackingPathInfo', selected ? `Position (${fixed(selected.x, 1)}, ${fixed(selected.y, 1)}) | ${supporting.length} Bilder` +
+    (frameLabels ? ` | Anzeige: ${frameLabels}${visibleSupporting.length > 12 ? ', ...' : ''}` : '') :
+    'Maus im Canvas: Bildrechtecke anzeigen. Klicken: Frames an dieser Position ueberlagern.');
   const origin = project({ x: 0, y: 0 });
   context.strokeStyle = '#aebbb5'; context.lineWidth = 1; context.beginPath();
   context.moveTo(padding, origin.y); context.lineTo(width - padding, origin.y);
@@ -1629,7 +1634,10 @@ function drawTrackingPath() {
 function updatePathRefitControls() {
   element('trackingPathRefit').disabled = pathRefitBusy || Boolean(pathRefitProposal) || !pathSelection || trackingPath.length < 2;
   element('trackingPathRefitApply').disabled = pathRefitBusy || !pathRefitProposal?.overlayReady;
-  element('trackingPathRefitDiscard').disabled = pathRefitBusy || !pathRefitProposal;
+  const discard = element('trackingPathRefitDiscard');
+  discard.disabled = !pathRefitBusy && !pathRefitProposal;
+  discard.querySelector('span').textContent = pathRefitBusy ? 'Abbrechen' : 'Verwerfen';
+  discard.title = pathRefitBusy ? 'Laufenden lokalen Refit abbrechen' : 'Refit-Vorschlag verwerfen';
   for (const control of document.querySelectorAll('.refit-adjustments input, .refit-adjustments button')) control.disabled = pathRefitBusy;
 }
 
@@ -1645,8 +1653,7 @@ function mergePlan() {
 }
 
 function updateMergeControls() {
-  const ready = Boolean(videoInfo && calibration && trackingPath.some(entry => entry.pose) &&
-    (!trackingDataset?.video || trackingDataset.video.name === videoInfo.name));
+  const ready = Boolean(calibration && trackingPath.some(entry => entry.pose) && trackingVideoCompatible(trackingDataset, videoInfo));
   element('mergeStart').disabled = !ready || taskBusy || mergeRunning;
   element('mergeCancel').disabled = !mergeRunning;
   text('mergeState', mergeRunning ? 'Laeuft' : ready ? 'Bereit' : 'Nicht bereit');
@@ -1975,9 +1982,10 @@ async function loadBrightnessCalibration(file) {
   text('brightnessStatus', 'Geladenes Helligkeitsfeld ist aktiv.'); updateControls();
 }
 
-async function localGroupComposite(entries, bounds, maxFrames, edgeFeather, featherMask, baseMask, region) {
+async function localGroupComposite(entries, bounds, maxFrames, edgeFeather, featherMask, baseMask, region, activity = () => {}) {
   const candidates = sharpestFramesFirst(entries.map(entry => frameGeometry(entry, calibration?.field, calibration?.maps)).filter(Boolean));
-  const supporting = approximateTopFrames(candidates, maxFrames, trackingPixelAllowed, pathSelection).slice(0, 16);
+  const supporting = approximateTopFrames(candidates, maxFrames, trackingPixelAllowed, pathSelection).slice(0, 16)
+    .sort((first, second) => first.entry.frame - second.entry.frame);
   const composite = document.createElement('canvas');
   composite.width = bounds.width; composite.height = bounds.height;
   const context = composite.getContext('2d', { willReadFrequently: true });
@@ -1985,7 +1993,7 @@ async function localGroupComposite(entries, bounds, maxFrames, edgeFeather, feat
   const sum = new Float32Array(bounds.width * bounds.height * 4);
   const counts = new Uint32Array(bounds.width * bounds.height);
   for (const [index, geometry] of supporting.entries()) {
-    text('trackingPathRefitInfo', `Gruppenmatch: Lade ${index + 1}/${supporting.length}, Frame #${geometry.entry.frame}...`);
+    activity(`Gruppenmatch: Lade ${index + 1}/${supporting.length}, Frame #${geometry.entry.frame}`);
     const image = await readTrackingFrame(geometry.entry.frame, { rectified: true, output: 'rgba' });
     const mask = localSelectionMask(geometry, pathSelection, region, baseMask);
     const allowed = (x, y) => trackingPixelAllowed(x, y) && maskIncludes(mask, x, y);
@@ -2004,7 +2012,7 @@ async function localGroupComposite(entries, bounds, maxFrames, edgeFeather, feat
   return { bitmap: await createImageBitmap(composite), frames: supporting.map(geometry => geometry.entry.frame) };
 }
 
-async function seedFromLocalGroupMatch(entries, worker, limits, preprocessing, baseMask, selectedFrame, localLimit) {
+async function seedFromLocalGroupMatch(entries, worker, limits, preprocessing, baseMask, selectedFrame, localLimit, activity = () => {}) {
   const groups = localRefitGroups(entries);
   if (groups.length < 2) return { entries, attempts: 0, accepted: 0 };
   const radius = Math.min(calibration.maps.outputWidth, calibration.maps.outputHeight) * preprocessing.region / 2;
@@ -2014,11 +2022,13 @@ async function seedFromLocalGroupMatch(entries, worker, limits, preprocessing, b
   const edgeFeather = number('overlayEdgeFeather', 10) / 100;
   const anchor = Math.max(0, groups.findIndex(group => group.some(entry => entry.frame === Number(selectedFrame))));
   const centerPose = { x: bounds.minX + bounds.width / 2, y: bounds.minY + bounds.height / 2, rotation: 0 };
+  activity('Gruppenmatch: bereite lokale Bildmaske vor');
   const featherMask = edgeFeatherMask(calibration.maps.outputWidth, calibration.maps.outputHeight, trackingPixelAllowed, edgeFeather);
   const composites = [];
   try {
     for (const [index, group] of groups.entries()) {
-      const composite = await localGroupComposite(group, bounds, maxFrames, edgeFeather, featherMask, baseMask, preprocessing.region);
+      activity(`Gruppenmatch: baue Gruppe ${index + 1}/${groups.length}`);
+      const composite = await localGroupComposite(group, bounds, maxFrames, edgeFeather, featherMask, baseMask, preprocessing.region, activity);
       composites.push({ frame: index, pose: centerPose,
         bitmap: composite.bitmap, sourceFrames: composite.frames });
     }
@@ -2026,7 +2036,7 @@ async function seedFromLocalGroupMatch(entries, worker, limits, preprocessing, b
     for (let reference = 0; reference < groups.length; reference++) for (let current = reference + 1; current < groups.length; current++) {
       pairs.push({ reference, current, group: `${reference}:${current}` });
     }
-    text('trackingPathRefitInfo', `Pruefe ${pairs.length} Gruppenueberlappungen vor dem Einzelbild-Refinement...`);
+    activity(`Pruefe ${pairs.length} Gruppenueberlappungen vor dem Einzelbild-Refinement`);
     const matches = await worker.call('local-refit-register', { images: composites, pairs,
       limits: { ...limits, radius: Math.max(limits.radius, radius), reverseRadius: Math.min(32, limits.reverseRadius) },
       preprocessing }, composites.map(item => item.bitmap));
@@ -2072,7 +2082,8 @@ async function refitTrackingPath() {
   const selectedFrame = element('trackingOverlayFrame').value;
   if (localEntries.length < 2) { text('trackingPathRefitInfo', 'Die Auswahl enthaelt zu wenige auswertbare Frames.'); return; }
   pathRefitBusy = true; pathRefitProposal = null; updatePathRefitControls();
-  let searchProgress = { pass: 1, round: 1, attempted: 0, limit: 512 };
+  pathRefitCancelRequested = false;
+  let searchProgress = { pass: 1, round: 1, attempted: 0, limit: 128 };
   const refitStarted = performance.now();
   let refitActivity = 'Lokaler Refit wird vorbereitet';
   const showRefitActivity = activity => {
@@ -2097,28 +2108,33 @@ async function refitTrackingPath() {
       ((status.pair || 1) - 1 + (status.stage === 'backward' || status.stage === 'feature-backward' ? 0.8 : 0.3)) / Math.max(1, status.pairs || 1);
     element('progress').value = Math.min(0.99, fraction);
   });
+  pathRefitWorker = worker;
   try {
+    overlayRequest++; trackingMosaicRequest++; clearTimeout(trackingMosaicTimer);
+    showRefitActivity('Lokaler Refit wartet auf laufende Bildabrufe');
+    await frameReader.waitUntilIdle();
     const limits = { radius: Math.min(256, Math.max(64, number('trackingContextRadius', 32) * 4)),
       reverseRadius: Math.min(256, Math.max(64, number('trackingContextRadius', 32) * 4)),
       angle: Math.min(5, Math.max(2, number('trackingContextAngle', 1) * 4)), coarseStep: 1 };
+    showRefitActivity('Lokaler Refit baut das Pose-Netz auf');
     let graph = buildPoseGraph(trackingPath, { conditionalLimit });
     const localLimit = Math.min(50, Math.max(25, conditionalLimit * 3));
     const graphOptions = { conditionalLimit, cycleLimit: localLimit, consensusLimit: localLimit,
       lever: Math.hypot(calibration.maps.outputWidth, calibration.maps.outputHeight) / 2 };
     searchProgress = { stage: 'group', pass: 0, round: 0, attempted: 0, limit: 0 };
-    const groupSeed = await seedFromLocalGroupMatch(localEntries, worker, limits, preprocessing, baseMask, selectedFrame, localLimit);
+    const groupSeed = await seedFromLocalGroupMatch(localEntries, worker, limits, preprocessing, baseMask, selectedFrame, localLimit, showRefitActivity);
     localEntries = groupSeed.entries;
-    text('trackingPathRefitInfo', `Gruppenmatch: ${groupSeed.accepted}/${groupSeed.attempts} Ueberlappungen bestaetigt, ${groupSeed.aligned} Gruppen ausgerichtet; starte Einzelbild-Refinement...`);
+    showRefitActivity(`Gruppenmatch: ${groupSeed.accepted}/${groupSeed.attempts} Ueberlappungen bestaetigt, ${groupSeed.aligned} Gruppen ausgerichtet; starte Einzelbild-Refinement`);
     let result = null; let totalMatches = 0; let completedPasses = 0;
     for (let pass = 1; pass <= 3 && localEntries.length >= 2; pass++) {
       const entries = new Map(localEntries.map(entry => [entry.frame, entry]));
       const search = await searchLocalRefit(localEntries, async (pairs, progress) => {
         searchProgress = { ...progress, pass };
-        const requiredFrames = [...new Set(pairs.flatMap(pair => [pair.current, pair.reference]))];
+        const requiredFrames = [...new Set(pairs.flatMap(pair => [pair.current, pair.reference]))].sort((first, second) => first - second);
         const images = [];
         try {
           for (const [index, frame] of requiredFrames.entries()) {
-            text('trackingPathRefitInfo', `Refit-Iteration ${pass}: Lade Frame ${index + 1}/${requiredFrames.length}: #${frame}...`);
+            showRefitActivity(`Refit-Iteration ${pass}: Lade Frame ${index + 1}/${requiredFrames.length}: #${frame}`);
             const decoded = await readTrackingFrame(frame, { rectified: true });
             const entry = entries.get(frame); const geometry = frameGeometry(entry, calibration?.field, calibration?.maps);
             images.push({ frame, pose: { ...entry.pose }, bitmap: decoded.bitmap,
@@ -2127,14 +2143,14 @@ async function refitTrackingPath() {
           return await worker.call('local-refit-register', { images, pairs, limits, preprocessing }, images.map(item => item.bitmap));
         } finally { for (const item of images) item.bitmap.close(); }
       }, { baseGraph: graph, preferredFrames: selectedFrame ? [Number(selectedFrame)] : [],
-        maxPairs: pass === 1 ? 512 : 256, graphOptions });
+        maxPairs: pass === 1 ? 128 : 64, graphOptions });
       totalMatches += search.matches.length;
       if (search.graph.localEdges < 1) {
         if (!result) throw new Error(`Kein bestaetigter lokaler Match nach ${search.rounds} Runden (${search.limited ? 'Suchbudget erreicht' : 'Kandidaten ausgeschoepft'}). ${localRefitFailure(search.matches, localLimit)}`);
         break;
       }
       graph = search.graph; completedPasses = pass;
-      text('trackingPathRefitInfo', `Refit-Iteration ${pass}: ${graph.localEdges} neue lokale Kanten; verteile Korrektur durch das Pose-Netz...`);
+      showRefitActivity(`Refit-Iteration ${pass}: ${graph.localEdges} neue lokale Kanten; verteile Korrektur durch das Pose-Netz`);
       result = await worker.call('pose-graph-refit', { graph, options: { seedFrames: seeds, iterations: 10, huber: 20 } });
       const corrected = new Map(result.corrections.map(item => [item.frame, item.pose]));
       localEntries = localCandidates(trackingPath.map(entry => corrected.has(entry.frame) ?
@@ -2149,16 +2165,27 @@ async function refitTrackingPath() {
     if (!pathOverlay.width) throw new Error('Das Mischbild der Refit-Vorschau konnte nicht aufgebaut werden.');
     pathRefitProposal.overlayReady = true;
     text('trackingPathRefitInfo', `${groupSeed.accepted}/${groupSeed.attempts} Gruppenmatches | ${completedPasses} Refit-Iterationen, ${totalMatches} Paarversuche | ${result.nodes} Frames, ${result.edges} Kanten (${result.localEdges} lokal, ${result.spatialEdges} raeumlich) | Lokal RMS ${fixed(result.localBeforeRms, 2)} -> ${fixed(result.localAfterRms, 2)} px | Netz RMS ${fixed(result.beforeRms, 2)} -> ${fixed(result.afterRms, 2)} px | Mischbild zeigt die Refit-Vorschau.`);
-  } catch (error) { text('trackingPathRefitInfo', `Refit fehlgeschlagen: ${error.message}`); }
+  } catch (error) {
+    text('trackingPathRefitInfo', pathRefitCancelRequested ? 'Lokaler Refit abgebrochen.' : `Refit fehlgeschlagen: ${error.message}`);
+  }
   finally {
     clearInterval(refitHeartbeat);
-    worker.terminate(); pathRefitBusy = false; updatePathRefitControls();
+    worker.terminate();
+    if (pathRefitWorker === worker) pathRefitWorker = null;
+    const cancelled = pathRefitCancelRequested;
+    pathRefitCancelRequested = false; pathRefitBusy = false; updatePathRefitControls();
     text('processingStatus', 'Bereit');
+    if (cancelled && pathSelection) void loadPathOverlay(pathSelection).finally(scheduleTrackingMosaic);
   }
 }
 
 async function discardTrackingPathRefit() {
-  if (pathRefitBusy) return;
+  if (pathRefitBusy) {
+    pathRefitCancelRequested = true;
+    text('trackingPathRefitInfo', 'Lokaler Refit wird abgebrochen...');
+    pathRefitWorker?.terminate();
+    return;
+  }
   pathRefitBusy = true;
   pathRefitProposal = null; text('trackingPathRefitInfo', 'Kein Refit-Vorschlag.');
   updatePathRefitControls(); drawTrackingPath();
@@ -2270,11 +2297,20 @@ async function loadPathOverlay(point) {
   const positionLabel = `${pathRefitProposal ? 'Refit-Vorschau | ' : ''}Position (${fixed(point.x, 1)}, ${fixed(point.y, 1)}) | Top ${maxFrames}/Bereich`;
   element('trackingOverlayPane').hidden = false;
   clearPathOverlay();
-  overlayZoom = 1; overlayPan = { x: 0, y: 0 }; renderPathOverlay(); drawTrackingPath();
-  if (!videoInfo || !calibration || (trackingDataset?.video && trackingDataset.video.name !== videoInfo.name)) {
+  overlayZoom = 1; overlayPan = { x: 0, y: 0 };
+  text('trackingOverlayInfo', `${positionLabel} | Suche passende Frames...`);
+  renderPathOverlay(); drawTrackingPath();
+  if (!calibration || !trackingVideoCompatible(trackingDataset, videoInfo)) {
     text('trackingOverlayInfo', 'Bitte das zum Tracking gehoerende Video und die Kalibrierung laden.'); return;
   }
-  if (trackingRunning || taskBusy) { text('trackingOverlayInfo', 'Verarbeitung pausieren und die Position erneut anklicken.'); return; }
+  if (trackingRunning) {
+    trackingRunning = false; trackingPaused = true; updateControls();
+    text('trackingOverlayInfo', `${positionLabel} | Tracking wird pausiert, danach werden die Frames automatisch geladen...`);
+    return;
+  }
+  if (taskBusy) { text('trackingOverlayInfo', 'Andere Verarbeitung zuerst abschliessen.'); return; }
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  if (request !== overlayRequest) return;
   const previewFrames = pathRefitProposal?.overlayFrames ? new Set(pathRefitProposal.overlayFrames) : null;
   const candidates = sharpestFramesFirst(trackingPath.filter(item => !previewFrames || previewFrames.has(item.frame))
     .map(item => trackingGeometry(item)).filter(geometry => geometry?.supports(point, trackingPixelAllowed)));
@@ -2727,7 +2763,8 @@ async function runTracking(restart = false) {
     if (latest && !failedCurrent && latest.frame !== lastRenderedFrame) {
       renderTrackingPreview(); renderTrackingResults(latest);
     }
-    scheduleTrackingMosaic();
+    if (pathSelection) void loadPathOverlay(pathSelection).finally(scheduleTrackingMosaic);
+    else scheduleTrackingMosaic();
     text('processingStatus', 'Bereit');
     text('pendingStatus', trackingLost ? 'Window Tracking verloren | Neustart erforderlich' : completed ? `Tracking abgeschlossen | ${trackingPath.length} Frames` : `Tracking pausiert vor Frame ${trackingNextIndex}`);
     updateControls();

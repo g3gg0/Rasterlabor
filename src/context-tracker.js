@@ -3,7 +3,7 @@ import { MASK_SEARCH } from './patch-mask.js';
 import { WebGpuContextTracker } from './webgpu-context-tracker.js';
 import { remapRGBA } from './maps.js';
 import { applyLoopClosure } from './tracking-data.js';
-import { refitGray } from './refit-preprocess.js';
+import { normalizeRefitPreprocess, refitGrayNormalized } from './refit-preprocess.js';
 
 const wrap = angle => Math.atan2(Math.sin(angle), Math.cos(angle));
 const rotate = (x, y, angle) => ({ x: Math.cos(angle) * x - Math.sin(angle) * y, y: Math.sin(angle) * x + Math.cos(angle) * y });
@@ -56,11 +56,12 @@ function overlapReferencePoints(cells, currentPose, referencePose, width, height
 export function contextImage(image, mask = null, preprocessing = null) {
   const { width, height } = image;
   if (mask && (mask.sourceWidth !== width || mask.sourceHeight !== height)) throw new Error('Umfeldmaske passt nicht zum entzerrten Bild.');
+  const normalizedPreprocessing = preprocessing ? normalizeRefitPreprocess(preprocessing) : null;
   const gray = new Int16Array(width * height);
   for (let index = 0; index < gray.length; index++) {
     const allowed = !mask || mask.data[Math.floor(Math.floor(index / width) / mask.cellSize) * mask.width + Math.floor((index % width) / mask.cellSize)] === MASK_SEARCH;
-    gray[index] = allowed && image.data[index * 4 + 3] === 255 ? (preprocessing ?
-      refitGray(image.data[index * 4], image.data[index * 4 + 1], image.data[index * 4 + 2], preprocessing) :
+    gray[index] = allowed && image.data[index * 4 + 3] === 255 ? (normalizedPreprocessing ?
+      refitGrayNormalized(image.data[index * 4], image.data[index * 4 + 1], image.data[index * 4 + 2], normalizedPreprocessing) :
       Math.floor((299 * image.data[index * 4] + 587 * image.data[index * 4 + 1] + 114 * image.data[index * 4 + 2] + 500) / 1000)) : -1;
   }
   const levels = [{ width, height, gray, scale: 1 }];

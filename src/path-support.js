@@ -61,6 +61,22 @@ export function localSelectionSupport(geometry, point, diameterFraction = 0.4, b
 }
 
 export function supportColor(frame) { return `hsl(${(frame * 137.508) % 360} 70% 38%)`; }
+export function evenlySpaced(items, limit) {
+  if (!items.length || limit < 1) return [];
+  if (items.length <= limit) return items.slice();
+  if (limit === 1) return [items.at(-1)];
+  return Array.from({ length: limit }, (_, index) => items[Math.round(index * (items.length - 1) / (limit - 1))]);
+}
+
+export function pointBounds(pointGroups, origin = null) {
+  let minX = origin?.x ?? Infinity; let minY = origin?.y ?? Infinity;
+  let maxX = origin?.x ?? -Infinity; let maxY = origin?.y ?? -Infinity;
+  for (const points of pointGroups) for (const point of points) {
+    minX = Math.min(minX, point.x); minY = Math.min(minY, point.y);
+    maxX = Math.max(maxX, point.x); maxY = Math.max(maxY, point.y);
+  }
+  return { minX, minY, maxX, maxY };
+}
 
 export function applyPixelMask(rgba, width, allowed) {
   for (let pixel = 0; pixel < rgba.length / 4; pixel++) {
@@ -79,11 +95,11 @@ export function sharpestFramesFirst(geometries) {
 
 export function approximateTopFrames(geometries, maxFrames, pixelAllowed = null, anchor = null, cellSize = null, sampleBounds = null) {
   if (!geometries.length || maxFrames < 1) return [];
-  const corners = geometries.flatMap(geometry => geometry.corners);
-  const minX = Math.floor(Math.max(Math.min(...corners.map(point => point.x)), sampleBounds?.minX ?? -Infinity));
-  const minY = Math.floor(Math.max(Math.min(...corners.map(point => point.y)), sampleBounds?.minY ?? -Infinity));
-  const maxX = Math.ceil(Math.min(Math.max(...corners.map(point => point.x)), sampleBounds?.maxX ?? Infinity));
-  const maxY = Math.ceil(Math.min(Math.max(...corners.map(point => point.y)), sampleBounds?.maxY ?? Infinity));
+  const bounds = pointBounds(geometries.map(geometry => geometry.corners));
+  const minX = Math.floor(Math.max(bounds.minX, sampleBounds?.minX ?? -Infinity));
+  const minY = Math.floor(Math.max(bounds.minY, sampleBounds?.minY ?? -Infinity));
+  const maxX = Math.ceil(Math.min(bounds.maxX, sampleBounds?.maxX ?? Infinity));
+  const maxY = Math.ceil(Math.min(bounds.maxY, sampleBounds?.maxY ?? Infinity));
   if (maxX <= minX || maxY <= minY) return [];
   const width = Math.max(1, maxX - minX), height = Math.max(1, maxY - minY);
   cellSize ??= Math.max(64, Math.ceil(geometries[0].width * 0.1));

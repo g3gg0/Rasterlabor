@@ -19,6 +19,10 @@ export class FrameReader {
     return run;
   }
 
+  async waitUntilIdle() {
+    await this.pending;
+  }
+
   toRgba(bitmap) {
     this.conversion ??= new OffscreenCanvas(1, 1);
     if (this.conversion.width !== bitmap.width) this.conversion.width = bitmap.width;

@@ -1,6 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applyLoopClosure, validateTracking, trackingReferenceCounts } from '../src/tracking-data.js';
+import { applyLoopClosure, validateTracking, trackingReferenceCounts, trackingVideoCompatible } from '../src/tracking-data.js';
+
+test('renamed legacy videos remain compatible when geometry and frame range match', () => {
+  const tracking = { video: { name: 'original.mp4', width: 2160, height: 3840 }, path: [{ frame: 27_019 }] };
+  assert.equal(trackingVideoCompatible(tracking, { name: 'renamed.mp4', width: 2160, height: 3840, frameCount: 31_748 }), true);
+  assert.equal(trackingVideoCompatible(tracking, { name: 'renamed.mp4', width: 1920, height: 1080, frameCount: 31_748 }), false);
+  assert.equal(trackingVideoCompatible(tracking, { name: 'renamed.mp4', width: 2160, height: 3840, frameCount: 20_000 }), false);
+});
 
 test('reference counts include rejected requests, distinguish consensus and cover the complete path', () => {
   const path = Array.from({ length: 250 }, (_, frame) => ({ frame, context: { matches: [], inliers: [], applied: false } }));

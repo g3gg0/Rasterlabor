@@ -1,7 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { frameGeometry, localSelectionMask, localSelectionDistance, localSelectionSupport, nearestPathEntry, applyPixelMask, edgeFeatherMask, applyEdgeFeather, accumulateFrame, approximateTopFrames, averagedFrames, sharpestFramesFirst, sparsePathFrames } from '../src/path-support.js';
+import { frameGeometry, localSelectionMask, localSelectionDistance, localSelectionSupport, nearestPathEntry, applyPixelMask, edgeFeatherMask, applyEdgeFeather, accumulateFrame, approximateTopFrames, averagedFrames, sharpestFramesFirst, sparsePathFrames, pointBounds, evenlySpaced } from '../src/path-support.js';
 import { contextImage } from '../src/context-tracker.js';
+
+test('point bounds handle tracking paths larger than the call argument limit', () => {
+  const points = Array.from({ length: 100_000 }, (_, index) => ({ x: index - 40_000, y: 50_000 - index }));
+  assert.deepEqual(pointBounds([points], { x: 0, y: 0 }),
+    { minX: -40_000, minY: -49_999, maxX: 59_999, maxY: 50_000 });
+});
+
+test('long diagnostic paths are sampled evenly with bounded drawing work', () => {
+  assert.deepEqual(evenlySpaced(Array.from({ length: 100_000 }, (_, index) => index), 5),
+    [0, 25_000, 50_000, 74_999, 99_999]);
+});
 
 test('sparse path frames retain endpoints and spatially distant coverage', () => {
   const geometry = (frame, x, y) => ({ entry: { frame }, width: 10, height: 10,

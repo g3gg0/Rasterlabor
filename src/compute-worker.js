@@ -94,7 +94,7 @@ self.onmessage = async ({ data }) => {
           let forward;
           let forwardSeed = current.pose;
           const attempts = [];
-          const radii = contextSearchRadii(data.limits.radius, current.image.width, current.image.height, 'spatial', 1.05);
+          const radii = contextSearchRadii(data.limits.radius, current.image.width, current.image.height, 'recent');
           for (const [attempt, radius] of radii.entries()) {
             progress({ operation: 'local-refit', stage: 'forward', pair: index + 1, pairs: data.pairs.length,
               current: current.frame, reference: reference.frame, attempt: attempt + 1, attempts: radii.length, radius });

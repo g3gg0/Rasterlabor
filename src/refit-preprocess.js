@@ -22,6 +22,10 @@ export function normalizeRefitPreprocess(options = {}) {
 
 export function refitGray(red, green, blue, options = DEFAULT_REFIT_PREPROCESS) {
   const normalized = normalizeRefitPreprocess(options);
+  return refitGrayNormalized(red, green, blue, normalized);
+}
+
+export function refitGrayNormalized(red, green, blue, normalized) {
   const luminance = (normalized.red * red + normalized.green * green + normalized.blue * blue) / 255;
   const leveled = clamp((luminance - 0.5) * normalized.contrast + 0.5 + normalized.brightness, 0, 1);
   return Math.round(255 * leveled ** (1 / normalized.gamma));

@@ -43,6 +43,15 @@ export function trackingReferenceCounts(path) {
   return counts;
 }
 
+export function trackingVideoCompatible(tracking, video) {
+  if (!video) return false;
+  const source = tracking?.video;
+  if (source && Number.isFinite(source.width) && Number.isFinite(source.height) &&
+      (source.width !== video.width || source.height !== video.height)) return false;
+  if (Number.isSafeInteger(video.frameCount) && tracking?.path?.some(entry => entry.frame >= video.frameCount)) return false;
+  return true;
+}
+
 export function validateTracking(tracking, fallbackVideo = null) {
   if (tracking == null) return null;
   if (tracking.format !== 'rasterlabor-xyr-tracking' || tracking.model_version !== 1 || !Array.isArray(tracking.path)) {
