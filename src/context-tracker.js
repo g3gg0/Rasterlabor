@@ -473,7 +473,7 @@ export class ContextTracker {
   async begin(image, frame, prediction, options, prepared = null) {
     if (this.pending) throw new Error('Umfeldregistrierung noch nicht abgeschlossen.');
     if (![options.contextRecent, options.contextSpatial].every(value => Number.isInteger(value) && value >= 0 && value <= 8) ||
-      !Number.isFinite(options.contextRadius) || options.contextRadius < 4 || options.contextRadius > 256 ||
+      !Number.isFinite(options.contextRadius) || options.contextRadius < 4 || options.contextRadius > Math.floor(Math.min(image.width, image.height) * 0.8) ||
       !Number.isFinite(options.contextAngle) || options.contextAngle < 0.1 || options.contextAngle > 5 ||
       !Number.isFinite(options.contextCycleStrict ?? CYCLE_STRICT_PX) || (options.contextCycleStrict ?? CYCLE_STRICT_PX) <= 0 ||
       !Number.isFinite(options.contextCycleConditional ?? CYCLE_CONDITIONAL_PX) ||

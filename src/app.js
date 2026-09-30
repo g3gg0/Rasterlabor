@@ -2335,15 +2335,42 @@ function draw() {
   text('zoomValue', `${Math.round(zoom * 100)}%`);
 }
 
+function trackingRadiusLimits() {
+  const image = videoInfo ?? calibration?.field;
+  const edge = image ? Math.min(image.width, image.height) : 0;
+  return { search: edge ? Math.floor(edge * 0.5) : 1024, context: edge ? Math.floor(edge * 0.8) : 256 };
+}
+
+function validateTrackingInputs() {
+  const limits = trackingRadiusLimits();
+  element('trackingSearchRadius').max = String(limits.search);
+  element('trackingContextRadius').max = String(limits.context);
+  for (const [id, limit, percent] of [['trackingSearchRadius', limits.search, 50], ['trackingContextRadius', limits.context, 80]]) {
+    element(id).title = `4 bis ${limit} px (${percent}% der kuerzeren Bildkante)`;
+  }
+  const inputs = [...document.querySelectorAll('.tracking-settings input[type="number"]')];
+  for (const input of inputs) { input.required = true; input.setCustomValidity(''); }
+  for (const [lower, upper, message] of [
+    ['trackingContextCycleStrict', 'trackingContextCycleConditional', 'Zyklus bedingt muss mindestens so gross wie Zyklus strikt sein.'],
+    ['trackingStart', 'trackingEnd', 'Endframe muss mindestens so gross wie Startframe sein.'],
+  ]) {
+    if (element(lower).valueAsNumber > element(upper).valueAsNumber) {
+      element(lower).setCustomValidity(message); element(upper).setCustomValidity(message);
+    }
+  }
+  for (const input of inputs) input.setAttribute('aria-invalid', String(!input.validity.valid));
+  return inputs.every(input => input.validity.valid);
+}
+
 function updateTrackingControls() {
   fineUi?.refresh();
   updateGpuAdapterControl();
-  element('trackingSearchRadius').max = '1024';
+  const validInputs = validateTrackingInputs();
   const ready = Boolean(videoInfo && calibration && videoInfo.width === calibration.field.width && videoInfo.height === calibration.field.height && !taskBusy && !continuous && !rectifiedPlayback);
   const canContinue = trackingPath.some(entry => entry.pose) && trackingNextIndex <= number('trackingEnd', 0);
-  element('trackingStartButton').disabled = !ready || trackingRunning || trackingPreviewBusy || !trackingRectangle;
+  element('trackingStartButton').disabled = !validInputs || !ready || trackingRunning || trackingPreviewBusy || !trackingRectangle;
   element('trackingPauseButton').disabled = !trackingRunning;
-  element('trackingResumeButton').disabled = !ready || trackingRunning || trackingPreviewBusy || !trackingRectangle || Boolean(trackingDataset?.reduction) ||
+  element('trackingResumeButton').disabled = !validInputs || !ready || trackingRunning || trackingPreviewBusy || !trackingRectangle || Boolean(trackingDataset?.reduction) ||
     trackingLost || (!trackingPaused && !canContinue) || trackingNextIndex > number('trackingEnd', 0);
   element('trackingResetButton').disabled = taskBusy || trackingRunning || trackingPreviewBusy;
   element('trackingExportButton').disabled = !trackingPath.some(entry => entry.pose);
@@ -2523,6 +2550,25 @@ function renderTrackingPreview() {
     context.strokeStyle = '#ffd74b'; context.lineWidth = 2;
     context.strokeRect(left + trackingRectangle.x * scale, top + trackingRectangle.y * scale,
       trackingRectangle.width * scale, trackingRectangle.height * scale);
+  }
+  const radiusInput = element('trackingSearchRadius');
+  const radius = radiusInput.valueAsNumber;
+  if (radiusInput.validity.valid && Number.isFinite(radius)) {
+    const cx = left + trackingPreviewImage.width * scale / 2;
+    const cy = top + trackingPreviewImage.height * scale / 2;
+    const r = radius * scale;
+    context.save();
+    context.beginPath(); context.rect(left, top, trackingPreviewImage.width * scale, trackingPreviewImage.height * scale); context.clip();
+    context.strokeStyle = '#53d9ff'; context.fillStyle = '#53d9ff15'; context.lineWidth = 1.5;
+    context.setLineDash([6, 4]); context.beginPath(); context.arc(cx, cy, r, 0, Math.PI * 2); context.fill(); context.stroke();
+    context.setLineDash([]); context.beginPath(); context.moveTo(cx, cy); context.lineTo(cx + r, cy); context.stroke();
+    context.beginPath(); context.moveTo(cx - 5, cy); context.lineTo(cx + 5, cy); context.moveTo(cx, cy - 5); context.lineTo(cx, cy + 5); context.stroke();
+    const label = `Suchradius ${radius} px ? ${(radius / Math.min(trackingPreviewImage.width, trackingPreviewImage.height) * 100).toFixed(1)} %`;
+    context.font = '12px sans-serif';
+    const labelWidth = context.measureText(label).width + 16;
+    context.fillStyle = '#10232ee6'; context.fillRect(cx - labelWidth / 2, cy + 12, labelWidth, 24);
+    context.fillStyle = '#a5edff'; context.textAlign = 'center'; context.fillText(label, cx, cy + 28);
+    context.restore();
   }
   text('trackingZoomValue', `${Math.round(trackingZoom * 100)}%`);
 }
@@ -4110,10 +4156,12 @@ function renderTrackingResults(entry) {
 }
 
 function trackingOptions() {
+  if (!validateTrackingInputs()) throw new Error('Bitte die rot markierten Tracking-Eingaben korrigieren.');
+  const limits = trackingRadiusLimits();
   const patchSearchRadius = number('trackingSearchRadius', 32);
   const windowSize = number('trackingWindow', 1);
-  if (!Number.isFinite(patchSearchRadius) || patchSearchRadius < 4 || patchSearchRadius > 1024) {
-    throw new Error('Suchradius muss zwischen 4 und 1024 px liegen.');
+  if (!Number.isFinite(patchSearchRadius) || patchSearchRadius < 4 || patchSearchRadius > limits.search) {
+    throw new Error(`Suchradius muss zwischen 4 und ${limits.search} px liegen.`);
   }
   if (!(windowSize >= 1 && windowSize <= 240)) throw new Error('Stabilisierungsfenster muss zwischen 1 und 240 Frames liegen.');
   const maxRotation = number('trackingMaxRotation', 5);
@@ -4123,10 +4171,10 @@ function trackingOptions() {
   const contextCycleStrict = number('trackingContextCycleStrict', 1.5);
   const contextCycleConditional = number('trackingContextCycleConditional', 7.5);
   if (![contextRecent, contextSpatial].every(value => Number.isInteger(value) && value >= 0 && value <= 8) ||
-    !Number.isFinite(contextRadius) || contextRadius < 4 || contextRadius > 256 || !Number.isFinite(contextAngle) || contextAngle < 0.1 || contextAngle > 5 ||
+    !Number.isFinite(contextRadius) || contextRadius < 4 || contextRadius > limits.context || !Number.isFinite(contextAngle) || contextAngle < 0.1 || contextAngle > 5 ||
     !Number.isFinite(contextCycleStrict) || contextCycleStrict <= 0 || !Number.isFinite(contextCycleConditional) ||
     contextCycleConditional < contextCycleStrict || contextCycleConditional > 50) {
-    throw new Error('Umfeld: n/m 0 bis 8, Radius 4 bis 256 px, Winkel 0.1 bis 5 Grad; Zyklusgrenzen positiv, aufsteigend und maximal 50 px.');
+    throw new Error(`Umfeld: n/m 0 bis 8, Radius 4 bis ${limits.context} px, Winkel 0.1 bis 5 Grad; Zyklusgrenzen positiv, aufsteigend und maximal 50 px.`);
   }
   if (!trackingRectangle || !Number.isFinite(maxRotation) || maxRotation < 1 || maxRotation > 10) throw new Error('Fenster auswaehlen und Rotationsgrenze zwischen 1 und 10 Grad setzen.');
   const sourceImageMask = trackingMaskHasSelection && trackingImageMask ?
@@ -4815,6 +4863,9 @@ element('infoButton').onclick = () => element('infoDialog').showModal();
 element('closeInfo').onclick = () => element('infoDialog').close();
 installPan(rawCanvas); installPan(resultCanvas);
 installMergePreviewInteraction();
+for (const input of document.querySelectorAll('.tracking-settings input[type="number"]')) {
+  input.addEventListener('input', () => { updateTrackingControls(); renderTrackingPreview(); });
+}
 installTrackingPreviewInteraction();
 installTrackingTabs();
 installPcbRealignment();
