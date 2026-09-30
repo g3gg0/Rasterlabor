@@ -2,6 +2,11 @@
   "name": "microscope-grid-calibration",
   "version": "1.0.0",
   "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/g3gg0/Rasterlabor.git"
+  },
+  "homepage": "https://g3gg0.github.io/Rasterlabor/",
   "type": "module",
   "scripts": {
     "build": "node build.mjs",

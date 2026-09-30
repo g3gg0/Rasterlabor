@@ -5,8 +5,6 @@ Checkerboard. Es berechnet ein gemeinsames kubisches
 B-Spline-Entzerrungsfeld und inverse Resampling-Maps. PCB-Stitching ist nicht
 Bestandteil dieser Anwendung.
 
-## Start
-
 ## GitHub Pages
 
 Dieses Verzeichnis (`web`, mit `package.json` und `.github`) bildet die
