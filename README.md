@@ -7,6 +7,29 @@ Bestandteil dieser Anwendung.
 
 ## Start
 
+## GitHub Pages
+
+Dieses Verzeichnis (`web`, mit `package.json` und `.github`) bildet die
+Repository-Wurzel von `g3gg0/Rasterlabor`. `package-lock.json` sowie alle
+benoetigten Dateien unter `src`, `tests` und `scripts` mit einchecken.
+Lokale Videos, Kalibrierungsarchive, `node_modules` und Build-Ausgaben werden
+durch `.gitignore` ausgeschlossen.
+
+Einmalig im GitHub-Repository unter **Settings > Pages > Build and deployment**
+die Quelle **GitHub Actions** auswaehlen. Nach jedem Push auf den Standardbranch
+(unabhaengig davon, ob dieser `main` oder `master` heisst) installiert der
+Workflow die Abhaengigkeiten mit `npm ci`, fuehrt die Tests aus und
+veroeffentlicht den Pages-Build unter <https://g3gg0.github.io/Rasterlabor/>.
+Der Workflow kann auch manuell ueber **Actions > Publish Rasterlabor** gestartet
+werden; veroeffentlicht wird ausschliesslich der Standardbranch.
+
+`npm run build:pages` erstellt `dist-pages/` als eigenstaendige statische Website,
+ohne Test-/Benchmark-Bundles und Source Maps. Relative Asset- und Worker-Pfade
+funktionieren auch unter `/Rasterlabor/`. GitHub Pages braucht keinen Node-Server;
+die Verarbeitung ausgewaehlter Dateien erfolgt weiterhin lokal im Browser.
+
+## Lokal starten
+
 Voraussetzung: Node.js 20 oder neuer und aktuelles Microsoft Edge mit WebCodecs.
 Die folgenden Befehle im Verzeichnis `web` ausfuehren:
 
