@@ -1,0 +1,15 @@
+node_modules/
+dist/
+dist-pages/
+exports/
+test-results/
+playwright-report/
+*.log
+
+# Local recordings and calibration exports (root directory only).
+/*.mp4
+/*.zip
+/*.pdf
+/metadata.json
+/tracking.json
+/*.optimized.json
