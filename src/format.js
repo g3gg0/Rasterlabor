@@ -2,7 +2,7 @@ import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate';
 import { validateTracking } from './tracking-data.js';
 import { validSharpness } from './sharpness.js';
 
-const limit = 768 * 1024 * 1024;
+const limit = 1024 * 1024 * 1024;
 const littleEndian = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
 const definitions = {
   coefficients: ['float64', 8], forward: ['float32', 4], inverseX: ['float32', 4], inverseY: ['float32', 4],
