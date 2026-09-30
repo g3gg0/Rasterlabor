@@ -1,5 +1,6 @@
 import { Matrix } from 'ml-matrix';
 import { WebGpuRemapper } from './webgpu-native-remapper.js';
+import { requestSelectedGpuAdapter } from './webgpu-selection.js';
 
 const pyramidShader = /* wgsl */ `
 struct Params { width: u32, height: u32, outputWidth: u32, outputHeight: u32, mode: u32, maskWidth: u32, cellSize: u32, masked: u32 }
@@ -144,14 +145,15 @@ export class WebGpuContextTracker {
 
   releaseRemap() {
     for (const resource of this.nativeRemapper?.resources ?? []) resource.destroy();
-    this.nativeRemapper = null; this.nativeMaps = null;
+    this.nativeRemapper = null; this.nativeMaps = null; this.nativeSourceMask = null;
+    this.nativeSourceMaskRevision = null;
   }
 
   async ready() {
     if (this.failure) return false;
     if (!this.initializing) this.initializing = (async () => {
       if (!globalThis.navigator?.gpu) throw new Error('WebGPU nicht verfuegbar');
-      const adapter = await navigator.gpu.requestAdapter();
+      const adapter = await requestSelectedGpuAdapter();
       if (!adapter) throw new Error('Kein WebGPU-Adapter');
       const storageLimit = Math.min(adapter.limits.maxStorageBufferBindingSize, 256 * 1024 * 1024);
       const device = await adapter.requestDevice({ requiredLimits: { maxStorageBufferBindingSize: storageLimit,
@@ -231,12 +233,15 @@ export class WebGpuContextTracker {
       try {
         if (image.frame) {
           const remapStarted = performance.now();
-          if (this.nativeMaps !== image.maps) {
+          if (this.nativeMaps !== image.maps || this.nativeSourceMask !== image.sourceMask ||
+              this.nativeSourceMaskRevision !== image.sourceMask?.revision) {
             this.releaseRemap();
             if (Math.max(image.width, image.height) > this.device.limits.maxTextureDimension2D) throw new Error('Umfeldbild ueberschreitet GPU-Texturlimit.');
             this.nativeRemapper = new WebGpuRemapper(this.device);
-            await this.nativeRemapper.initializeRemap(image.maps);
+            await this.nativeRemapper.initializeRemap(image.maps, null, 0, image.brightness, image.sourceMask);
             this.nativeMaps = image.maps;
+            this.nativeSourceMask = image.sourceMask;
+            this.nativeSourceMaskRevision = image.sourceMask?.revision;
           }
           this.nativeRemapper.check();
           timing.nativeRemapSetupMs = performance.now() - remapStarted;
@@ -361,7 +366,7 @@ export class WebGpuContextTracker {
       const values = new Float32Array(readback.getMappedRange()).slice(); readback.unmap();
       if (!values.every(Number.isFinite)) throw new Error('Ungueltige GPU-Messung');
       const [count, sumFirst, sumSecond, squareFirst, squareSecond, product] = values;
-      if (count < 128 || count < samples.length * 0.8) return null;
+      if (count < 128 || count < samples.length * (step.minimumOverlapFraction ?? 0.2)) return null;
       const varianceFirst = squareFirst - sumFirst ** 2 / count; const varianceSecond = squareSecond - sumSecond ** 2 / count;
       if (Math.min(varianceFirst, varianceSecond) / count < 4) return null;
       const covariance = product - sumFirst * sumSecond / count; const gain = covariance / varianceFirst;

@@ -1,5 +1,11 @@
+import { onWebGpuSelectionChange, requestSelectedGpuAdapter } from './webgpu-selection.js';
+
 let contextPromise = null;
 let contextFailure = '';
+onWebGpuSelectionChange(() => {
+  const previous = contextPromise; contextPromise = null; contextFailure = '';
+  void previous?.then(value => value?.device?.destroy()).catch(() => {});
+});
 
 const shader = /* wgsl */ `
 struct Params {
@@ -66,7 +72,7 @@ fn correlate(@builtin(global_invocation_id) id: vec3<u32>) {
 async function context() {
   if (!contextPromise) contextPromise = (async () => {
     if (!globalThis.navigator?.gpu) return null;
-    const adapter = await navigator.gpu.requestAdapter();
+    const adapter = await requestSelectedGpuAdapter();
     if (!adapter) return null;
     const device = await adapter.requestDevice();
     const module = device.createShaderModule({ code: shader });

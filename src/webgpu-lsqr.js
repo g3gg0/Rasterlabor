@@ -1,4 +1,10 @@
+import { onWebGpuSelectionChange, requestSelectedGpuAdapter } from './webgpu-selection.js';
+
 let contextPromise = null;
+onWebGpuSelectionChange(() => {
+  const previous = contextPromise; contextPromise = null;
+  void previous?.then(value => value?.device?.destroy()).catch(() => {});
+});
 
 const shader = /* wgsl */ `
 struct Params {
@@ -235,7 +241,7 @@ fn finishSolution(@builtin(global_invocation_id) id: vec3<u32>) {
 async function context() {
   if (!navigator.gpu) throw new Error('WebGPU wird von diesem Browser nicht bereitgestellt.');
   if (!contextPromise) contextPromise = (async () => {
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    const adapter = await requestSelectedGpuAdapter();
     if (!adapter) throw new Error('Kein WebGPU-Adapter verfuegbar.');
     let device;
     try {

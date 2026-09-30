@@ -1,3 +1,5 @@
+import { getWebGpuSelection } from './webgpu-selection.js';
+
 export class WorkerClient {
   constructor(url, onProgress = () => {}) {
     this.worker = new Worker(url, { type: 'module' });
@@ -20,7 +22,7 @@ export class WorkerClient {
     return new Promise((resolve, reject) => {
       const id = ++this.sequence;
       this.pending.set(id, { resolve, reject });
-      this.worker.postMessage({ id, type, ...payload }, transfer);
+      this.worker.postMessage({ id, type, ...payload, gpuSelection: getWebGpuSelection() }, transfer);
     });
   }
   terminate() {

@@ -52,6 +52,28 @@ export function trackingVideoCompatible(tracking, video) {
   return true;
 }
 
+export function removeUnselectedTrackingFrames(tracking, selectedFrames, reduction) {
+  if (!tracking?.path?.length || !(selectedFrames instanceof Set) || !selectedFrames.size) {
+    throw new Error('Keine registrierten Frames zum Entfernen ausgewaehlt.');
+  }
+  const path = tracking.path.filter(entry => selectedFrames.has(entry.frame)).map(entry => {
+    const kept = { ...entry };
+    if (entry.incrementalMatch && !selectedFrames.has(entry.incrementalMatch.frame)) delete kept.incrementalMatch;
+    if (entry.context) {
+      const context = { ...entry.context };
+      if (Array.isArray(context.matches)) context.matches = context.matches.filter(match => selectedFrames.has(match?.frame));
+      if (Array.isArray(context.inliers)) context.inliers = context.inliers.filter(frame => selectedFrames.has(frame));
+      if (Array.isArray(context.matches)) context.selected = context.matches.length;
+      if (context.loopClosure && !selectedFrames.has(context.loopClosure.anchorFrame)) delete context.loopClosure;
+      delete context.spatialConfirmation;
+      kept.context = context;
+    }
+    return kept;
+  });
+  if (path.length !== selectedFrames.size) throw new Error('Die Auswahl enthaelt unbekannte Trackingframes.');
+  return { ...tracking, path, failures: [], reduction };
+}
+
 export function validateTracking(tracking, fallbackVideo = null) {
   if (tracking == null) return null;
   if (tracking.format !== 'rasterlabor-xyr-tracking' || tracking.model_version !== 1 || !Array.isArray(tracking.path)) {

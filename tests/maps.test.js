@@ -35,6 +35,16 @@ test('raw-frame inclusion masks follow inverse maps into rectified coordinates',
   assert.deepEqual([target.sourceWidth, target.sourceHeight, target.cellSize, target.revision], [2, 2, 1, 7]);
 });
 
+test('rectification rejects every bilinear source footprint touching the unselected raw border', () => {
+  const image = { width: 4, height: 3, data: new Uint8ClampedArray(4 * 3 * 4).fill(255) };
+  const mask = createPatchMask(4, 3, 1);
+  for (const [x, y] of [[1, 0], [2, 0], [1, 1], [2, 1]]) mask.data[y * mask.width + x] = 1;
+  const maps = { outputWidth: 2, outputHeight: 1, valid: new Uint8Array([1, 1]),
+    inverseX: new Float32Array([1.5, 2.5]), inverseY: new Float32Array([0.5, 0.5]) };
+  const output = remapRGBA(image, maps, mask);
+  assert.deepEqual([...output.data], [255, 255, 255, 255, 0, 0, 0, 0]);
+});
+
 test('dense inverse, coverage mask, signed forward coordinates and lossless ZIP roundtrip', async () => {
   const field = createSpline(48, 40, 24, [1, 0.04, 0, 1, -10, -8]);
   const frames = Array.from({ length: 4 }, (_, id) => ({ id, timestamp: id * 100000,

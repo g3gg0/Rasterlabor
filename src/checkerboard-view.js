@@ -35,7 +35,7 @@ export function installCheckerboardView({ canvas, getState, redraw }) {
     if (!Number.isFinite(step) || step < 10 || step > Math.min(state.image.width, state.image.height) / 2) {
       field('status').textContent = 'Ungueltige Feldkante'; return;
     }
-    const request = ++revision; const client = new WorkerClient('/compute-worker.js'); worker = client;
+    const request = ++revision; const client = new WorkerClient('./compute-worker.js'); worker = client;
     field('run').disabled = true; field('step').disabled = true; field('cancel').hidden = false;
     field('status').textContent = 'Schachbrettsuche laeuft ...';
     try {

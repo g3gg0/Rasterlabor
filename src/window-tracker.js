@@ -1,6 +1,6 @@
 import FFT from 'fft.js';
 
-function transform2d(values, width, height, inverse = false) {
+export function transform2d(values, width, height, inverse = false) {
   const output = values.slice();
   for (const vertical of [false, true]) {
     const length = vertical ? height : width;

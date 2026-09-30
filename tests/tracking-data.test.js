@@ -1,6 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applyLoopClosure, validateTracking, trackingReferenceCounts, trackingVideoCompatible } from '../src/tracking-data.js';
+import { applyLoopClosure, removeUnselectedTrackingFrames, validateTracking, trackingReferenceCounts, trackingVideoCompatible } from '../src/tracking-data.js';
+
+test('frame reduction removes discarded registrations and their references from saved data', () => {
+  const source = { path: [
+    { frame: 1, timestamp: 1 },
+    { frame: 2, timestamp: 2, incrementalMatch: { frame: 1 }, context: { matches: [{ frame: 1 }, { frame: 3 }], inliers: [1, 3], selected: 2, loopClosure: { anchorFrame: 1 } } },
+    { frame: 3, timestamp: 3 }], failures: [{ frame: 4 }] };
+  const reduced = removeUnselectedTrackingFrames(source, new Set([2, 3]), { divisions: 5, minimum: 2 });
+  assert.deepEqual(reduced.path.map(entry => entry.frame), [2, 3]);
+  assert.deepEqual(reduced.path[0].context.matches.map(match => match.frame), [3]);
+  assert.deepEqual(reduced.path[0].context.inliers, [3]);
+  assert.equal(reduced.path[0].context.selected, 1);
+  assert.equal(reduced.path[0].incrementalMatch, undefined);
+  assert.equal(reduced.path[0].context.loopClosure, undefined);
+  assert.deepEqual(reduced.failures, []);
+  assert.deepEqual(source.path[1].context.inliers, [1, 3]);
+});
 
 test('renamed legacy videos remain compatible when geometry and frame range match', () => {
   const tracking = { video: { name: 'original.mp4', width: 2160, height: 3840 }, path: [{ frame: 27_019 }] };

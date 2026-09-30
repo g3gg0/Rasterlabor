@@ -2,6 +2,7 @@ import { createFile, DataStream } from 'mp4box';
 import { orientationFromMatrix } from './video-orientation.js';
 import { measureFrameSharpness } from './sharpness.js';
 import { decodeFrontiers } from './decode-order.js';
+import { setWebGpuSelection } from './webgpu-selection.js';
 
 let file = null;
 let samples = [];
@@ -249,6 +250,7 @@ let queue = Promise.resolve();
 self.onmessage = ({ data }) => {
   queue = queue.then(async () => {
     try {
+      setWebGpuSelection(data.gpuSelection ?? 'default');
       const result = data.type === 'open' ? await openVideo(data.file) : await decodeFrame(data.index, data.type === 'native-frame', data.useWebGpu, data.measureSharpness !== false);
       self.postMessage({ id: data.id, result }, result.frame ? [result.frame] : result.bitmap ? [result.bitmap] : []);
     } catch (error) { self.postMessage({ id: data.id, error: error.message }); }

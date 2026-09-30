@@ -1,4 +1,5 @@
 import { WebGpuOverlay } from './webgpu-overlay.js';
+import { requestSelectedGpuAdapter } from './webgpu-selection.js';
 import { sharpestFramesFirst } from './path-support.js';
 import { blurriestFramesFirst, selectMergeFrames } from './merge-plan.js';
 
@@ -40,9 +41,9 @@ export function closeOverlayTiles(overlay) {
 
 export async function renderTiledOverlay({ maps, width, height, minX, minY, geometries, pixelAllowed,
   decode, cancelled = () => false, progress = () => {}, tileSize = null, maxFrames = 0, edgeFeather = 0.1,
-  brightness = null, frameOrder = 'existing', blend = 'average', tileReady = null, retainTiles = true }) {
+  brightness = null, frameOrder = 'existing', blend = 'average', tileReady = null, retainTiles = true, renderer: sharedRenderer = null }) {
   if (tileSize === null) {
-    const adapter = await navigator.gpu?.requestAdapter();
+    const adapter = await requestSelectedGpuAdapter();
     if (!adapter) throw new Error('Keine WebGPU-GPU verfuegbar.');
     tileSize = overlayTileSize(maps, adapter.limits.maxTextureDimension2D);
   }
@@ -59,8 +60,10 @@ export async function renderTiledOverlay({ maps, width, height, minX, minY, geom
     if (!plan.length || cancelled()) return null;
     const setup = performance.now();
     // One full-resolution remap and one tile accumulator, reused for the entire mosaic.
-    renderer = await WebGpuOverlay.create(maps, Math.min(tileSize, width), Math.min(tileSize, height), minX, minY,
+    renderer = sharedRenderer || await WebGpuOverlay.create(maps, Math.min(tileSize, width), Math.min(tileSize, height), minX, minY,
       pixelAllowed, maxFrames, edgeFeather, brightness);
+    await renderer.resizeOutput(Math.min(tileSize, width), Math.min(tileSize, height));
+    renderer.maxFrames = maxFrames;
     output.setupMs = performance.now() - setup;
     for (const [tileIndex, tile] of plan.entries()) {
       if (cancelled()) return null;
@@ -70,6 +73,12 @@ export async function renderTiledOverlay({ maps, width, height, minX, minY, geom
         progress({ tileIndex, tileCount: plan.length, frameIndex, frameCount: tile.geometries.length,
           framePass: output.framePasses + 1, plannedFramePasses, frame: geometry.entry.frame, tileSize });
         const start = performance.now();
+        const operation = mergeSelection ? blend === 'sharp-over' ? 4 : 5 : 0;
+        if (await renderer.addCachedFrame(geometry, operation)) {
+          output.gpuMs += performance.now() - start;
+          output.frameMs += performance.now() - start; output.framePasses++;
+          continue;
+        }
         const decoded = await decode(geometry.entry.frame);
         output.decodeMs += performance.now() - start;
         try {
@@ -95,7 +104,7 @@ export async function renderTiledOverlay({ maps, width, height, minX, minY, geom
     completed = true;
     return output;
   } finally {
-    renderer?.destroy();
+    if (!sharedRenderer) renderer?.destroy();
     if (!completed) closeOverlayTiles(output);
   }
 }

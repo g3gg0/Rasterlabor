@@ -44,10 +44,16 @@ fn measure(@builtin(global_invocation_id) id: vec3u, @builtin(local_invocation_i
   }
 }`;
 
+import { onWebGpuSelectionChange, requestSelectedGpuAdapter } from './webgpu-selection.js';
+
 let contextPromise = null;
+onWebGpuSelectionChange(() => {
+  const previous = contextPromise; contextPromise = null;
+  void previous?.then(value => value?.device?.destroy()).catch(() => {});
+});
 async function context() {
   if (!contextPromise) contextPromise = (async () => {
-    const adapter = await navigator.gpu?.requestAdapter();
+    const adapter = await requestSelectedGpuAdapter();
     if (!adapter) return null;
     const device = await adapter.requestDevice();
     const sampleModule = device.createShaderModule({code: sampleShader});

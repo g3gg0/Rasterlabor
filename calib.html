@@ -5,15 +5,16 @@
 	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<meta name="color-scheme" content="light">
 	<title>Rasterlabor | Mikroskopkalibrierung</title>
-	<link rel="stylesheet" href="/app.css">
-	<script type="module" src="/app.js"></script>
+	<link rel="stylesheet" href="./app.css">
+	<script type="module" src="./app.js"></script>
 </head>
 <body>
 	<header class="app-header">
 		<div class="identity"><span class="brand-mark"><i data-lucide="scan-line"></i></span><div><h1>Rasterlabor</h1><span>Mikroskopkalibrierung</span></div></div>
 		<div class="header-actions"><span class="local-state"><i data-lucide="hard-drive"></i> Lokal</span>
 			<details class="image-adjustments"><summary title="Globale Bildoptionen" aria-label="Globale Bildoptionen"><i data-lucide="sliders-horizontal"></i></summary><div class="adjustment-panel" role="group" aria-label="Globale Bildoptionen">
-				<label class="check" title="Verwendet WebGPU in allen unterstuetzten Arbeitsschritten; bei Problemen wird automatisch die CPU verwendet."><input id="globalUseWebGpu" type="checkbox" checked> WebGPU-Beschleunigung</label>
+				<label class="gpu-selection">WebGPU-Ger&auml;t <select id="globalGpuAdapter" aria-describedby="globalGpuStatus" disabled><option value="none">Keine</option><option value="default" selected>Adapter werden gepr&uuml;ft&hellip;</option></select></label>
+				<p id="globalGpuStatus" class="gpu-status" role="status">WebGPU-Adapter werden gepr&uuml;ft.</p>
 				<label>Helligkeit <input id="previewBrightness" type="range" min="-100" max="100" step="1" value="0"><span id="previewBrightnessValue">0</span></label>
 				<label>Kontrast <input id="previewContrast" type="range" min="0" max="300" step="1" value="100"><span id="previewContrastValue">100%</span></label>
 				<label>Gamma <input id="previewGamma" type="range" min="0.1" max="3" step="0.05" value="1"><span id="previewGammaValue">1.00</span></label>
@@ -28,22 +29,17 @@
 			<button id="openVideo" title="Video &ouml;ffnen" aria-label="Video &ouml;ffnen"><i data-lucide="folder-open"></i><span>Video &ouml;ffnen</span></button>
 			<button id="importButton" title="Kalibrierung laden" aria-label="Kalibrierung laden"><i data-lucide="upload"></i></button>
 			<button id="exportButton" title="Kalibrierung speichern" aria-label="Kalibrierung speichern" disabled><i data-lucide="download"></i></button>
-			<div id="correctionDataStatus" class="correction-data-status" role="status" aria-label="Korrekturdaten im Datensatz">
-				<span id="lensDataStatus" class="correction-led">Linse</span>
-				<span id="trackingDataStatus" class="correction-led">XYR</span>
-				<span id="brightnessDataStatus" class="correction-led" title="Helligkeitskorrektur: noch nicht implementiert">Helligkeit</span>
-			</div>
 			<button id="correctedVideoButton" title="Korrigiertes Video speichern" aria-label="Korrigiertes Video speichern" disabled><i data-lucide="file-video"></i><span>Korrigiertes Video speichern</span></button>
 			<button id="infoButton" title="Kalibrierinformationen" aria-label="Kalibrierinformationen"><i data-lucide="info"></i></button>
 		</div>
 		<input id="videoFile" type="file" accept="video/mp4,.mp4,.m4v,.mov" hidden>
-		<input id="calibrationFile" type="file" accept=".zip" hidden>
+		<input id="calibrationFile" type="file" accept=".zip,.json" hidden>
 		<input id="brightnessFile" type="file" accept=".rbright" hidden>
 	</header>
 	<nav class="workflow-tabs" role="tablist" aria-label="Arbeitsbereich">
-		<button role="tab" aria-selected="true" data-workflow="calibration"><i data-lucide="scan-line"></i> Linsenkalibrierung</button>
-		<button role="tab" aria-selected="false" data-workflow="tracking"><i data-lucide="route"></i> Tracking</button>
-		<button id="brightnessWorkflow" role="tab" aria-selected="false" data-workflow="brightness"><i data-lucide="sun-medium"></i> Helligkeitskorrektur</button>
+		<button role="tab" aria-selected="true" data-workflow="calibration"><i data-lucide="scan-line"></i> Linsenkalibrierung <span id="lensDataStatus" class="correction-led workflow-status-led"></span></button>
+		<button id="brightnessWorkflow" role="tab" aria-selected="false" data-workflow="brightness"><i data-lucide="sun-medium"></i> Helligkeitskorrektur <span id="brightnessDataStatus" class="correction-led workflow-status-led"></span></button>
+		<button role="tab" aria-selected="false" data-workflow="tracking"><i data-lucide="route"></i> Tracking <span id="trackingDataStatus" class="correction-led workflow-status-led"></span></button>
 		<button id="mergeWorkflow" role="tab" aria-selected="false" data-workflow="merge"><i data-lucide="layers-3"></i> Merge</button>
 	</nav>
 	<div id="message" role="status" hidden></div>
@@ -130,16 +126,70 @@
 				<section class="image-pane"><div class="pane-heading"><h2>Tracking-Frame</h2><div class="view-tools"><button id="trackingZoomOut" title="Verkleinern" aria-label="Verkleinern"><i data-lucide="zoom-out"></i></button><span id="trackingZoomValue">100%</span><button id="trackingZoomIn" title="Vergroe&szlig;ern" aria-label="Vergroe&szlig;ern"><i data-lucide="zoom-in"></i></button><button id="trackingFitView" title="Ansicht einpassen" aria-label="Ansicht einpassen"><i data-lucide="maximize"></i></button><span id="trackingPreviewState">Noch nicht gestartet</span></div></div><div class="canvas-host"><canvas id="trackingPreviewCanvas" aria-label="Aktueller entzerrter Frame mit Tracking-Fenster"></canvas><div id="trackingPreviewEmpty" class="empty-state"><i data-lucide="focus"></i><span>Tracking starten</span></div></div></section>
 				<section class="image-pane"><div class="pane-heading"><h2>XY-Pfad</h2><span id="trackingPathState">0 Posen</span></div><div class="canvas-host"><canvas id="trackingPathCanvas" aria-label="Stabilisierter Kamerabewegungspfad"></canvas><div id="trackingPathEmpty" class="empty-state"><i data-lucide="route"></i><span>Noch kein Bewegungspfad</span></div></div></section>
 			</div>
+			<nav class="workflow-tabs tracking-action-tabs" role="tablist" aria-label="Tracking-Ansichten">
+				<button id="trackingTabPoses" type="button" role="tab" aria-controls="trackingPosesPanel" aria-selected="true" tabindex="0" data-tracking-tab="poses">Posen</button>
+				<button id="trackingTabOverlay" type="button" role="tab" aria-controls="trackingOverlayPane" aria-selected="false" tabindex="-1" data-tracking-tab="overlay">Frame-&Uuml;berlagerung</button>
+				<button id="trackingTabMatch" type="button" role="tab" aria-controls="trackingMatchPanel" aria-selected="false" tabindex="-1" data-tracking-tab="match">Matchdiagnose <span id="trackingMatchTabFrame"></span></button>
+				<button id="trackingTabOptimization" type="button" role="tab" aria-controls="trackingOptimizationPanel" aria-selected="false" tabindex="-1" data-tracking-tab="optimization">Optimization</button>
+			</nav>
+            <div class="match-network-controls" aria-label="Dauerhaftes Match-Netz">
+              <label><input id="trackingNetworkShow" type="checkbox" checked>Match-Netz anzeigen</label>
+              <label><input id="trackingNetworkAll" type="checkbox">Gesamtes Netz</label>
+              <label>Bildverbindung<select id="trackingNetworkPair"><option value="">Verbindung ausw&auml;hlen</option></select></label>
+              <label>Messpunkt<select id="trackingNetworkCell"><option value="">Alle Messpunkte</option></select></label>
+              <button id="trackingNetworkDeleteCell" type="button" disabled>Messpunkt l&ouml;schen</button>
+              <button id="trackingNetworkDeletePair" type="button" disabled>Bildverbindung l&ouml;schen</button>
+              <button id="trackingNetworkUndo" type="button" disabled>L&ouml;schen r&uuml;ckg&auml;ngig</button>
+            </div>
+            <p id="trackingNetworkInfo" class="path-info" aria-live="polite">Noch keine best&auml;tigten Verbindungen. Messpunkte oder Verbindungslinien im XY-Pfad anklicken.</p>
+
 			<p id="trackingPathInfo" class="path-info">Maus im Canvas: Bildrechtecke anzeigen. Klicken: Frames an dieser Position &uuml;berlagern.</p>
-            <section id="trackingOverlayPane" class="image-pane" hidden>
-				<div class="pane-heading"><h2>Frame-&Uuml;berlagerung</h2><div class="overlay-controls"><label>Frames je Bereich<input id="trackingOverlayMaxFrames" type="number" min="1" max="64" step="1" value="3" title="Ungefaehr die n schaerfsten Frames je raeumlichem Bereich anhand der Tracking-Posen"></label><label>Ansicht<select id="trackingOverlayFrame" disabled><option value="">Mischbild</option></select></label><button id="trackingOverlayInspect" disabled title="Ausgewaehlten Frame und seine Referenzmatches untersuchen"><i data-lucide="scan-search"></i><span>Pr&uuml;fen</span></button><button id="trackingPathRefit" disabled title="Pose-Netz ab dieser Auswahl robust nachoptimieren"><i data-lucide="git-compare-arrows"></i><span>Pfad nachoptimieren</span></button><button id="trackingPathRefitApply" disabled><i data-lucide="check"></i><span>&Uuml;bernehmen</span></button><button id="trackingPathRefitDiscard" disabled><i data-lucide="x"></i><span>Verwerfen</span></button><button id="trackingOverlayFit">Einpassen</button></div></div>
-				<div class="refit-adjustments" aria-label="Vorverarbeitung fuer lokalen Refit"><label>Helligkeit<input id="refitBrightness" type="range" min="-100" max="100" step="1" value="0"><output id="refitBrightnessValue">0</output></label><label>Kontrast<input id="refitContrast" type="range" min="25" max="300" step="1" value="100"><output id="refitContrastValue">100%</output></label><label>Gamma<input id="refitGamma" type="range" min="0.2" max="3" step="0.05" value="1"><output id="refitGammaValue">1.00</output></label><label>Rot<input id="refitRed" type="range" min="0" max="200" step="1" value="30"><output id="refitRedValue">30</output></label><label>Gr&uuml;n<input id="refitGreen" type="range" min="0" max="200" step="1" value="59"><output id="refitGreenValue">59</output></label><label>Blau<input id="refitBlue" type="range" min="0" max="200" step="1" value="11"><output id="refitBlueValue">11</output></label><label>Bereich<input id="refitRegion" type="range" min="10" max="100" step="5" value="40"><output id="refitRegionValue">40%</output></label><label>Randbreite<input id="overlayEdgeFeather" type="range" min="0" max="50" step="1" value="10"><output id="overlayEdgeFeatherValue">10%</output></label><label class="refit-preview-toggle"><input id="refitPreprocessPreview" type="checkbox"><span>Matcherbild anzeigen</span></label><button id="refitPreprocessReset" title="Refit-Vorverarbeitung zuruecksetzen" aria-label="Refit-Vorverarbeitung zuruecksetzen"><i data-lucide="rotate-ccw"></i></button></div>
+			<section id="trackingPosesPanel" role="tabpanel" aria-labelledby="trackingTabPoses" class="observations tracking-observations"><div class="section-heading"><h2>Posen</h2><span id="trackingSummary">0 Frames</span></div><div class="table-scroll"><table><thead><tr><th>Frame / PTS</th><th>X, px</th><th>Y, px</th><th>Rotation</th><th>Match / RMS</th><th>Sch&auml;rfe</th><th title="Wie viele andere Frames diesen Frame als Umfeldreferenz angefordert haben, inklusive verworfener Matches">Als Referenz</th><th title="Anzahl selbst angeforderter Umfeldreferenzen, inklusive verworfener Matches; ohne den inkrementellen Fenstermatch">Eigene Referenzen</th></tr></thead><tbody id="trackingTable"><tr><td colspan="8" class="muted">Noch keine Posen</td></tr></tbody></table></div></section>
+            <section id="trackingOverlayPane" class="image-pane tracking-tab-panel" role="tabpanel" aria-labelledby="trackingTabOverlay" hidden>
+				<p id="trackingOverlayEmpty" class="path-info">Position im XY-Pfad anklicken, um die dort liegenden Frames zu &uuml;berlagern.</p>
+				<div class="pane-heading"><h2>Frame-&Uuml;berlagerung</h2><div class="overlay-controls"><label>Frames je Bereich<input id="trackingOverlayMaxFrames" type="number" min="1" max="64" step="1" value="3" title="Ungefaehr die n schaerfsten Frames je raeumlichem Bereich anhand der Tracking-Posen"></label><label>Ansicht<select id="trackingOverlayFrame" disabled><option value="">Mischbild</option></select></label><button id="trackingOverlayInspect" disabled title="Ausgewaehlten Frame und seine Referenzmatches untersuchen"><i data-lucide="scan-search"></i><span>Pr&uuml;fen</span></button><button id="trackingOverlayPoseApply" disabled title="Verschobene Frame-Pose uebernehmen"><i data-lucide="check"></i><span>Frame &uuml;bernehmen</span></button><button id="trackingOverlayPoseDiscard" disabled title="Frame-Verschiebung verwerfen"><i data-lucide="x"></i><span>Verwerfen</span></button><button id="trackingPathRefit" disabled title="Pose-Netz ab dieser Auswahl robust nachoptimieren"><i data-lucide="git-compare-arrows"></i><span>Pfad nachoptimieren</span></button><button id="trackingPathRefitApply" disabled><i data-lucide="check"></i><span>&Uuml;bernehmen</span></button><button id="trackingPathRefitDiscard" disabled><i data-lucide="x"></i><span>Verwerfen</span></button><button id="trackingOverlayFit">Einpassen</button></div></div>
+							<div class="refit-adjustments" aria-label="Vorverarbeitung fuer lokalen Refit"><label>Helligkeit<input id="refitBrightness" type="range" min="-100" max="100" step="1" value="0"><output id="refitBrightnessValue">0</output></label><label>Kontrast<input id="refitContrast" type="range" min="25" max="300" step="1" value="100"><output id="refitContrastValue">100%</output></label><label>Gamma<input id="refitGamma" type="range" min="0.2" max="3" step="0.05" value="1"><output id="refitGammaValue">1.00</output></label><label>Rot<input id="refitRed" type="range" min="0" max="200" step="1" value="30"><output id="refitRedValue">30</output></label><label>Gr&uuml;n<input id="refitGreen" type="range" min="0" max="200" step="1" value="59"><output id="refitGreenValue">59</output></label><label>Blau<input id="refitBlue" type="range" min="0" max="200" step="1" value="11"><output id="refitBlueValue">11</output></label><label>Bereich<input id="refitRegion" type="range" min="10" max="100" step="5" value="100"><output id="refitRegionValue">100%</output></label><label>Randbreite<input id="overlayEdgeFeather" type="range" min="0" max="50" step="1" value="10"><output id="overlayEdgeFeatherValue">10%</output></label><label class="refit-preview-toggle"><input id="refitPreprocessPreview" type="checkbox"><span>Matcherbild anzeigen</span></label><button id="refitPreprocessReset" title="Refit-Vorverarbeitung zuruecksetzen" aria-label="Refit-Vorverarbeitung zuruecksetzen"><i data-lucide="rotate-ccw"></i></button></div>
                 <p id="trackingOverlayInfo" class="path-info" aria-live="polite"></p>
                 <p id="trackingPathRefitInfo" class="path-info" aria-live="polite">Kein Refit-Vorschlag.</p>
                 <div class="canvas-host"><canvas id="trackingOverlayCanvas" aria-label="Ausgerichtete Frames; Mausrad zum Zoomen, Ziehen zum Verschieben"></canvas></div>
-				<p class="path-info">Mausrad: Zoom am Mauszeiger &middot; Ziehen: Verschieben &middot; Einzelbild ausw&auml;hlen und &bdquo;Pr&uuml;fen&ldquo; &ouml;ffnet dessen Referenzmatches &middot; Die Ansicht verwendet die gemessenen Posen ohne erneute Bildregistrierung.</p>
+				<p class="path-info">Die Ansicht verwendet die gemessenen Posen ohne erneute Bildregistrierung.</p>
             </section>
-			<section class="observations tracking-observations"><div class="section-heading"><h2>Posen</h2><span id="trackingSummary">0 Frames</span></div><div class="table-scroll"><table><thead><tr><th>Frame / PTS</th><th>X, px</th><th>Y, px</th><th>Rotation</th><th>Match / RMS</th><th>Sch&auml;rfe</th><th title="Wie viele andere Frames diesen Frame als Umfeldreferenz angefordert haben, inklusive verworfener Matches">Als Referenz</th><th title="Anzahl selbst angeforderter Umfeldreferenzen, inklusive verworfener Matches; ohne den inkrementellen Fenstermatch">Eigene Referenzen</th></tr></thead><tbody id="trackingTable"><tr><td colspan="8" class="muted">Noch keine Posen</td></tr></tbody></table></div></section>
+			<section id="trackingMatchPanel" class="tracking-tab-panel" role="tabpanel" aria-labelledby="trackingTabMatch" hidden><p id="trackingMatchEmpty" class="path-info">Pose ausw&auml;hlen, um ihre gespeicherten Referenzmatches zu untersuchen.</p></section>
+			<section id="trackingOptimizationPanel" class="tracking-tab-panel" role="tabpanel" aria-labelledby="trackingTabOptimization" hidden><h2>Globale Optimierung</h2><div class="tracking-planned-grid"><article class="pcb-realignment-card"><h3>PCB-Realignment</h3>
+<p>R&auml;umliche Keyframes, Paarmessungen, Pose-Graph und Korrekturinterpolation. WebGPU sucht grobe Korrekturen und pr&uuml;ft strukturarme Bildbereiche; FFT-Messzellen und R&uuml;ckweg pr&uuml;fen die Paarpose. Fehlende zeitliche Verbindungen werden mit reduzierten Zwischenframes erneut gemessen.</p>
+<div class="frame-reduction-controls">
+<label>Keyframe-Abstand (Bildkanten)<input id="pcbSpacing" type="number" min="0.02" max="2" step="0.05" value="0.3"></label>
+<label>Wendewinkel (Grad)<input id="pcbTurnDegrees" type="number" min="1" max="180" step="1" value="25"></label>
+<label>Wiederbesuch (Frames)<input id="pcbRevisitGap" type="number" min="1" max="100000" step="1" value="256"></label>
+<label>Nachbarn je Keyframe<input id="pcbMaxNeighbors" type="number" min="1" max="16" step="1" value="4"></label>
+<label>Paarbudget<input id="pcbMaxPairs" type="number" min="1" max="100000" step="1" value="2048"></label>
+<label>Brückenpaar-Budget<input id="pcbBridgeBudget" type="number" min="0" max="100000" step="1" value="2048" title="Zusätzliche Nachbarpaare aus reduzierten Frames zwischen abgelehnten zeitlichen Keyframes"></label>
+<label>Suchradius (px)<input id="pcbSearchRadius" type="number" min="4" max="256" step="1" value="128"></label>
+<label>GPU-Grobsuche (px)<input id="pcbCoarseRadius" type="number" min="128" max="2048" step="32" value="384" title="Maximale Posenkorrektur bei durch FFT nicht bestätigten Paaren"></label>
+<label>GPU-Mindestüberlappung (%)<input id="pcbCoarseOverlap" type="number" min="1" max="50" step="1" value="5"></label>
+<label>Winkel (Grad)<input id="pcbSearchAngle" type="number" min="0.1" max="10" step="0.1" value="2"></label>
+<label>FFT-Zellkante (px)<input id="pcbFftCellSize" type="number" min="16" max="256" step="16" value="256"></label>
+<label>FFT-Zellen je Achse<input id="pcbFftCells" type="number" min="2" max="8" step="1" value="3"></label>
+<label>FFT-Mindest-PSR<input id="pcbFftPsr" type="number" min="2" max="30" step="0.5" value="6"></label>
+<label>FFT-Konsens (px)<input id="pcbFftResidual" type="number" min="1" max="20" step="0.5" value="15"></label>
+<label>R&uuml;ckweggrenze (px)<input id="pcbCycleLimit" type="number" min="0.1" max="50" step="0.1" value="20"></label>
+<label>FFT-R&uuml;ckwegfaktor<input id="pcbFftCycleFactor" type="number" min="1" max="3" step="0.1" value="2" title="Bei beidseitig best&auml;tigter FFT und GPU: R&uuml;ckweg bis zum Faktor des FFT-Residuums, maximal 12 px"></label>
+<label>Mindest-NCC<input id="pcbMinScore" type="number" min="0" max="1" step="0.01" value="0.9"></label>
+<label>Mindestens Strukturpixel<input id="pcbMinSupport" type="number" min="16" max="1000000" step="16" value="128"></label>
+<label>Matching-Helligkeit (%)<input id="pcbBrightness" type="number" min="-100" max="100" step="1" value="0"></label>
+<label>Matching-Kontrast (%)<input id="pcbContrast" type="number" min="25" max="300" step="1" value="100"></label>
+<label>Matching-Gamma<input id="pcbGamma" type="number" min="0.2" max="3" step="0.05" value="1"></label>
+<label>Graphiterationen<input id="pcbIterations" type="number" min="1" max="50" step="1" value="8"></label>
+<label>Zwischenframes lokal pr&uuml;fen<input id="pcbLocalBudget" type="number" min="0" max="100000" step="1" value="64"></label>
+<label>Huber-Skala (px)<input id="pcbHuber" type="number" min="0.1" max="1000" step="1" value="20"></label>
+</div><div class="frame-reduction-controls">
+<button id="pcbRealignStart" type="button">Berechnen</button><button id="pcbRealignPause" type="button" disabled>Pause</button><button id="pcbRealignResume" type="button" disabled>Fortsetzen</button><button id="pcbRealignStep" type="button" disabled>Ein Paar messen</button><button id="pcbRealignCancel" type="button" disabled>Abbrechen</button><button id="pcbRealignApply" type="button" disabled>Korrigierte Posen &uuml;bernehmen</button><button id="pcbRealignDiscard" type="button" disabled>Vorschlag verwerfen</button><button id="pcbRealignUndo" type="button" disabled>Posekorrektur r&uuml;ckg&auml;ngig</button>
+</div><p id="pcbRealignStatus" role="status" aria-live="polite">Noch nicht berechnet.</p><details id="pcbRealignDetails" hidden><summary>Diagnose</summary><label>Bildpaar<select id="pcbPairSelect" aria-label="PCB-Bildpaar"></select></label><p id="pcbPairSummary" class="status-line"></p><div class="pcb-diagnostic-grid"><div><strong>Messzellen und Verschiebungen</strong><canvas id="pcbCellCanvas" width="512" height="320" aria-label="PCB-Messzellen"></canvas></div><div><strong>Vorher</strong><canvas id="pcbPairBefore" width="512" height="320" aria-label="Bildpaar vor Posekorrektur"></canvas></div><div><strong>Nachher</strong><canvas id="pcbPairAfter" width="512" height="320" aria-label="Bildpaar nach Posekorrektur"></canvas></div></div><details><summary>Messdaten als JSON</summary><pre id="pcbRealignDiagnostics"></pre></details></details></article><article class="fine-alignment-card"><h3>Feinoptimierung aller Frames</h3>
+<p>Kleine Positions- und Rotationsfehler korrigieren. Jedes Frame wird mit nahen Nachbarn gepr&uuml;ft; gespeicherte Anker halten best&auml;tigte Strukturen zusammen.</p>
+<div class="button-row"><label>Suchradius (Pixel)<input id="fineRadius" type="number" min="2" max="12" step="1" value="6"></label><button id="fineStart" type="button">Alle Frames feinjustieren</button><button id="fineCancel" type="button" disabled>Stop / Teilresultat</button><button id="fineApply" type="button" disabled>Vorschlag &uuml;bernehmen</button><button id="fineDiscard" type="button" disabled>Verwerfen</button><button id="fineUndo" type="button" disabled>R&uuml;ckg&auml;ngig</button></div>
+<p id="fineStatus" role="status" aria-live="polite">Noch kein Feindurchlauf.</p><p id="fineWorst"></p>
+<p>Schlechteste Pr&uuml;fung je Frame: Rot = unsicher/fehlgeschlagen, Orange bis Gr&uuml;n = steigende Korrelation. Auswahl &ouml;ffnet das Frame zur manuellen Anpassung in der &Uuml;berlagerung. Ungemessene Frames werden nicht als gute Matches gewertet.</p>
+<div id="fineDropdown" class="fine-dropdown"><button id="fineFrames" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="fineList" disabled>Frame ausw&auml;hlen</button><div id="finePopup" class="fine-popup" hidden><label>Framenummer filtern<input id="fineFilter" type="search" autocomplete="off"></label><div id="fineList" role="listbox" aria-label="Frames, schlechteste Matches zuerst"></div></div></div></article><article><h3>Framereduzierung</h3><p>Die sch&auml;rfsten Frames, die jeden Quadratblock vollst&auml;ndig abdecken.</p><div class="frame-reduction-controls"><label>Teilung N<input id="frameReductionDivisions" type="number" min="1" max="50" step="1" value="5" title="Blockkante = k&uuml;rzere Seite des nutzbaren entzerrten Bildinhalts geteilt durch N"></label><label>Bilder je Block M<input id="frameReductionMinimum" type="number" min="1" max="100" step="1" value="3"></label><button id="frameReductionCalculate" type="button">Auswahl berechnen</button><button id="frameReductionApply" type="button" disabled>Nicht ausgew&auml;hlte Frames entfernen</button><button id="frameReductionUndo" type="button" disabled>Entfernung r&uuml;ckg&auml;ngig</button></div><p id="frameReductionStatus" role="status" aria-live="polite">Noch keine Auswahl berechnet.</p><details id="frameReductionDetails" hidden><summary>Verbleibende Frames</summary><div id="frameReductionFrames" class="frame-reduction-list"></div></details></article></div></section>
 		</main>
 	</div>
 	<div class="workspace" data-workflow-panel="brightness" hidden>
@@ -153,7 +203,7 @@
 				<div class="action-row"><button id="brightnessPause" disabled><i data-lucide="pause"></i> Pause</button><button id="brightnessResume" disabled><i data-lucide="play"></i> Fortsetzen</button></div>
 				<button id="brightnessReset" class="wide" disabled><i data-lucide="rotate-ccw"></i> Zur&uuml;cksetzen</button>
 				<div class="action-row"><button id="brightnessSave" disabled title="Helligkeitsfeld speichern" aria-label="Helligkeitsfeld speichern"><i data-lucide="download"></i></button><button id="brightnessLoad" title="Helligkeitsfeld laden" aria-label="Helligkeitsfeld laden"><i data-lucide="upload"></i></button><button id="brightnessDisable" disabled><i data-lucide="power"></i> Deaktivieren</button></div>
-				<div id="brightnessStatus" class="status-line" aria-live="polite">Tracking mit mehreren &Uuml;berlappungen erforderlich.</div>
+				<div id="brightnessStatus" class="status-line" aria-live="polite">G&uuml;ltige Linsenkalibrierung und mindestens f&uuml;nf akzeptierte Checkerboard-Frames erforderlich.</div>
 			</section>
 		</aside>
 		<main><div class="video-strip"><div><strong>Relative Helligkeitsverteilung</strong><span>Nach geometrischer Entzerrung</span></div><span id="brightnessMetrics">Keine Messung</span></div>
@@ -166,8 +216,13 @@
 				<label>Mischverfahren<select id="mergeBlend"><option value="sharp-over">Scharfe Frames dar&uuml;ber</option><option value="average">Top-Frames mitteln</option></select></label>
 				<label>Scharfe Frames je Pixel<input id="mergeMaxFrames" type="number" min="1" max="64" step="1" value="3"></label>
 				<label>Rand&uuml;berblendung, %<input id="mergeEdgeFeather" type="number" min="0" max="50" step="1" value="10"></label>
-				<button id="mergeStart" class="primary wide" disabled><i data-lucide="download"></i> BigTIFF erstellen</button>
+				<label>Aufteilung<select id="mergeSplit"><option value="0">Eine TIFF-Datei (Standard)</option><option value="512">Automatisch, max. 512 MiB je TIFF</option><option value="two">Zwei TIFF-Streifen</option><option value="256">Max. 256 MiB je TIFF</option><option value="1024">Max. 1 GiB je TIFF</option></select></label>
+				<label>Speichern<select id="mergeSaveMethod"><option value="download">Browser-Download (auch eingebettet)</option><option value="picker">Dateidialog (eine TIFF-Datei)</option></select></label>
+				<button id="mergeStart" class="primary wide" disabled><i data-lucide="download"></i> Komprimiertes BigTIFF erstellen</button>
 				<button id="mergeCancel" class="wide" disabled><i data-lucide="square"></i> Abbrechen</button>
+				<div id="mergeDownloads"></div>
+				<details id="mergeJoin" hidden><summary>TIFF-Teile unter Linux zusammenf&uuml;gen</summary><pre id="mergeJoinCommand" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre></details>
+				<button id="mergeSavePreview" class="wide" disabled>PNG-&Uuml;bersicht speichern (bis 4096 px)</button>
 				<div id="mergeStatus" class="status-line" aria-live="polite">Tracking und zugeh&ouml;riges Video erforderlich.</div>
 			</section>
 		</aside>

@@ -27,10 +27,12 @@ export function localSelectionMask(geometry, point, diameterFraction = 0.4, base
   const mask = createPatchMask(geometry.width, geometry.height, baseMask?.cellSize);
   const center = geometry.local(point);
   const radius = Math.min(geometry.width, geometry.height) * Math.max(0.1, Math.min(1, diameterFraction)) / 2;
+  const fullImage = diameterFraction >= 1;
   for (let row = 0; row < mask.height; row++) for (let column = 0; column < mask.width; column++) {
     const x = Math.min(mask.sourceWidth - 1, (column + 0.5) * mask.cellSize);
     const y = Math.min(mask.sourceHeight - 1, (row + 0.5) * mask.cellSize);
-    if ((x - center.x) ** 2 + (y - center.y) ** 2 <= radius ** 2 && (!baseMask || maskIncludes(baseMask, x, y))) {
+    if ((fullImage || (x - center.x) ** 2 + (y - center.y) ** 2 <= radius ** 2) &&
+        (!baseMask || maskIncludes(baseMask, x, y))) {
       mask.data[row * mask.width + column] = MASK_SEARCH;
     }
   }
@@ -48,13 +50,14 @@ export function localSelectionSupport(geometry, point, diameterFraction = 0.4, b
   const { width, height } = geometry;
   const center = geometry.local(point);
   const radius = Math.min(width, height) * Math.max(0.1, Math.min(1, diameterFraction)) / 2;
+  const fullImage = diameterFraction >= 1;
   const cellSize = baseMask?.cellSize ?? Math.max(4, Math.ceil(Math.max(width, height) / 512));
   const stride = Math.max(1, Math.ceil(Math.sqrt(width * height / 6000)));
   let support = 0;
   for (let row = 2; row < height - 2; row += stride) for (let column = 2; column < width - 2; column += stride) {
     const x = Math.min(width - 1, (Math.floor(column / cellSize) + 0.5) * cellSize);
     const y = Math.min(height - 1, (Math.floor(row / cellSize) + 0.5) * cellSize);
-    if ((x - center.x) ** 2 + (y - center.y) ** 2 <= radius ** 2 &&
+    if ((fullImage || (x - center.x) ** 2 + (y - center.y) ** 2 <= radius ** 2) &&
         (!baseMask || maskIncludes(baseMask, x, y)) && (!pixelAllowed || pixelAllowed(column, row))) support++;
   }
   return support;

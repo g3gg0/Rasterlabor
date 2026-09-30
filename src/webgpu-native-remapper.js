@@ -1,4 +1,5 @@
 import { edgeFeatherMask } from './path-support.js';
+import { requestSelectedGpuAdapter } from './webgpu-selection.js';
 
 // Full-resolution remap and weighted accumulation. Pixel data stays on the GPU.
 const vertex = /* wgsl */ `
@@ -14,6 +15,13 @@ struct Orientation { axes: vec4f, translationSize: vec4f }
 @group(0) @binding(3) var<uniform> orientation: Orientation;
 @group(0) @binding(4) var edgeMask: texture_2d<f32>;
 @group(0) @binding(5) var gainMap: texture_2d<f32>;
+@group(0) @binding(6) var sourceMask: texture_2d<f32>;
+@group(0) @binding(7) var<uniform> maskInfo: vec4f;
+fn sourceAllowed(p: vec2f) -> bool {
+  if (maskInfo.w == 0.0) { return true; }
+  if (p.x < 0.0 || p.y < 0.0 || p.x >= maskInfo.x || p.y >= maskInfo.y) { return false; }
+  return textureLoad(sourceMask, vec2i(p / maskInfo.z), 0).r > 0.5;
+}
 fn readSource(p: vec2f) -> vec3f {
   let v = p + vec2f(0.5) - orientation.translationSize.xy;
   let coded = vec2f(dot(orientation.axes.xy, v), dot(orientation.axes.zw, v));
@@ -29,6 +37,8 @@ fn toSrgb(value: vec3f) -> vec3f {
   let p = textureLoad(map, vec2i(position.xy), 0).xy;
   if (p.x < 0 || p.y < 0) { return vec4f(0); }
   let q = floor(p); let f = fract(p);
+  if (!sourceAllowed(q) || !sourceAllowed(q + vec2f(1, 0)) ||
+      !sourceAllowed(q + vec2f(0, 1)) || !sourceAllowed(q + vec2f(1, 1))) { return vec4f(0); }
   let rgb = mix(mix(readSource(q), readSource(q + vec2f(1, 0)), f.x),
     mix(readSource(q + vec2f(0, 1)), readSource(q + vec2f(1, 1)), f.x), f.y);
   let edge = textureLoad(edgeMask, vec2i(position.xy), 0).r;
@@ -38,15 +48,15 @@ fn toSrgb(value: vec3f) -> vec3f {
 
 // Shared native VideoFrame -> rectified full-resolution GPU surface.
 export class WebGpuRemapper {
-  static async create(maps, brightness = null) {
-    const adapter = await navigator.gpu?.requestAdapter();
+  static async create(maps, brightness = null, sourceMask = null) {
+    const adapter = await requestSelectedGpuAdapter();
     if (!adapter) throw new Error('Keine WebGPU-GPU verfuegbar.');
     if (Math.max(maps.outputWidth, maps.outputHeight) > adapter.limits.maxTextureDimension2D)
       throw new Error('Entzerrung ueberschreitet das GPU-Texturlimit.');
     const device = await adapter.requestDevice({ requiredLimits: {
       maxTextureDimension2D: adapter.limits.maxTextureDimension2D, maxBufferSize: adapter.limits.maxBufferSize } });
     const result = new WebGpuRemapper(device);
-    try { await result.initializeRemap(maps, null, 0, brightness); return result; }
+    try { await result.initializeRemap(maps, null, 0, brightness, sourceMask); return result; }
     catch (error) { result.destroy(); throw error; }
   }
   constructor(device) {
@@ -57,7 +67,7 @@ export class WebGpuRemapper {
   resource(value) { this.resources.push(value); return value; }
   buffer(size, usage) { return this.resource(this.device.createBuffer({ size, usage })); }
   check() { if (this.failure) throw new Error(this.failure.message); }
-  async initializeRemap(maps, allowed = null, edgeFeather = 0, brightness = maps.brightness ?? null) {
+  async initializeRemap(maps, allowed = null, edgeFeather = 0, brightness = maps.brightness ?? null, sourceMask = null) {
     const d = this.device;
     this.width = maps.outputWidth; this.height = maps.outputHeight;
     const remapModule = d.createShaderModule({code: remapShader});
@@ -67,7 +77,9 @@ export class WebGpuRemapper {
       { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } },
       { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
       { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
-      { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } }
+      { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } },
+      { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+      { binding: 7, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }
     ] });
     this.remapPipeline = await d.createRenderPipelineAsync({ layout: d.createPipelineLayout({ bindGroupLayouts: [remapLayout] }),
       vertex: { module: remapModule, entryPoint: 'vertex' }, fragment: { module: remapModule, entryPoint: 'remap', targets: [{ format: 'rgba8unorm' }] } });
@@ -103,6 +115,19 @@ export class WebGpuRemapper {
     for (let row = 0; row < maps.outputHeight; row++) gainUpload.set(
       gain.subarray(row * maps.outputWidth, (row + 1) * maps.outputWidth), row * gainBytesPerRow / 4);
     d.queue.writeTexture({ texture: this.gainMap }, gainUpload, { bytesPerRow: gainBytesPerRow }, [maps.outputWidth, maps.outputHeight]);
+    const maskWidth = sourceMask?.width ?? 1, maskHeight = sourceMask?.height ?? 1;
+    this.sourceMask = this.resource(d.createTexture({ size: [maskWidth, maskHeight], format: 'r8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST }));
+    const maskStride = Math.ceil(maskWidth / 256) * 256;
+    const maskUpload = new Uint8Array(maskStride * maskHeight);
+    if (sourceMask?.data) {
+      for (let row = 0; row < maskHeight; row++) for (let col = 0; col < maskWidth; col++)
+        maskUpload[row * maskStride + col] = sourceMask.data[row * maskWidth + col] === 1 ? 255 : 0;
+    } else maskUpload[0] = 255;
+    d.queue.writeTexture({ texture: this.sourceMask }, maskUpload, { bytesPerRow: maskStride }, [maskWidth, maskHeight]);
+    this.maskInfo = this.buffer(16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    d.queue.writeBuffer(this.maskInfo, 0, new Float32Array(sourceMask ?
+      [sourceMask.sourceWidth, sourceMask.sourceHeight, sourceMask.cellSize, 1] : [0, 0, 1, 0]));
     this.rectified = this.resource(d.createTexture({ size: [maps.outputWidth, maps.outputHeight], format: 'rgba8unorm',
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC }));
     this.orientationBuffer = this.buffer(32, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
@@ -119,7 +144,8 @@ export class WebGpuRemapper {
     const bindGroup = d.createBindGroup({ layout: this.remapPipeline.getBindGroupLayout(0), entries: [
       { binding: 0, resource: external }, { binding: 1, resource: this.nearestSampler },
       { binding: 2, resource: this.map.createView() }, { binding: 3, resource: { buffer: this.orientationBuffer } },
-      { binding: 4, resource: this.edgeMask.createView() }, { binding: 5, resource: this.gainMap.createView() }
+      { binding: 4, resource: this.edgeMask.createView() }, { binding: 5, resource: this.gainMap.createView() },
+      { binding: 6, resource: this.sourceMask.createView() }, { binding: 7, resource: { buffer: this.maskInfo } }
     ] });
     const remap = command.beginRenderPass({ colorAttachments: [{ view: this.rectified.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0] }] });
     remap.setPipeline(this.remapPipeline); remap.setBindGroup(0, bindGroup); remap.draw(3); remap.end();

@@ -27,7 +27,7 @@ export function installTrackingInspector({ readFrame, getMask, busy, drawImage =
       <button type="submit"><i data-lucide="rotate-cw"></i> Paar erneut pruefen</button></form>
       <label>Ergebnis<select data-role="experiment"></select></label>
     </div>`;
-  document.getElementById('trackingTable').closest('section').after(root);
+  document.getElementById('trackingMatchPanel').append(root);
   const field = name => root.querySelector(`[data-role="${name}"]`);
   const canvas = field('canvas');
   let selectedEntry = null; let selectedMatch = null; let currentImage = null; let referenceImage = null;
@@ -167,7 +167,7 @@ export function installTrackingInspector({ readFrame, getMask, busy, drawImage =
     const request = revision;
     const limits = Object.fromEntries(['radius', 'angle', 'reverseRadius'].map(key => [key, Number(form.elements[key].value)]));
     limits.coarseStep = form.elements.coarseStep.checked ? 1 : 0;
-    worker = new WorkerClient('/compute-worker.js'); const client = worker;
+    worker = new WorkerClient('./compute-worker.js'); const client = worker;
     form.querySelector('button').disabled = true; field('status').textContent = 'Debugversuch laeuft (CPU, gespeicherte Laufmaske) ...';
     try {
       const current = await createImageBitmap(currentImage); const reference = await createImageBitmap(referenceImage);

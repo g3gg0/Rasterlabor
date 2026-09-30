@@ -1,4 +1,10 @@
-import { applyLoopClosure, trackingReferenceCounts, trackingVideoCompatible } from './tracking-data.js';
+import { planPcbOverlapChecks } from './pcb-overlap-checks.js';
+import { importOptimizedProject } from './optimized-project.js';
+import { networkGeometryKey, emptyMatchNetwork, migrateMatchNetwork, mergeNetworkMatches,
+  deleteNetworkMatch, networkEdges, applyNetworkToGraph, projectNetworkCells } from './match-network.js';
+import { installFineAlignment } from './fine-ui.js';
+import { pairStiffness } from './pair-stiffness.js';
+import { applyLoopClosure, removeUnselectedTrackingFrames, trackingReferenceCounts, trackingVideoCompatible } from './tracking-data.js';
 import './style.css';
 import { createIcons, icons } from 'lucide';
 import { WorkerClient } from './rpc.js';
@@ -10,19 +16,25 @@ import { relativeCoverageScale } from './maps.js';
 import { createPatchMask, MASK_FORBIDDEN, MASK_NEUTRAL, MASK_SEARCH, maskIncludes, paintPatchMask, remapInclusionMask } from './patch-mask.js';
 import { analyzeObservations, selectConsistentFrames } from './observation-diagnostics.js';
 import { fitCameraPose, stabilizePose } from './motion-tracking.js';
-import { frameGeometry, localSelectionMask, localSelectionDistance, localSelectionSupport, supportColor, applyPixelMask, edgeFeatherMask, edgeFeatherWeight, applyEdgeFeather, accumulateFrame, approximateTopFrames, averagedFrames, sharpestFramesFirst, sparsePathFrames, pointBounds, evenlySpaced } from './path-support.js';
+import { frameGeometry, localSelectionMask, supportColor, applyPixelMask, edgeFeatherMask, edgeFeatherWeight, applyEdgeFeather, accumulateFrame, approximateTopFrames, averagedFrames, sharpestFramesFirst, sparsePathFrames, pointBounds, evenlySpaced } from './path-support.js';
 import { FrameReader } from './frame-reader.js';
 import { installTrackingInspector } from './tracking-inspector.js';
 import { installCheckerboardView } from './checkerboard-view.js';
 import { checkerboardCells } from './checkerboard-analysis.js';
 import { WebGpuOverlay } from './webgpu-overlay.js';
+import { discoverWebGpuAdapters, getWebGpuSelection, requestSelectedGpuAdapter,
+  setWebGpuSelection } from './webgpu-selection.js';
 import { renderTiledOverlay, closeOverlayTiles, overlayTiles, overlayTileSize } from './overlay-tiles.js';
-import { applyPoseCorrection, buildPoseGraph, localRefitGroups, searchLocalRefit } from './pose-graph-refit.js';
+import { measuredRefitComponent, addLocalRefitEdges, buildPoseGraph, planFocusedRefitPairs, planRefitBridgePairs } from './pose-graph-refit.js';
 import { refitColorMatrix } from './refit-preprocess.js';
 import { brightnessDisplayRange, brightnessFieldPixels, decodeBrightnessCalibration, encodeBrightnessCalibration } from './brightness-calibration.js';
 import { fitCheckerboardBrightness, sampleCheckerboardBrightness } from './checkerboard-brightness.js';
 import { mergeBounds, mergeEstimate, selectMergeFrames } from './merge-plan.js';
-import { beginBigTiff } from './bigtiff-writer.js';
+import { reduceFramesByBlocks } from './frame-reduction.js';
+import { acceptedPcbConstraints, composePose, interpolatePcbPoses, pcbRunFingerprint, planPcbPairs, selectPcbIntermediateFrames,
+  selectPcbKeyframes, planPcbTemporalBridges, planPcbTemporalSkips } from './pcb-realignment.js';
+import { planTiffParts, beginTiffParts, tiffJoinCommand } from './tiff-parts.js';
+import { createBrowserImageFile } from './browser-image-file.js';
 
 createIcons({ icons });
 const element = id => document.getElementById(id);
@@ -37,9 +49,9 @@ const coverageImage = document.createElement('canvas');
 const residualImage = document.createElement('canvas');
 const rectifiedImage = document.createElement('canvas');
 const observationImage = document.createElement('canvas');
-let decoder = new WorkerClient('/decoder-worker.js', showProgress);
-const computer = new WorkerClient('/compute-worker.js', showProgress);
-let trackingComputer = new WorkerClient('/compute-worker.js', showProgress);
+let decoder = new WorkerClient('./decoder-worker.js', showProgress);
+const computer = new WorkerClient('./compute-worker.js', showProgress);
+let trackingComputer = new WorkerClient('./compute-worker.js', showProgress);
 let videoInfo = null;
 let expectedVideo = null;
 let videoUrl = null;
@@ -49,7 +61,13 @@ let calibration = null;
 let brightnessCalibration = null;
 const frameReader = new FrameReader({ getDecoder: () => decoder, getMaps: () => calibration?.maps, getBrightness: () => brightnessCalibration, computer,
   onFallback: error => console.warn('FrameReader: CPU-Fallback:', error.message) });
-const useWebGpu = () => element('globalUseWebGpu').checked;
+const useWebGpu = () => getWebGpuSelection() !== 'none';
+let gpuAdapterReady = false;
+function updateGpuAdapterControl() {
+  element('globalGpuAdapter').disabled = !gpuAdapterReady || taskBusy || continuous || rectifiedPlayback ||
+    navigationBusy || trackingRunning || trackingPreviewBusy || pcbBusy || pathRefitBusy ||
+    mergeRunning || overlayGpuInFlight > 0;
+}
 const readFrame = (index, options = {}) => frameReader.read(index, { gpu: useWebGpu(), ...options });
 const readTrackingFrame = (index, options = {}) => frameReader.read(index, { gpu: useWebGpu(), ...options });
 let snapshotFrames = [];
@@ -63,6 +81,8 @@ let continuous = false;
 let cancelRequested = false;
 let revalidating = false;
 let taskBusy = false;
+let fineUi = null;
+let fineBusy = false;
 let navigationBusy = false;
 let stale = false;
 let detectionsStale = false;
@@ -134,6 +154,1014 @@ let brightnessSession = null;
 let trackingNextIndex = 0;
 let trackingNeedsSeed = false;
 let trackingPath = [];
+let pcbBusy = false;
+let pcbCancelled = false;
+let pcbPauseRequested = false;
+let pcbStepRemaining = 0;
+let pcbResume = null;
+let pcbWorker = null;
+let pcbProposal = null;
+let pcbUndo = null;
+let pcbLastDiagnostics = null;
+function pcbParameters() {
+  const parameters = { spacing: number('pcbSpacing', 0.3), turnDegrees: number('pcbTurnDegrees', 25),
+    revisitGap: number('pcbRevisitGap', 256), maxNeighbors: number('pcbMaxNeighbors', 4),
+    maxPairs: number('pcbMaxPairs', 2048), bridgeBudget: number('pcbBridgeBudget', 2048),
+    radius: number('pcbSearchRadius', 128),
+    coarseRadius: number('pcbCoarseRadius', 384),
+    coarseOverlap: number('pcbCoarseOverlap', 5) / 100,
+    angle: number('pcbSearchAngle', 2), cycleLimit: number('pcbCycleLimit', 5),
+    fftCycleFactor: number('pcbFftCycleFactor', 2),
+    cellSize: number('pcbFftCellSize', 256), cellsPerAxis: number('pcbFftCells', 3),
+    minimumPsr: number('pcbFftPsr', 6), residualLimit: number('pcbFftResidual', 6),
+    minimumScore: number('pcbMinScore', 0.9), minimumSupport: number('pcbMinSupport', 128),
+    iterations: number('pcbIterations', 8), localBudget: number('pcbLocalBudget', 64),
+    huber: number('pcbHuber', 20),
+    brightness: number('pcbBrightness', 0) / 100, contrast: number('pcbContrast', 100) / 100,
+    gamma: number('pcbGamma', 1) };
+  if (!(parameters.radius >= 4 && parameters.radius <= 256 && parameters.angle >= 0.1 && parameters.angle <= 10 &&
+      parameters.coarseRadius >= 128 && parameters.coarseRadius <= 2048 &&
+      parameters.coarseOverlap >= 0.01 && parameters.coarseOverlap <= 0.5 &&
+      parameters.cycleLimit > 0 && parameters.cycleLimit <= 50 && parameters.minimumScore >= 0 && parameters.minimumScore <= 1 &&
+      parameters.fftCycleFactor >= 1 && parameters.fftCycleFactor <= 3 &&
+      Number.isInteger(parameters.minimumSupport) && parameters.minimumSupport >= 16 && parameters.minimumSupport <= 1000000 &&
+      Number.isInteger(parameters.iterations) && parameters.iterations >= 1 && parameters.iterations <= 50 &&
+      Number.isInteger(parameters.localBudget) && parameters.localBudget >= 0 && parameters.localBudget <= 100000 &&
+      Number.isInteger(parameters.bridgeBudget) && parameters.bridgeBudget >= 0 && parameters.bridgeBudget <= 100000 &&
+      parameters.huber > 0 && parameters.huber <= 1000 &&
+      Number.isInteger(parameters.cellSize) && parameters.cellSize >= 16 && parameters.cellSize <= 256 &&
+      Number.isInteger(parameters.cellsPerAxis) && parameters.cellsPerAxis >= 2 && parameters.cellsPerAxis <= 8 &&
+      parameters.minimumPsr >= 2 && parameters.minimumPsr <= 30 &&
+      parameters.residualLimit >= 1 && parameters.residualLimit <= 20 &&
+      parameters.brightness >= -1 && parameters.brightness <= 1 &&
+      parameters.contrast >= 0.25 && parameters.contrast <= 3 && parameters.gamma >= 0.2 && parameters.gamma <= 3))
+    throw new Error('Ungueltige PCB-Realignment-Parameter.');
+  return parameters;
+}
+function updatePcbControls() {
+  updateGpuAdapterControl();
+  element('pcbRealignStart').disabled = pcbBusy || trackingRunning || taskBusy || pathRefitBusy;
+  element('pcbRealignPause').disabled = !pcbBusy || pcbPauseRequested;
+  element('pcbRealignResume').disabled = !pcbBusy || !pcbPauseRequested;
+  element('pcbRealignStep').disabled = !pcbBusy || !pcbPauseRequested;
+  element('pcbRealignCancel').disabled = !pcbBusy;
+  element('pcbRealignApply').disabled = pcbBusy || !pcbProposal;
+  element('pcbRealignDiscard').disabled = pcbBusy || !pcbProposal;
+  element('pcbRealignUndo').disabled = pcbBusy || !pcbUndo;
+}
+async function waitForPcbResume() {
+  if (!pcbPauseRequested) return;
+  text('pcbRealignStatus', 'Pausiert. Fortsetzen oder ein Paar messen.');
+  await new Promise(resolve => { pcbResume = resolve; });
+  pcbResume = null;
+  if (pcbCancelled) throw new Error('PCB-Realignment abgebrochen.');
+}
+function invalidatePcbProposal() {
+  pcbProposal = null;
+  updatePcbControls(); drawTrackingPath();
+}
+let pcbDiagnosticRevision = 0;
+let pcbSelectedMatch = null;
+const pcbPairView = { images: [], match: null, offsets: [], zoom: 1, panX: 0, panY: 0 };
+let pcbCellMatch = null;
+let pcbSelectedCellId = null;
+let pcbCellTargets = [];
+const pcbCellView = { zoom: 1, panX: 0, panY: 0 };
+function clampPcbCellView(canvas) {
+  const maxPanX = Math.max(0, (canvas.width - 64) * (pcbCellView.zoom - 1) / 2);
+  const maxPanY = Math.max(0, (canvas.height - 64) * (pcbCellView.zoom - 1) / 2);
+  pcbCellView.panX = Math.max(-maxPanX, Math.min(maxPanX, pcbCellView.panX));
+  pcbCellView.panY = Math.max(-maxPanY, Math.min(maxPanY, pcbCellView.panY));
+}
+function selectedPcbCell() {
+  return pcbCellMatch?.fft?.cells?.find(cell => cell.cellId === pcbSelectedCellId) ?? null;
+}
+function pcbCellSize() {
+  const source = pcbProposal ?? pcbLastDiagnostics ?? trackingDataset?.pcbRealignment;
+  return pcbCellMatch?.fft?.cellSize ?? source?.parameters?.cellSize ?? 256;
+}
+function releasePcbPairImages() {
+  pcbDiagnosticRevision++;
+  for (const bitmap of pcbPairView.images) bitmap.close();
+  pcbPairView.images = [];
+  pcbPairView.offsets = [];
+}
+function pcbDiagnosticPairs() {
+  const source = pcbProposal ?? pcbLastDiagnostics ?? trackingDataset?.pcbRealignment;
+  return [...(source?.pairDiagnostics ?? []), ...(source?.localDiagnostics ?? [])];
+}
+function drawPcbCells(match) {
+  if (pcbCellMatch !== match) {
+    pcbSelectedCellId = null;
+    Object.assign(pcbCellView, { zoom: 1, panX: 0, panY: 0 });
+  }
+  pcbCellMatch = match;
+  pcbCellTargets = [];
+  const canvas = element('pcbCellCanvas'), context = canvas.getContext('2d');
+  clampPcbCellView(canvas);
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = '#f7faf8'; context.fillRect(0, 0, canvas.width, canvas.height);
+  const cells = match.fft?.cells ?? [];
+  if (!cells.length) { context.fillStyle = '#52635b'; context.fillText(match.fft?.reason ?? 'Keine Messzellen', 18, 25); return; }
+  const minX = Math.min(...cells.map(cell => cell.center.x)), maxX = Math.max(...cells.map(cell => cell.center.x));
+  const minY = Math.min(...cells.map(cell => cell.center.y)), maxY = Math.max(...cells.map(cell => cell.center.y));
+  const scaleX = (canvas.width - 64) / Math.max(1, maxX - minX);
+  const scaleY = (canvas.height - 64) / Math.max(1, maxY - minY);
+  const px = value => canvas.width / 2 + (value - (minX + maxX) / 2) * scaleX * pcbCellView.zoom + pcbCellView.panX;
+  const py = value => canvas.height / 2 + (value - (minY + maxY) / 2) * scaleY * pcbCellView.zoom + pcbCellView.panY;
+  const inliers = new Set(match.fft?.inlierCells ?? []);
+  for (const cell of cells) {
+    const x = px(cell.center.x), y = py(cell.center.y);
+    const structure = Math.max(1, Math.min(15, cell.structureRms ?? cell.texture ?? 1));
+    const diameter = 3 + (structure - 1) / 14 * 17;
+    const radius = diameter / 2;
+    pcbCellTargets.push({ x, y, radius, cellId: cell.cellId });
+    const color = inliers.has(cell.cellId) ? '#08765f' :
+      cell.reason === 'Maske oder Rand' ? '#89938f' :
+        cell.reason === 'Nicht ausgewaehlt' ? '#5796c8' :
+          cell.accepted ? '#ba7619' : '#b04949';
+    context.fillStyle = color; context.beginPath(); context.arc(x, y, radius, 0, Math.PI * 2); context.fill();
+    if (cell.cellId === pcbSelectedCellId) {
+      context.strokeStyle = '#143bcb'; context.lineWidth = 3;
+      context.beginPath(); context.arc(x, y, radius + 4, 0, Math.PI * 2); context.stroke();
+    }
+    if (Number.isFinite(cell.dx) && Number.isFinite(cell.dy)) {
+      const arrowScale = Math.min(8, scaleX, scaleY) * pcbCellView.zoom;
+      const endX = x + cell.dx * arrowScale, endY = y + cell.dy * arrowScale;
+      context.strokeStyle = color; context.lineWidth = 2; context.beginPath();
+      context.moveTo(x, y); context.lineTo(endX, endY); context.stroke();
+    }
+  }
+  renderPcbCellDetails();
+}
+function renderPcbCellDetails() {
+  const panel = element('pcbCellDetails'), cell = selectedPcbCell();
+  panel.hidden = !cell;
+  if (!cell) return;
+  const reason = cell.reason === 'Nicht ausgewaehlt' ? 'Nicht fuer FFT ausgewaehlt' :
+    cell.reason ?? (cell.accepted ? 'Messung verwendbar' : 'Nicht verwendbar');
+  const structure = cell.structureRms ?? cell.texture;
+  text('pcbCellDetailsStatus', `Zelle ${cell.cellId} | ${reason} | Struktur ${fixed(structure, 2)} | ` +
+    `PSR ${fixed(cell.psr, 2)} | eigene Strukturpixel ${Math.round(cell.ownedSupportPixels ?? 0)} | ` +
+    `Verschiebung (${fixed(cell.dx, 2)}, ${fixed(cell.dy, 2)}) px`);
+  const match = pcbCellMatch;
+  text('pcbCellReferenceLabel', `Referenz #${match.reference}`);
+  text('pcbCellCurrentLabel', `Frame #${match.current} vor Korrektur`);
+  const size = pcbCellSize();
+  for (const [index, id, pose] of [[0, 'pcbCellReference', match.referencePose],
+    [1, 'pcbCellCurrent', match.currentPose]]) {
+    const canvas = element(id), context = canvas.getContext('2d');
+    context.fillStyle = '#f7faf8'; context.fillRect(0, 0, canvas.width, canvas.height);
+    if (pcbPairView.images.length !== 2 || !pose) continue;
+    const scale = Math.min(canvas.width, canvas.height) / (size * 1.15);
+    context.save();
+    context.translate(canvas.width / 2, canvas.height / 2);
+    context.scale(scale, scale);
+    context.translate(-cell.center.x, -cell.center.y);
+    context.translate(pose.x, pose.y); context.rotate(pose.rotation);
+    drawAdjustedImage(context, pcbPairView.images[index],
+      pcbPairView.offsets[index][0], pcbPairView.offsets[index][1]);
+    context.restore();
+    context.strokeStyle = '#143bcb'; context.lineWidth = 1;
+    context.strokeRect((canvas.width - size * scale) / 2,
+      (canvas.height - size * scale) / 2, size * scale, size * scale);
+  }
+}
+function renderPcbPairImages() {
+  const { images, match, offsets, zoom, panX, panY } = pcbPairView;
+  const before = element('pcbPairBefore'), after = element('pcbPairAfter');
+  for (const [canvas, currentPose] of [[before, match?.currentPose], [after, match?.forward?.pose ?? match?.currentPose]]) {
+    const context = canvas.getContext('2d');
+    context.fillStyle = '#f7faf8'; context.fillRect(0, 0, canvas.width, canvas.height);
+    if (images.length !== 2 || !match?.referencePose || !currentPose) continue;
+    const scale = Math.min(canvas.width / (images[0].width * 1.4),
+      canvas.height / (images[0].height * 1.4)) * zoom;
+    context.save();
+    context.translate(canvas.width / 2 + panX, canvas.height / 2 + panY);
+    context.scale(scale, scale);
+    context.translate(-match.referencePose.x, -match.referencePose.y);
+    const drawImageAtPose = (bitmap, pose, imageOffset, alpha) => {
+      context.save(); context.globalAlpha = alpha;
+      context.translate(pose.x, pose.y); context.rotate(pose.rotation);
+      drawAdjustedImage(context, bitmap, imageOffset[0], imageOffset[1]);
+      context.restore();
+    };
+    drawImageAtPose(images[0], match.referencePose, offsets[0], 1);
+    drawImageAtPose(images[1], currentPose, offsets[1], 0.55);
+    const cell = selectedPcbCell();
+    if (cell && match === pcbCellMatch) {
+      const size = pcbCellSize();
+      context.strokeStyle = '#143bcb'; context.lineWidth = 2 / scale;
+      context.strokeRect(cell.center.x - size / 2, cell.center.y - size / 2, size, size);
+    }
+    context.restore();
+  }
+}
+function centerPcbPairOnSelectedCell() {
+  const cell = selectedPcbCell();
+  const { images, match, zoom } = pcbPairView;
+  if (!cell || images.length !== 2 || !match?.referencePose) return;
+  const canvas = element('pcbPairBefore');
+  const scale = Math.min(canvas.width / (images[0].width * 1.4),
+    canvas.height / (images[0].height * 1.4)) * zoom;
+  pcbPairView.panX = -(cell.center.x - match.referencePose.x) * scale;
+  pcbPairView.panY = -(cell.center.y - match.referencePose.y) * scale;
+}
+async function drawPcbPairImages(match) {
+  releasePcbPairImages();
+  const revision = pcbDiagnosticRevision;
+  Object.assign(pcbPairView, { images: [], match, offsets: [], zoom: 1, panX: 0, panY: 0 });
+  renderPcbPairImages();
+  if (!videoInfo || !calibration?.maps || !match.referencePose || !match.currentPose) return;
+  const images = [];
+  try {
+    for (const frame of [match.reference, match.current]) images.push((await readTrackingFrame(frame,
+      { rectified: true, sourceMask: pcbSourceMask() })).bitmap);
+    if (revision !== pcbDiagnosticRevision) return;
+    const offset = (frame, bitmap) => {
+      const entry = trackingPath.find(item => item.frame === frame);
+      return entry?.mode === 'window' ? [-bitmap.width / 2, -bitmap.height / 2] :
+        [calibration.maps.origin[0] - calibration.field.width / 2,
+          calibration.maps.origin[1] - calibration.field.height / 2];
+    };
+    pcbPairView.images = images.splice(0);
+    pcbPairView.offsets = [offset(match.reference, pcbPairView.images[0]),
+      offset(match.current, pcbPairView.images[1])];
+    centerPcbPairOnSelectedCell();
+    renderPcbPairImages();
+    renderPcbCellDetails();
+  } catch (error) {
+    if (revision === pcbDiagnosticRevision) text('pcbPairSummary', `Bildpaar konnte nicht geladen werden: ${error.message}`);
+  } finally { for (const bitmap of images) bitmap.close(); }
+}
+function installPcbPairZoom() {
+  const cellPanel = document.createElement('div');
+  cellPanel.id = 'pcbCellDetails'; cellPanel.hidden = true;
+  cellPanel.className = 'pcb-cell-details';
+  cellPanel.innerHTML = '<p id="pcbCellDetailsStatus" class="status-line"></p>' +
+    '<div class="pcb-cell-images"><div><strong id="pcbCellReferenceLabel"></strong>' +
+    '<canvas id="pcbCellReference" width="320" height="320" aria-label="Ausschnitt der Referenzzelle"></canvas></div>' +
+    '<div><strong id="pcbCellCurrentLabel"></strong>' +
+    '<canvas id="pcbCellCurrent" width="320" height="320" aria-label="Ausschnitt der aktuellen Zelle"></canvas></div></div>';
+  element('pcbRealignDetails').querySelector('.pcb-diagnostic-grid').after(cellPanel);
+  const cellCanvas = element('pcbCellCanvas');
+  cellCanvas.title = 'Mausrad: Zoom; ziehen: verschieben; Doppelklick: einpassen; Zelle anklicken: Bildausschnitte';
+  let cellDrag = null, suppressCellClick = false;
+  cellCanvas.addEventListener('wheel', event => {
+    event.preventDefault();
+    if (!pcbCellMatch) return;
+    const rect = cellCanvas.getBoundingClientRect();
+    const x = (event.clientX - rect.left) * cellCanvas.width / rect.width;
+    const y = (event.clientY - rect.top) * cellCanvas.height / rect.height;
+    const next = Math.max(1, Math.min(32, pcbCellView.zoom * Math.exp(-event.deltaY * 0.001)));
+    const factor = next / pcbCellView.zoom;
+    pcbCellView.panX = x - cellCanvas.width / 2 - (x - cellCanvas.width / 2 - pcbCellView.panX) * factor;
+    pcbCellView.panY = y - cellCanvas.height / 2 - (y - cellCanvas.height / 2 - pcbCellView.panY) * factor;
+    pcbCellView.zoom = next;
+    clampPcbCellView(cellCanvas);
+    drawPcbCells(pcbCellMatch);
+  }, { passive: false });
+  cellCanvas.addEventListener('pointerdown', event => {
+    suppressCellClick = false;
+    cellDrag = { x: event.clientX, y: event.clientY, moved: false };
+    cellCanvas.setPointerCapture(event.pointerId);
+  });
+  cellCanvas.addEventListener('pointermove', event => {
+    if (!cellDrag) return;
+    const dx = event.clientX - cellDrag.x, dy = event.clientY - cellDrag.y;
+    if (Math.abs(dx) + Math.abs(dy) > 2) cellDrag.moved = true;
+    const rect = cellCanvas.getBoundingClientRect();
+    pcbCellView.panX += dx * cellCanvas.width / rect.width;
+    pcbCellView.panY += dy * cellCanvas.height / rect.height;
+    clampPcbCellView(cellCanvas);
+    cellDrag.x = event.clientX; cellDrag.y = event.clientY;
+    if (cellDrag.moved && pcbCellMatch) drawPcbCells(pcbCellMatch);
+  });
+  cellCanvas.addEventListener('pointerup', () => {
+    suppressCellClick = Boolean(cellDrag?.moved); cellDrag = null;
+  });
+  cellCanvas.addEventListener('pointercancel', () => { cellDrag = null; });
+  cellCanvas.addEventListener('dblclick', () => {
+    Object.assign(pcbCellView, { zoom: 1, panX: 0, panY: 0 });
+    if (pcbCellMatch) drawPcbCells(pcbCellMatch);
+  });
+  cellCanvas.addEventListener('click', event => {
+    if (suppressCellClick) { suppressCellClick = false; return; }
+    const rect = cellCanvas.getBoundingClientRect();
+    const x = (event.clientX - rect.left) * cellCanvas.width / rect.width;
+    const y = (event.clientY - rect.top) * cellCanvas.height / rect.height;
+    const nearest = pcbCellTargets.map(target => ({ target,
+      distance: Math.hypot(target.x - x, target.y - y) }))
+      .sort((first, second) => first.distance - second.distance)[0];
+    pcbSelectedCellId = nearest?.distance <= Math.max(12, nearest.target.radius + 4) &&
+      nearest.target.cellId !== pcbSelectedCellId ?
+      nearest.target.cellId : null;
+    if (pcbCellMatch) drawPcbCells(pcbCellMatch);
+    if (pcbSelectedCellId !== null) centerPcbPairOnSelectedCell();
+    renderPcbPairImages();
+  });
+  for (const canvas of [element('pcbPairBefore'), element('pcbPairAfter')]) {
+    canvas.title = 'Mausrad: Zoom; ziehen: verschieben; Doppelklick: einpassen';
+    canvas.addEventListener('wheel', event => {
+      event.preventDefault();
+      if (pcbPairView.images.length !== 2) return;
+      const rect = canvas.getBoundingClientRect();
+      const x = (event.clientX - rect.left) * canvas.width / rect.width - canvas.width / 2;
+      const y = (event.clientY - rect.top) * canvas.height / rect.height - canvas.height / 2;
+      const next = Math.max(0.5, Math.min(64, pcbPairView.zoom * Math.exp(-event.deltaY * 0.001)));
+      const factor = next / pcbPairView.zoom;
+      pcbPairView.panX = x - (x - pcbPairView.panX) * factor;
+      pcbPairView.panY = y - (y - pcbPairView.panY) * factor;
+      pcbPairView.zoom = next;
+      renderPcbPairImages();
+    }, { passive: false });
+    let dragging = null;
+    canvas.addEventListener('pointerdown', event => {
+      if (pcbPairView.images.length !== 2) return;
+      dragging = { x: event.clientX, y: event.clientY };
+      canvas.setPointerCapture(event.pointerId);
+    });
+    canvas.addEventListener('pointermove', event => {
+      if (!dragging) return;
+      const rect = canvas.getBoundingClientRect();
+      pcbPairView.panX += (event.clientX - dragging.x) * canvas.width / rect.width;
+      pcbPairView.panY += (event.clientY - dragging.y) * canvas.height / rect.height;
+      dragging = { x: event.clientX, y: event.clientY };
+      renderPcbPairImages();
+    });
+    canvas.addEventListener('pointerup', () => { dragging = null; });
+    canvas.addEventListener('pointercancel', () => { dragging = null; });
+    canvas.addEventListener('dblclick', () => {
+      pcbPairView.zoom = 1; pcbPairView.panX = 0; pcbPairView.panY = 0;
+      renderPcbPairImages();
+    });
+  }
+}
+function refreshPcbPairDiagnostics() {
+  const pairs = pcbDiagnosticPairs(), select = element('pcbPairSelect');
+  const selected = pcbSelectedMatch;
+  select.replaceChildren();
+  for (const [index, pair] of pairs.entries()) {
+    const option = document.createElement('option');
+    option.value = String(index);
+    option.textContent = `#${pair.current} gegen #${pair.reference} (${pair.kind ?? 'lokal'})`;
+    select.append(option);
+  }
+  element('pcbRealignDetails').hidden = pairs.length === 0;
+  if (!pairs.length) {
+    pcbSelectedMatch = null;
+    releasePcbPairImages();
+    return;
+  }
+  const selectedIndex = pairs.findIndex(pair => pair === selected ||
+    (selected && pair.reference === selected.reference && pair.current === selected.current &&
+      pair.kind === selected.kind));
+  select.value = String(Math.max(0, selectedIndex));
+  const show = () => {
+    const match = pairs[Number(select.value)] ?? pairs[0];
+    pcbSelectedMatch = match;
+    const effectiveCycleLimit = match.fftGpuVerification?.accepted ?
+      Math.max((pcbProposal ?? pcbLastDiagnostics ?? trackingDataset?.pcbRealignment)?.parameters?.cycleLimit ?? 5,
+        match.fftGpuVerification.cycleLimit ?? 0) :
+      (pcbProposal ?? pcbLastDiagnostics ?? trackingDataset?.pcbRealignment)?.parameters?.cycleLimit;
+    const accepted = Boolean(match.forward?.accepted && match.backward?.accepted &&
+      Number.isFinite(match.reverseDistance) &&
+      match.reverseDistance <= effectiveCycleLimit);
+    const cells = match.fft?.cells ?? [];
+    text('pcbPairSummary', `${accepted ? 'Paarmessung angenommen' : 'Paarmessung verworfen'} | ` +
+      `${match.fft?.inlierCells?.length ?? 0}/${cells.length} Zellen | ` +
+      `${match.fft?.uniqueSupportArea ?? 0} eindeutige Strukturpixel | ` +
+      `Residuum ${fixed(match.fft?.residualRms, 2)} px | ` +
+      `Rueckweg ${fixed(match.reverseDistance, 2)} / ${fixed(effectiveCycleLimit, 2)} px | ` +
+      `${accepted ? `Feder Position ${fixed(pairStiffness(match).weight, 1)}, Rotation ${pairStiffness(match).rotationWeight ? fixed(pairStiffness(match).weight, 1) : 'frei'} | ` : ''}` +
+      `${match.accelerator ?? 'CPU-FFT/NCC'} | ` +
+      `${match.fftGpuVerification?.accepted ? 'FFT-Pose durch WebGPU bestaetigt' :
+        match.coarse?.accepted ? 'GPU-Grobsuche bestaetigt' : match.fftGpuVerification?.reason ?? match.coarse?.reason ??
+        match.fft?.reason ?? match.forward?.reason ?? ''}`);
+    drawPcbCells(match);
+    if (element('pcbRealignDetails').open) void drawPcbPairImages(match);
+    else releasePcbPairImages();
+  };
+  select.onchange = show;
+  if (selected !== pairs[Number(select.value)]) show();
+}
+function pcbSourceMask() {
+  if (trackingImageMask) return trackingMaskHasSelection ? trackingImageMask : null;
+  return (trackingRunOptions ?? trackingDataset?.options)?.sourceImageMask ?? null;
+}
+async function runPcbRealignment() {
+  if (pcbBusy || trackingRunning || taskBusy || pathRefitBusy) return;
+  if (!videoInfo || !calibration?.maps || !trackingVideoCompatible(trackingDataset, videoInfo)) {
+    text('pcbRealignStatus', 'Passendes Video, Kalibrierung und Tracking-Posen laden.'); return;
+  }
+  let parameters;
+  try { parameters = pcbParameters(); }
+  catch (error) { text('pcbRealignStatus', error.message); return; }
+  const sourcePath = trackingPath;
+  const sourcePoses = new Map(sourcePath.map(entry => [entry.frame, { ...entry.pose }]));
+  const sourceMask = pcbSourceMask();
+  const mask = sourceMask ? remapInclusionMask(sourceMask, calibration.maps) :
+    (trackingRunOptions ?? trackingDataset?.options)?.imageMask ?? null;
+  let keyframes, pairs;
+  try {
+    keyframes = selectPcbKeyframes(sourcePath, { width: calibration.maps.outputWidth,
+      height: calibration.maps.outputHeight, ...parameters });
+    pairs = planPcbPairs(keyframes, calibration.field, calibration.maps, { ...parameters, mask });
+  } catch (error) { text('pcbRealignStatus', error.message); return; }
+  if (keyframes.length < 2) { text('pcbRealignStatus', 'Zu wenige Keyframes.'); return; }
+  if (parameters.maxPairs < keyframes.length - 1) {
+    text('pcbRealignStatus', `Paarbudget ${parameters.maxPairs} reicht fuer ${keyframes.length} Keyframes nicht. Mindestens ${keyframes.length - 1} einstellen.`); return;
+  }
+  if (!pairs.length) { text('pcbRealignStatus', 'Keine ueberlappenden Keyframe-Paare.'); return; }
+  invalidatePcbProposal(); pcbLastDiagnostics = null; pcbBusy = true; pcbCancelled = false;
+  pcbPauseRequested = false; pcbStepRemaining = 0; updatePcbControls();
+  refreshPcbPairDiagnostics();
+  const worker = new WorkerClient('./compute-worker.js'); pcbWorker = worker;
+  const started = performance.now();
+  const entries = new Map(sourcePath.map(entry => [entry.frame, entry]));
+  const nativeFrameCache = new Map();
+  const profile = { pairs: 0, decoded: 0, reused: 0, decodeMs: 0, remapMs: 0,
+    copyMs: 0, workerMs: 0, readbackMs: 0, fftMs: 0, pyramidMs: 0, nccMs: 0, fallbackMs: 0 };
+  const pairBitmap = async frame => {
+    const decoded = await readTrackingFrame(frame, { gpu: useWebGpu(), rectified: true,
+      sourceMask, measureSharpness: false });
+    if (decoded.frameTiming?.cacheHit) profile.reused++;
+    else profile.decoded++;
+    profile.decodeMs += decoded.frameTiming?.decodeMs ?? 0;
+    profile.remapMs += decoded.frameTiming?.remapMs ?? 0;
+    return decoded.bitmap;
+  };
+  const preprocessing = { brightness: parameters.brightness, contrast: parameters.contrast,
+    gamma: parameters.gamma, red: 0.3, green: 0.59, blue: 0.11, region: 0.4, edgeFeather: 0.1 };
+  let nativeGpuPath = useWebGpu() && parameters.brightness === 0 &&
+    parameters.contrast === 1 && parameters.gamma === 1;
+  const fingerprint = pcbRunFingerprint(sourcePath, calibration, videoInfo, mask);
+  const previousDraft = trackingDataset?.pcbRealignmentDraft;
+  const sameParameters = previousDraft?.parameters && Object.entries(parameters).every(([key, value]) =>
+    (previousDraft.parameters[key] ?? (key === 'fftCycleFactor' ? 2 : undefined)) === value);
+  const resume = previousDraft?.schemaVersion === 1 && previousDraft.viaRecoveryVersion === 4 && previousDraft.fingerprint === fingerprint &&
+    sameParameters &&
+    Array.isArray(previousDraft.matches) && previousDraft.matches.length <= pairs.length &&
+    previousDraft.matches.every((match, index) => match.reference === pairs[index].reference &&
+      match.current === pairs[index].current);
+  const draft = resume ? previousDraft : { schemaVersion: 1, viaRecoveryVersion: 4, fingerprint, parameters,
+    matches: [], bridgeMatches: [], skipMatches: [], localMatches: [] };
+  draft.parameters = parameters;
+  const matches = draft.matches;
+  trackingDataset = { ...trackingDataset, pcbRealignmentDraft: draft };
+  const publishPcbPairs = () => {
+    storeNetworkMatches([...matches, ...(draft.bridgeMatches ?? []), ...(draft.skipMatches ?? []),
+      ...(draft.localMatches ?? [])], parameters);
+    drawTrackingPath();
+    pcbLastDiagnostics = { parameters,
+      pairDiagnostics: [...matches, ...(draft.bridgeMatches ?? []), ...(draft.skipMatches ?? [])],
+      localDiagnostics: [...(draft.localMatches ?? [])] };
+    refreshPcbPairDiagnostics();
+  };
+  if (matches.length || draft.bridgeMatches?.length || draft.skipMatches?.length || draft.localMatches?.length)
+    publishPcbPairs();
+  if (resume && matches.length) text('pcbRealignStatus', `${matches.length} gespeicherte Paarmessungen werden fortgesetzt.`);
+  const measurePair = async (pair, poses = null) => {
+    const images = [];
+    try {
+      for (const frame of [pair.reference, pair.current]) {
+        const entry = entries.get(frame);
+        let bitmap = null, native = null;
+        if (nativeGpuPath) {
+          if (nativeFrameCache.has(frame)) {
+            nativeFrameCache.delete(frame); nativeFrameCache.set(frame, true); profile.reused++;
+          } else {
+            const decoded = await readTrackingFrame(frame, { gpu: true, output: 'native', measureSharpness: false });
+            native = { frame: decoded.frame, orientation: decoded.orientation };
+            nativeFrameCache.set(frame, true);
+            profile.decoded++; profile.decodeMs += decoded.frameTiming?.decodeMs ?? 0;
+          }
+        } else bitmap = await pairBitmap(frame);
+        const width = nativeGpuPath ? calibration.maps.outputWidth : bitmap.width;
+        const height = nativeGpuPath ? calibration.maps.outputHeight : bitmap.height;
+        const offset = entry.mode === 'window' ? [-width / 2, -height / 2] :
+          [calibration.maps.origin[0] - calibration.field.width / 2,
+            calibration.maps.origin[1] - calibration.field.height / 2];
+        images.push({ frame, pose: { ...(poses?.get(frame) ?? entry.pose) }, offset, bitmap, native });
+      }
+      if (pcbCancelled) throw new Error('PCB-Realignment abgebrochen.');
+      const workerStarted = performance.now();
+      const result = await worker.call('pcb-pair-register', { images, pair:{...pair,cells:pair.cells??currentMatchNetwork().pairs.find(p=>p.reference===pair.reference&&p.current===pair.current)?.cells??[]}, mask, preprocessing,
+        nativePath: nativeGpuPath,
+        localLandmarks: true, useWebGpu: useWebGpu(), coarseRadius: parameters.coarseRadius,
+        minimumOverlapFraction: parameters.coarseOverlap,
+        fft: { cellSize: parameters.cellSize, cellsPerAxis: parameters.cellsPerAxis,
+          searchRadius: Math.min(parameters.radius, parameters.cellSize / 2 - 1), minimumPsr: parameters.minimumPsr,
+          residualLimit: parameters.residualLimit },
+        limits: { radius: parameters.radius, angle: parameters.angle,
+          cycleLimit: parameters.cycleLimit,
+          fftCycleFactor: parameters.fftCycleFactor,
+          minimumScore: parameters.minimumScore,
+          minimumSupport: parameters.minimumSupport } }, images.map(item => item.native?.frame ?? item.bitmap).filter(Boolean));
+      profile.workerMs += performance.now() - workerStarted;
+      profile.pairs++;
+      if (nativeGpuPath && Array.isArray(result.nativeCachedFrames)) {
+        nativeFrameCache.clear();
+        for (const frame of result.nativeCachedFrames) nativeFrameCache.set(frame, true);
+        delete result.nativeCachedFrames;
+      }
+      for (const key of ['readbackMs', 'fftMs', 'pyramidMs', 'nccMs', 'fallbackMs'])
+        profile[key] += result.profile?.[key] ?? 0;
+      return result;
+    } catch (error) {
+      if (!nativeGpuPath) throw error;
+      nativeGpuPath = false;
+      nativeFrameCache.clear();
+      console.warn('PCB: nativer WebGPU-Pfad fehlgeschlagen, Bitmap-Fallback:', error.message);
+      return measurePair(pair, poses);
+    } finally { for (const item of images) { item.bitmap?.close(); item.native?.frame?.close(); } }
+  };
+  try {
+    await frameReader.waitUntilIdle();
+    if (nativeGpuPath) {
+      try {
+        const cache = frameReader.cacheStats();
+        await worker.call('pcb-native-setup', { maps: calibration.maps, sourceMask,
+          brightness: brightnessCalibration, cacheBudget: Math.max(0, cache.budget - cache.bytes) });
+      } catch (error) {
+        console.warn('PCB: nativer WebGPU-Pfad nicht verfuegbar, Bitmap-Fallback:', error.message);
+        nativeGpuPath = false;
+      }
+    }
+    for (let pairIndex = matches.length; pairIndex < pairs.length; pairIndex++) {
+      const pair = pairs[pairIndex];
+      await waitForPcbResume();
+      if (pcbCancelled) throw new Error('PCB-Realignment abgebrochen.');
+      text('pcbRealignStatus', `Paar ${pairIndex + 1}/${pairs.length}: #${pair.current} gegen #${pair.reference} | ${Math.round((performance.now() - started) / 1000)} s`);
+      matches.push(await measurePair(pair));
+      draft.phase = 'keyframes'; draft.nextPair = matches.length;
+      publishPcbPairs();
+      if (pcbStepRemaining > 0 && --pcbStepRemaining === 0) { pcbPauseRequested = true; updatePcbControls(); }
+      if (pairIndex % 4 === 3) await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    await waitForPcbResume();
+    const initialMeasurements = acceptedPcbConstraints(matches, parameters);
+    const bridgePairs = planPcbTemporalBridges(sourcePath, pairs, matches,
+      initialMeasurements.accepted, parameters.bridgeBudget);
+    const bridgeMatches = draft.bridgeMatches ?? (draft.bridgeMatches = []);
+    if (bridgeMatches.length > bridgePairs.length || bridgeMatches.some((match, index) =>
+      match.reference !== bridgePairs[index].reference || match.current !== bridgePairs[index].current))
+      bridgeMatches.length = 0;
+    for (let index = bridgeMatches.length; index < bridgePairs.length; index++) {
+      await waitForPcbResume();
+      if (pcbCancelled) throw new Error('PCB-Realignment abgebrochen.');
+      const pair = bridgePairs[index];
+      text('pcbRealignStatus', `Brueckenpaar ${index + 1}/${bridgePairs.length}: #${pair.current} gegen #${pair.reference}`);
+      bridgeMatches.push(await measurePair(pair));
+      draft.phase = 'bridges'; draft.nextBridge = bridgeMatches.length;
+      publishPcbPairs();
+      if (pcbStepRemaining > 0 && --pcbStepRemaining === 0) { pcbPauseRequested = true; updatePcbControls(); }
+      if (index % 4 === 3) await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    await waitForPcbResume();
+    const bridgeAccepted = acceptedPcbConstraints(bridgeMatches, parameters);
+    const skipPairs = planPcbTemporalSkips(bridgePairs, bridgeMatches,
+      bridgeAccepted.accepted, Math.max(0, parameters.bridgeBudget - bridgePairs.length));
+    const skipMatches = draft.skipMatches ?? (draft.skipMatches = []);
+    if (skipMatches.length > skipPairs.length || skipMatches.some((match, index) =>
+      match.reference !== skipPairs[index].reference || match.current !== skipPairs[index].current))
+      skipMatches.length = 0;
+    for (let index = skipMatches.length; index < skipPairs.length; index++) {
+      await waitForPcbResume();
+      if (pcbCancelled) throw new Error('PCB-Realignment abgebrochen.');
+      const pair = skipPairs[index];
+      text('pcbRealignStatus', `Bruecken-Ersatzpaar ${index + 1}/${skipPairs.length}: #${pair.current} gegen #${pair.reference}`);
+      skipMatches.push(await measurePair(pair));
+      draft.phase = 'bridge-skips'; draft.nextSkip = skipMatches.length;
+      publishPcbPairs();
+      if (pcbStepRemaining > 0 && --pcbStepRemaining === 0) { pcbPauseRequested = true; updatePcbControls(); }
+      if (index % 4 === 3) await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    await waitForPcbResume();
+    if (useWebGpu() && (draft.matchVersion ?? 1) < 2) {
+      const retry = [...matches, ...bridgeMatches, ...skipMatches].filter(match =>
+        match.fft?.accepted && match.fft.inlierCells?.length >= 4 &&
+        match.fft.uniqueSupportArea >= 8192 &&
+        !acceptedPcbConstraints([match], parameters).accepted.length);
+      for (const [index, match] of retry.entries()) {
+        await waitForPcbResume();
+        if (pcbCancelled) throw new Error('PCB-Realignment abgebrochen.');
+        text('pcbRealignStatus', `FFT-Pose auf WebGPU pruefen ${index + 1}/${retry.length}: #${match.current} gegen #${match.reference}`);
+        const updated = await measurePair(match);
+        for (const group of [matches, bridgeMatches, skipMatches]) {
+          const position = group.indexOf(match);
+          if (position >= 0) { group[position] = updated; break; }
+        }
+        publishPcbPairs();
+        if (pcbStepRemaining > 0 && --pcbStepRemaining === 0) { pcbPauseRequested = true; updatePcbControls(); }
+        if (index % 4 === 3) await new Promise(resolve => setTimeout(resolve, 0));
+      }
+      draft.matchVersion = 2;
+    }
+    const allMatches = [...matches, ...bridgeMatches, ...skipMatches];
+    storeNetworkMatches(allMatches, parameters);
+    const measurements = acceptedPcbConstraints(allMatches, parameters);
+    measurements.accepted = networkEdges(currentMatchNetwork(), new Set(sourcePath.map(entry => entry.frame)));
+    const graphFrames = new Set(keyframes.map(entry => entry.frame));
+    let expanded;
+    do {
+      expanded = false;
+      for (const edge of measurements.accepted) {
+        if (!graphFrames.has(edge.reference) && !graphFrames.has(edge.current)) continue;
+        for (const frame of [edge.reference, edge.current]) if (!graphFrames.has(frame)) {
+          graphFrames.add(frame); expanded = true;
+        }
+      }
+    } while (expanded);
+    const graphEdges = measurements.accepted.filter(edge =>
+      graphFrames.has(edge.reference) && graphFrames.has(edge.current));
+    pcbLastDiagnostics = { parameters, pairDiagnostics: allMatches.map(match => ({ reference: match.reference,
+      current: match.current, kind: match.kind, referencePose: match.referencePose,
+      currentPose: match.currentPose, fft: match.fft, forward: match.forward, backward: match.backward,
+      reverseDistance: match.reverseDistance, agreement: match.agreement,
+      coarse: match.coarse, fftGpuVerification: match.fftGpuVerification,
+      accelerator: match.accelerator })) };
+    text('pcbRealignDiagnostics', JSON.stringify({ keyframes: [...graphFrames],
+      accepted: measurements.accepted, rejected: measurements.rejected,
+      pairs: pcbLastDiagnostics.pairDiagnostics }, null, 2));
+    refreshPcbPairDiagnostics();
+    if (!measurements.accepted.length && !currentMatchNetwork().pairs.some(pair => pair.cells.length >= (pair.minimumCells ?? 3))) throw new Error(`Kein belastbares Keyframe-Paar: ${measurements.rejected.length} verworfen.`);
+    const graph = { nodes: sourcePath.map(entry => entry.frame).sort((a, b) => a - b).map(frame =>
+      ({ frame, pose: { ...entries.get(frame).pose } })),
+      edges: graphEdges };
+    text('pcbRealignStatus', `Optimiere ${graph.nodes.length} Frames und ${graph.edges.length} gemessene Kanten...`);
+    let solved = await worker.call('pcb-graph-optimize', { graph, network: currentMatchNetwork(),
+      options: { iterations: Math.max(20, parameters.iterations), huber: Math.min(4, parameters.huber),
+        lever: Math.hypot(calibration.maps.outputWidth, calibration.maps.outputHeight) / 2 } });
+    if (pcbCancelled) throw new Error('PCB-Realignment abgebrochen.');
+    text('pcbRealignDiagnostics', JSON.stringify({ keyframes: [...graphFrames],
+      components: solved.components, accepted: measurements.accepted,
+      rejected: measurements.rejected, pairs: pcbLastDiagnostics.pairDiagnostics }, null, 2));
+    const optimized = new Map(solved.corrections.map(item => [item.frame, item.pose]));
+    if (!optimized.size) throw new Error('Kein belastbarer Teilgraph konnte verbessert werden.');
+    const byFrame = interpolatePcbPoses(sourcePath, optimized);
+    const localMatches = draft.localMatches;
+    const localCandidates = selectPcbIntermediateFrames(sourcePath, graphFrames,
+      Math.max(parameters.localBudget, sourcePath.length));
+    const optimizedFrames = [...graphFrames].filter(frame => optimized.has(frame)).sort((first, second) => first - second);
+    let referenceIndex = 0;
+    if (localMatches.length > localCandidates.length || localMatches.some((match, index) =>
+      match.current !== localCandidates[index].frame)) localMatches.length = 0;
+    for (const match of localMatches) {
+      const edge = networkEdges(currentMatchNetwork(), new Set([match.reference,match.current])).find(edge=>
+        edge.reference===match.reference&&edge.current===match.current);
+      if(edge&&byFrame.has(edge.reference)&&!edge.currentPivot&&!edge.pointCells)byFrame.set(edge.current,composePose(byFrame.get(edge.reference),edge.measurement));
+    }
+    for (let index = localMatches.length; index < localCandidates.length; index++) {
+      const entry = localCandidates[index];
+      await waitForPcbResume();
+      if (pcbCancelled) throw new Error('PCB-Realignment abgebrochen.');
+      while (referenceIndex + 1 < optimizedFrames.length && optimizedFrames[referenceIndex + 1] <= entry.frame)
+        referenceIndex++;
+      const references = [optimizedFrames[referenceIndex], optimizedFrames[referenceIndex + 1]]
+        .filter(frame => frame !== undefined && frame !== entry.frame);
+      const reference = references.sort((first, second) => {
+        const distance = frame => Math.hypot(byFrame.get(frame).x - byFrame.get(entry.frame).x,
+          byFrame.get(frame).y - byFrame.get(entry.frame).y);
+        return distance(first) - distance(second);
+      })[0];
+      if (reference === undefined || !byFrame.has(entry.frame)) continue;
+      text('pcbRealignStatus', `Zwischenframe ${index + 1}/${localCandidates.length}: #${entry.frame} gegen #${reference}`);
+      const match = await measurePair({ reference, current: entry.frame, kind: 'local' }, byFrame);
+      localMatches.push(match);
+      draft.phase = 'intermediate'; draft.nextLocal = localMatches.length;
+      publishPcbPairs();
+      const verified = acceptedPcbConstraints([match], parameters);
+      const retained = networkEdges(currentMatchNetwork(), new Set([match.reference,match.current])).find(edge=>edge.current===entry.frame);
+      if (verified.accepted.length && retained && !retained.currentPivot && !retained.pointCells)
+        byFrame.set(entry.frame, composePose(byFrame.get(retained.reference),retained.measurement));
+      if (pcbStepRemaining > 0 && --pcbStepRemaining === 0) { pcbPauseRequested = true; updatePcbControls(); }
+      if (index % 4 === 3) await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    await waitForPcbResume();
+    const localVerification = acceptedPcbConstraints(localMatches, parameters);
+    // Image evidence, not graph disagreement alone, controls anchor confidence.
+    const residualChecks = solved.after.pairs.filter(pair => pair.confirmedP90 > 8);
+    const residualMatches = [];
+    for (const [index, pair] of residualChecks.entries()) {
+      await waitForPcbResume();
+      if (pcbCancelled) throw new Error('PCB-Realignment abgebrochen.');
+      const saved = currentMatchNetwork().pairs.find(item => item.id === pair.id);
+      text('pcbRealignStatus', `Pruefe Widerspruch ${index+1}/${residualChecks.length}: #${pair.reference} / #${pair.current}`);
+      const measured = await measurePair({reference:pair.reference,current:pair.current,kind:'residual-check',cells:saved?.cells??[]},byFrame);
+      residualMatches.push(measured);
+      storeNetworkMatches([measured],parameters);
+    }
+    // A connected graph can still contain displaced visits: check real overlap,
+    // independently of graph residuals, using the same bounded refinement as the UI.
+    const overlapChecks=planPcbOverlapChecks(sourcePath.map(entry=>({...entry,pose:byFrame.get(entry.frame)})),
+      currentMatchNetwork(),Math.min(calibration.maps.outputWidth,calibration.maps.outputHeight)*.6);
+    const overlapMatches=[];
+    for(const [index,pair] of overlapChecks.entries()) {
+      await waitForPcbResume();
+      if(pcbCancelled) throw new Error('PCB-Realignment abgebrochen.');
+      text('pcbRealignStatus',`Pruefe ueberlappende Bildstreifen ${index+1}/${overlapChecks.length}: #${pair.reference} / #${pair.current}`);
+      const images=[];
+      try {
+        for(const frame of [pair.reference,pair.current]) {
+          const entry=entries.get(frame),bitmap=await pairBitmap(frame);
+          const offset=entry.mode==='window'?[-bitmap.width/2,-bitmap.height/2]:
+            [calibration.maps.origin[0]-calibration.field.width/2,calibration.maps.origin[1]-calibration.field.height/2];
+          images.push({frame,pose:byFrame.get(frame),offset,bitmap});
+        }
+        const saved=currentMatchNetwork().pairs.find(p=>p.id===`${pair.reference}:${pair.current}`);
+        const match=await worker.call('pcb-pair-refine',{images,pair:{...pair,cells:saved?.cells??[]},mask},images.map(i=>i.bitmap));
+        overlapMatches.push(match);storeNetworkMatches([match],parameters);
+      } finally { for(const item of images) item.bitmap.close(); }
+      if(pcbStepRemaining>0 && --pcbStepRemaining===0){pcbPauseRequested=true;updatePcbControls();}
+    }
+    // Jointly solve again after intermediate measurements, so a local correction
+    // propagates through every retained anchor instead of moving one frame alone.
+    solved = await worker.call('pcb-graph-optimize', {graph, network:currentMatchNetwork(),
+      options:{iterations:Math.max(20,parameters.iterations),huber:Math.min(4,parameters.huber),
+        lever:Math.hypot(calibration.maps.outputWidth,calibration.maps.outputHeight)/2}});
+    for (const item of solved.corrections) byFrame.set(item.frame,item.pose);
+    const anchorAudits=[];
+    const conflicts=solved.after.pairs.filter(pair=>pair.confirmedP90>4);
+    for(const [index,pair]of conflicts.entries()){
+      await waitForPcbResume();
+      if(pcbCancelled)throw new Error('PCB-Realignment abgebrochen.');
+      text('pcbRealignStatus',`Pruefe gespeicherte Anker ${index+1}/${conflicts.length}: #${pair.reference} / #${pair.current}`);
+      const cells=currentMatchNetwork().pairs.find(p=>p.id===pair.id)?.cells??[];
+      const audit=await measurePair({...pair,cells,anchorsOnly:true},byFrame);
+      anchorAudits.push(audit);storeNetworkMatches([audit],parameters);
+      if(pcbStepRemaining>0 && --pcbStepRemaining===0){pcbPauseRequested=true;updatePcbControls();}
+    }
+    if(anchorAudits.length){
+      solved=await worker.call('pcb-graph-optimize',{graph,network:currentMatchNetwork(),
+        options:{iterations:Math.max(20,parameters.iterations),huber:Math.min(4,parameters.huber),lever:Math.hypot(calibration.maps.outputWidth,calibration.maps.outputHeight)/2}});
+      for(const item of solved.corrections)byFrame.set(item.frame,item.pose);
+    }
+
+    if (pcbCancelled) throw new Error('PCB-Realignment abgebrochen.');
+    trackingDataset = { ...trackingDataset, pcbRealignmentDraft: undefined };
+    pcbProposal = { byFrame, sourcePath, sourcePoses, maps: calibration.maps, parameters,
+      keyframes: [...graphFrames],
+      constraints: graphEdges, rejected: measurements.rejected, components: solved.components,
+      residualChecks: residualMatches, overlapChecks:overlapMatches, anchorAudits, pointResiduals: solved.after,
+      localVerification: { attempted: localMatches.length, accepted: localVerification.accepted.length,
+        rejected: localVerification.rejected.length },
+      pairDiagnostics: allMatches.map(match => ({ reference: match.reference, current: match.current,
+        kind: match.kind, referencePose: match.referencePose, currentPose: match.currentPose,
+        fft: match.fft, forward: match.forward, backward: match.backward,
+        reverseDistance: match.reverseDistance, agreement: match.agreement,
+        coarse: match.coarse, fftGpuVerification: match.fftGpuVerification,
+        accelerator: match.accelerator })),
+      localDiagnostics: [...localMatches, ...residualMatches, ...overlapMatches].map(match => ({ reference: match.reference, current: match.current,
+        referencePose: match.referencePose, currentPose: match.currentPose,
+        fft: match.fft, forward: match.forward, backward: match.backward,
+        reverseDistance: match.reverseDistance, coarse: match.coarse,
+        fftGpuVerification: match.fftGpuVerification,
+        accelerator: match.accelerator })),
+      beforeRms: solved.beforeRms, afterRms: solved.afterRms,
+      elapsedMs: performance.now() - started };
+    pcbLastDiagnostics = { parameters, pairDiagnostics: pcbProposal.pairDiagnostics, localDiagnostics: pcbProposal.localDiagnostics };
+    text('pcbRealignStatus', `${graphFrames.size} Graphframes | ${allMatches.length} Paare: ${measurements.accepted.length} angenommen, ${measurements.rejected.length} verworfen | ` +
+      `${solved.components.length} Komponenten; ${sourcePath.length - solved.unmeasured.length}/${sourcePath.length} Frames mit Messpunkten, ${solved.unmeasured.length} interpoliert | ` +
+      `${solved.directionOnlyFrames?.length ?? 0} Frames nur quer zu Kanten gestuetzt | ` +
+      `${localVerification.accepted.length}/${localMatches.length} Zwischenframes lokal bestaetigt | ` +
+      `RMS ${fixed(solved.beforeRms, 2)} Ã¢â€ â€™ ${fixed(solved.afterRms, 2)} px | ` +
+      `${profile.reused} Frameabrufe aus Cache, ${fixed(profile.workerMs / Math.max(1, profile.pairs) / 1000, 2)} s Rechenzeit/Paar | ` +
+      `Vorschlag im XY-Pfad rot gestrichelt.`);
+    text('pcbRealignDiagnostics', JSON.stringify({ components: solved.components, pairs: pcbProposal.pairDiagnostics,
+      intermediatePairs: pcbProposal.localDiagnostics,
+      keyframes: pcbProposal.keyframes, durationMs: Math.round(pcbProposal.elapsedMs) }, null, 2));
+    refreshPcbPairDiagnostics();
+    drawTrackingPath();
+  } catch (error) { text('pcbRealignStatus', pcbCancelled ? 'PCB-Realignment abgebrochen.' : error.message); }
+  finally { console.info('PCB-Paarmessung Laufzeitprofil', profile);
+    worker.terminate(); if (pcbWorker === worker) pcbWorker = null;
+    pcbResume = null; pcbBusy = false; pcbPauseRequested = false; pcbStepRemaining = 0; updatePcbControls(); }
+}
+
+function fineSourceSnapshot() {
+  const maps = calibration.maps, sourceMask = pcbSourceMask();
+  return { path: trackingPath, maps, video: videoInfo, brightness: brightnessCalibration,
+    networkState: trackingDataset?.matchNetwork, network: currentMatchNetwork(), sourceMask,
+    sourceMaskRevision: sourceMask?.revision,
+    mask: sourceMask ? remapInclusionMask(sourceMask, maps) : (trackingRunOptions ?? trackingDataset?.options)?.imageMask ?? null,
+    reach: Math.hypot(maps.outputWidth, maps.outputHeight),
+    frames: trackingPath.map(entry => ({ frame: entry.frame, pose: entry.pose ? { ...entry.pose } : null,
+      offset: entry.mode === 'window' ? [-maps.outputWidth / 2, -maps.outputHeight / 2] :
+        [maps.origin[0] - calibration.field.width / 2, maps.origin[1] - calibration.field.height / 2] })) };
+}
+function fineSourceCurrent(source) {
+  const mask = pcbSourceMask();
+  return source.path === trackingPath && source.maps === calibration?.maps && source.video === videoInfo &&
+    source.brightness === brightnessCalibration && source.networkState === trackingDataset?.matchNetwork &&
+    source.sourceMask === mask && source.sourceMaskRevision === mask?.revision &&
+    source.frames.length === trackingPath.length && source.frames.every((item, index) => {
+      const entry = trackingPath[index];
+      return item.frame === entry.frame && ['x','y','rotation'].every(key => item.pose?.[key] === entry.pose?.[key]);
+    });
+}
+function refreshFinePoses() {
+  invalidatePcbProposal(); pathRefitProposal = null;
+  clearPathOverlay(true); renderTrackingResults(trackingPath.at(-1));
+  scheduleTrackingMosaic(); updateControls();
+}
+function installFineControls() {
+  fineUi = installFineAlignment({
+    available: () => Boolean(videoInfo && calibration?.maps && trackingPath.length > 1 &&
+      trackingVideoCompatible(trackingDataset, videoInfo) && !taskBusy && !trackingRunning &&
+      !trackingPreviewBusy && !pcbBusy && !pathRefitBusy && !mergeRunning && !continuous && !rectifiedPlayback),
+    snapshot: fineSourceSnapshot, current: fineSourceCurrent,
+    busy(value) {
+      fineBusy = value; taskBusy = value;
+      if (value) { invalidatePcbProposal(); pathRefitProposal = null;
+        trackingMosaicRequest++; clearTimeout(trackingMosaicTimer); }
+      updateControls();
+    },
+    async bitmap(frame, source) {
+      const decoded = await readTrackingFrame(frame, { rectified: true, sourceMask: source.sourceMask,
+        cache: false, measureSharpness: false });
+      return decoded.bitmap;
+    },
+    report(report) { trackingDataset = { ...trackingDataset, fineAlignment: report }; },
+    apply(proposal) {
+      const undo = { poses: new Map(trackingPath.map(entry => [entry.frame, entry.pose ? {...entry.pose} : null])), dataset: trackingDataset };
+      for (const entry of trackingPath) if (proposal.byFrame.get(entry.frame)) entry.pose = { ...proposal.byFrame.get(entry.frame) };
+      trackingDataset = { ...trackingDataset, matchNetwork: proposal.network,
+        fineAlignment: { ...proposal.report, applied: true } };
+      networkDeleteUndo = null; networkViewKey = '';
+      refreshFinePoses(); undo.after = fineSourceSnapshot(); return undo;
+    },
+    undo(saved) {
+      if (!fineSourceCurrent(saved.after)) return false;
+      for (const entry of trackingPath) entry.pose = saved.poses.get(entry.frame);
+      trackingDataset = saved.dataset; networkDeleteUndo = null; networkViewKey = '';
+      refreshFinePoses(); return true;
+    },
+    async openFrame(frame) {
+      if (taskBusy || trackingRunning || pcbBusy || pathRefitBusy || mergeRunning) throw new Error('Laufende Verarbeitung zuerst beenden.');
+      const entry = trackingPath.find(item => item.frame === frame);
+      const geometry = entry && frameGeometry(entry, calibration?.field, calibration?.maps);
+      if (!geometry) throw new Error(`Frame #${frame} hat keine gueltige Pose.`);
+      invalidatePcbProposal(); pathRefitProposal = null;
+      await loadPathOverlay(geometry.world(geometry.width / 2, geometry.height / 2), { forceFrame: frame });
+      if (!overlayContributors.some(item => item.entry.frame === frame)) throw new Error(`Frame #${frame} konnte nicht geladen werden.`);
+      element('trackingOverlayFrame').value = String(frame);
+      await selectOverlayContributor();
+    }
+  });
+}
+function installPcbRealignment() {
+  installPcbPairZoom();
+  element('pcbRealignDetails').addEventListener('toggle', () => {
+    if (element('pcbRealignDetails').open) element('pcbPairSelect').onchange?.();
+    else releasePcbPairImages();
+  });
+  element('pcbRealignStart').onclick = () => void runPcbRealignment();
+  element('pcbRealignPause').onclick = () => { pcbPauseRequested = true; pcbStepRemaining = 0;
+    text('pcbRealignStatus', 'Pause nach dem aktuellen Paar angefordert.'); updatePcbControls(); };
+  element('pcbRealignResume').onclick = () => { pcbPauseRequested = false; pcbStepRemaining = 0;
+    pcbResume?.(); updatePcbControls(); };
+  element('pcbRealignStep').onclick = () => { pcbPauseRequested = false; pcbStepRemaining = 1;
+    pcbResume?.(); updatePcbControls(); };
+  element('pcbRealignCancel').onclick = () => { pcbCancelled = true; pcbResume?.(); pcbWorker?.terminate();
+    text('pcbRealignStatus', 'Abbruch angefordert.'); };
+  element('pcbRealignDiscard').onclick = () => { invalidatePcbProposal(); text('pcbRealignStatus', 'Vorschlag verworfen.'); };
+  element('pcbRealignApply').onclick = () => {
+    if (!pcbProposal || pcbBusy) return;
+    const current = pcbProposal.sourcePath === trackingPath && pcbProposal.maps === calibration?.maps &&
+      trackingPath.length === pcbProposal.sourcePoses.size && trackingPath.every(entry => {
+        const pose = pcbProposal.sourcePoses.get(entry.frame);
+        return pose && pose.x === entry.pose.x && pose.y === entry.pose.y && pose.rotation === entry.pose.rotation;
+      });
+    if (!current) { invalidatePcbProposal();
+      text('pcbRealignStatus', 'Tracking-Posen oder Kalibrierung wurden seit der Berechnung geaendert. Erneut berechnen.'); return; }
+    pcbUndo = { poses: new Map(trackingPath.map(entry => [entry.frame, { ...entry.pose }])), dataset: trackingDataset };
+    const optimizedComponents = pcbProposal.components.filter(component => component.status === 'optimized').length;
+    for (const entry of trackingPath) if (pcbProposal.byFrame.has(entry.frame)) entry.pose = { ...pcbProposal.byFrame.get(entry.frame) };
+    trackingDataset = { ...trackingDataset, pcbRealignment: { schemaVersion: 1,
+      parameters: pcbProposal.parameters, keyframes: pcbProposal.keyframes,
+      constraints: pcbProposal.constraints, rejected: pcbProposal.rejected,
+      components: pcbProposal.components, residualChecks: pcbProposal.residualChecks, pointResiduals: pcbProposal.pointResiduals, pairDiagnostics: pcbProposal.pairDiagnostics,
+      localVerification: pcbProposal.localVerification, localDiagnostics: pcbProposal.localDiagnostics,
+      originalPoses: [...pcbUndo.poses],
+      beforeRms: pcbProposal.beforeRms, afterRms: pcbProposal.afterRms } };
+    invalidatePcbProposal();
+    text('pcbRealignStatus', `Posen fuer ${trackingPath.length} Frames uebernommen (${optimizedComponents} optimierte Teilgraphen und interpolierte Zwischenframes). Originalposen im Projektzustand gespeichert.`);
+    renderTrackingResults(trackingPath.at(-1)); scheduleTrackingMosaic(); updatePcbControls();
+  };
+  element('pcbRealignUndo').onclick = () => {
+    if (!pcbUndo || pcbBusy) return;
+    for (const entry of trackingPath) if (pcbUndo.poses.has(entry.frame)) entry.pose = pcbUndo.poses.get(entry.frame);
+    trackingDataset = pcbUndo.dataset; pcbUndo = null;
+    text('pcbRealignStatus', 'Urspruengliche Posen wiederhergestellt.');
+    renderTrackingResults(trackingPath.at(-1)); scheduleTrackingMosaic(); updatePcbControls();
+  };
+  for (const control of element('trackingOptimizationPanel').querySelectorAll('.pcb-realignment-card input')) control.oninput = () => {
+    if (pcbProposal) { invalidatePcbProposal(); text('pcbRealignStatus', 'Parameter geaendert. Erneut berechnen.'); }
+  };
+  updatePcbControls();
+}
+let frameReductionPreview = null;
+let frameReductionUndo = null;
+function resetFrameReduction() {
+  frameReductionPreview = null;
+  frameReductionUndo = null;
+  element('frameReductionApply').disabled = true;
+  element('frameReductionUndo').disabled = true;
+  element('frameReductionDetails').hidden = true;
+  text('frameReductionStatus', 'Noch keine Auswahl berechnet.');
+}
+function refreshReducedTrackingPath() {
+  clearPathOverlay(); pathSelection = null; pathRefitProposal = null;
+  renderTrackingResults(trackingPath.at(-1));
+  updateTrackingControls();
+  scheduleTrackingMosaic();
+}
+function installFrameReduction() {
+  for (const id of ['frameReductionDivisions', 'frameReductionMinimum']) element(id).oninput = () => {
+    frameReductionPreview = null;
+    element('frameReductionApply').disabled = true;
+    text('frameReductionStatus', 'Parameter geaendert. Auswahl erneut berechnen.');
+  };
+  element('frameReductionCalculate').onclick = () => {
+    if (trackingRunning || taskBusy || pathRefitBusy) {
+      text('frameReductionStatus', 'Warten, bis die laufende Verarbeitung abgeschlossen ist.'); return;
+    }
+    try {
+      const geometries = trackingPath.map(entry => frameGeometry(entry, calibration?.field, calibration?.maps)).filter(Boolean);
+      const result = reduceFramesByBlocks(geometries, {
+        divisions: number('frameReductionDivisions', 5), minimum: number('frameReductionMinimum', 3) });
+      frameReductionPreview = { result, path: trackingPath, maps: calibration?.maps };
+      const ids = [...result.frames].sort((a, b) => a - b);
+      text('frameReductionFrames', ids.map(frame => `#${frame}`).join(', ') || 'Keine vollstaendig abdeckbaren Bloecke.');
+      element('frameReductionDetails').hidden = false;
+      element('frameReductionApply').disabled = !ids.length || Boolean(frameReductionUndo);
+      text('frameReductionStatus', `${result.selectedFrames} von ${result.totalFrames} Frames ausgewÃƒÂ¤hlt | Blockkante ${result.blockSize} px | ${result.blocks} betroffene BlÃƒÂ¶cke` +
+        (result.shortBlocks ? ` | ${result.shortBlocks} BlÃƒÂ¶cke mit weniger als M vollstÃƒÂ¤ndigen Bildern, davon ${result.uncoveredBlocks} ohne vollstÃƒÂ¤ndige Abdeckung. In diesen Bereichen kann die Reduktion Bildinhalt verlieren.` :
+          ' | Alle betroffenen BlÃƒÂ¶cke erreichen M vollstÃƒÂ¤ndige Bilder.'));
+    } catch (error) {
+      frameReductionPreview = null; element('frameReductionApply').disabled = true;
+      text('frameReductionStatus', error.message);
+    }
+  };
+  element('frameReductionApply').onclick = () => {
+    if (!frameReductionPreview || frameReductionPreview.path !== trackingPath || frameReductionPreview.maps !== calibration?.maps ||
+        frameReductionUndo || trackingRunning || taskBusy || pathRefitBusy) return;
+    const { result } = frameReductionPreview;
+    const reduction = { created_at: new Date().toISOString(), divisions: number('frameReductionDivisions', 5),
+      minimum: number('frameReductionMinimum', 3), block_size_px: result.blockSize,
+      source_frames: trackingPath.length, selected_frames: result.selectedFrames,
+      short_blocks: result.shortBlocks, uncovered_blocks: result.uncoveredBlocks };
+    const reduced = removeUnselectedTrackingFrames({ ...trackingDataset, path: trackingPath, failures: trackingFailures }, result.frames, reduction);
+    frameReductionUndo = { path: trackingPath, failures: trackingFailures, dataset: trackingDataset };
+    trackingDataset = reduced;
+    trackingPath = reduced.path;
+    trackingFailures = reduced.failures;
+    pcbProposal = null; pcbUndo = null; updatePcbControls();
+    frameReductionPreview = null;
+    element('frameReductionApply').disabled = true;
+    element('frameReductionUndo').disabled = false;
+    text('frameReductionStatus', `${reduction.source_frames - trackingPath.length} Frames aus der Registrierung entfernt; ${trackingPath.length} bleiben. RÃƒÂ¼ckgÃƒÂ¤ngig stellt den ursprÃƒÂ¼nglichen Pfad wieder her.`);
+    refreshReducedTrackingPath();
+  };
+  element('frameReductionUndo').onclick = () => {
+    if (!frameReductionUndo || trackingRunning || taskBusy || pathRefitBusy) return;
+    trackingPath = frameReductionUndo.path;
+    trackingFailures = frameReductionUndo.failures;
+    trackingDataset = frameReductionUndo.dataset;
+    pcbProposal = null; updatePcbControls();
+    resetFrameReduction();
+    text('frameReductionStatus', `${trackingPath.length} registrierte Frames wiederhergestellt.`);
+    refreshReducedTrackingPath();
+  };
+}
+let trackingTab = 'poses';
+function activateTrackingTab(tab, { focus = false } = {}) {
+  const panels = { poses: 'trackingPosesPanel', overlay: 'trackingOverlayPane', match: 'trackingMatchPanel', optimization: 'trackingOptimizationPanel' };
+  if (!Object.hasOwn(panels, tab)) return;
+  trackingTab = tab;
+  for (const [name, panel] of Object.entries(panels)) {
+    element(panel).hidden = name !== tab;
+    const button = document.querySelector(`[data-tracking-tab="${name}"]`);
+    button.setAttribute('aria-selected', String(name === tab));
+    button.tabIndex = name === tab ? 0 : -1;
+  }
+  if (focus) document.querySelector(`[data-tracking-tab="${tab}"]`).focus();
+  if (tab === 'overlay') requestAnimationFrame(renderPathOverlay);
+}
+function installTrackingTabs() {
+  const tabs = [...document.querySelectorAll('[data-tracking-tab]')];
+  for (const button of tabs) {
+    button.onclick = () => activateTrackingTab(button.dataset.trackingTab);
+    button.onkeydown = event => {
+      const index = tabs.indexOf(button);
+      const next = event.key === 'ArrowRight' ? (index + 1) % tabs.length : event.key === 'ArrowLeft' ? (index + tabs.length - 1) % tabs.length :
+        event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : -1;
+      if (next < 0) return;
+      event.preventDefault(); activateTrackingTab(tabs[next].dataset.trackingTab, { focus: true });
+    };
+  }
+}
 let trackingFailures = [];
 let trackingDataset = null;
 let trackingPreviewTransform = null;
@@ -149,24 +1177,73 @@ let trackingLost = false;
 let pathProject = null;
 let pathHover = null;
 let pathSelection = null;
+let pathZoom = 1;
+let pathPan = { x: 0, y: 0 };
+let networkSelectedPair = null;
+let networkSelectedCell = null;
+let networkHitTargets = [];
+let networkDeleteUndo = null;
+let networkVisiblePairs = [];
+let networkViewKey = '';
+const networkMeasuredMatches = new WeakSet();
+const networkCalibrationKeys = new WeakMap();
+function currentNetworkGeometryKey() {
+  if (!calibration) return null;
+  if (!networkCalibrationKeys.has(calibration)) networkCalibrationKeys.set(calibration, networkGeometryKey(calibration));
+  return networkCalibrationKeys.get(calibration);
+}
+function currentMatchNetwork() {
+  const key = currentNetworkGeometryKey();
+  const network = trackingDataset?.matchNetwork;
+  return network?.schemaVersion === 1 && (!network.geometryKey || network.geometryKey === key) ? network : emptyMatchNetwork(key);
+}
+function storeNetworkMatches(matches, parameters) {
+  const pending = matches.filter(match => !networkMeasuredMatches.has(match));
+  if (!pending.length) return;
+  pending.forEach(match => networkMeasuredMatches.add(match));
+  const previous = currentMatchNetwork();
+  const network = mergeNetworkMatches(previous, pending, parameters);
+  if (network === previous) return;
+  const old = trackingDataset?.matchNetwork;
+  if (old && old !== previous && old.geometryKey && old.geometryKey !== network.geometryKey)
+    trackingDataset = {...trackingDataset, matchNetworkArchive:[...(trackingDataset.matchNetworkArchive ?? []),old]};
+  trackingDataset = { ...trackingDataset, matchNetwork: network };
+  networkDeleteUndo = null;
+}
+
 let trackingMosaicImage = document.createElement('canvas');
 let trackingMosaicBounds = null;
 let trackingMosaicRequest = 0;
 let trackingMosaicTimer = 0;
 let trackingMosaicBusy = false;
+const trackingMosaicFrames = new Map();
 let overlayRequest = 0;
 let overlayGpuIdle = Promise.resolve();
+let overlayGpuSession = null;
+let overlayLiveRequest = 0;
+let overlayLiveBitmap = null;
+let overlayLiveRunning = false;
+let overlayGpuInFlight = 0;
 let pathOverlay = document.createElement('canvas');
 let overlayContributors = [];
 let overlayBounds = null;
 let overlaySelectedImage = null;
 let overlaySelectionRequest = 0;
-function clearPathOverlay() {
+let overlayPoseDraft = null;
+function releaseOverlayGpuSession() {
+  overlayLiveRequest++;
+  const session = overlayGpuSession; overlayGpuSession = null;
+  if (session) void overlayGpuIdle.then(() => session.renderer.destroy());
+}
+function clearPathOverlay(preserveGpu = false) {
+  if (!preserveGpu) releaseOverlayGpuSession();
+  overlayLiveRequest++; overlayLiveBitmap?.close(); overlayLiveBitmap = null;
   closeOverlayTiles(pathOverlay);
   if (!pathOverlay.tiles) pathOverlay.width = pathOverlay.height = 0;
   pathOverlay = document.createElement('canvas');
   overlaySelectedImage?.bitmap.close();
   overlaySelectedImage = null;
+  overlayPoseDraft = null;
   overlayContributors = [];
   overlayBounds = null;
   overlaySelectionRequest++;
@@ -174,6 +1251,15 @@ function clearPathOverlay() {
   selector.replaceChildren(new Option('Mischbild', ''));
   selector.disabled = true;
   element('trackingOverlayInspect').disabled = true;
+  updateOverlayPoseControls();
+}
+function updateOverlayPoseControls() {
+  const changed = overlayPoseDraft && (overlayPoseDraft.pose.x !== overlayPoseDraft.originalPose.x ||
+    overlayPoseDraft.pose.y !== overlayPoseDraft.originalPose.y ||
+    overlayPoseDraft.pose.rotation !== overlayPoseDraft.originalPose.rotation);
+  const busy = trackingRunning || taskBusy || pathRefitBusy || pcbBusy || Boolean(pathRefitProposal || pcbProposal);
+  element('trackingOverlayPoseApply').disabled = !changed || busy;
+  element('trackingOverlayPoseDiscard').disabled = !changed;
 }
 let overlayZoom = 1;
 let overlayPan = { x: 0, y: 0 };
@@ -193,6 +1279,8 @@ const trackingMaskPaintLayer = document.createElement('canvas');
 let trackingMaskTransform = null;
 let mergeRunning = false;
 let mergeCancelled = false;
+let mergeResultStatus = null;
+let mergeDownloads = [];
 let mergeTilePlan = null;
 const checkerboardView = installCheckerboardView({ canvas: resultCanvas, redraw: () => draw(),
   getState: () => ({ visible: view === 'rectified', ready: rectifiedReady && Boolean(calibration) && video.paused && !rectifiedPlayback && !taskBusy && !navigationBusy && !trackingRunning,
@@ -263,6 +1351,7 @@ function updateMemoryStats() {
   const canvases = [rawImage, fieldImage, coverageImage, residualImage, rectifiedImage, rawCanvas, resultCanvas];
   const canvasBytes = canvases.reduce((sum, canvas) => sum + canvas.width * canvas.height * 4, 0);
   const heap = performance.memory;
+  const frameCacheStats = frameReader.cacheStats();
   footer.replaceChildren();
   const entries = [
     ['Beobachtungspunkte', framePoints.toLocaleString('de-DE')],
@@ -270,6 +1359,7 @@ function updateMemoryStats() {
     ['Vektor-Nutzlast (geschaetzt)', megabytes(pointBytes)],
     ['Kalibrierungsarrays', megabytes(arrayBytes)],
     ['Bildpuffer', megabytes(canvasBytes)],
+    ['Entzerrter Framecache', `${frameCacheStats.frames.toLocaleString('de-DE')} Frames / ${megabytes(frameCacheStats.bytes)}`],
     ['JS-Heap (Hauptseite)', heap ? `${megabytes(heap.usedJSHeapSize)} / ${megabytes(heap.jsHeapSizeLimit)}` : 'nicht verfuegbar']
   ];
   for (const [label, value] of entries) {
@@ -553,11 +1643,27 @@ function trackingForExport() {
 
 function restoreTracking(tracking) {
   if (!tracking?.path?.length) return;
+  pathZoom = 1; pathPan = { x: 0, y: 0 };
   trackingImageMask = null;
   trackingMaskHasSelection = false;
   trackingDataset = tracking;
   trackingPath = tracking.path;
+  fineUi?.restore(tracking.fineAlignment);
+  trackingDataset.matchNetwork = migrateMatchNetwork(tracking, currentNetworkGeometryKey());
+  networkSelectedPair = null; networkSelectedCell = null; networkDeleteUndo = null; networkViewKey = '';
+
   trackingFailures = Array.isArray(tracking.failures) ? tracking.failures : [];
+  pcbUndo = null;
+  if (tracking.pcbRealignmentDraft?.schemaVersion === 1)
+    text('pcbRealignStatus', `PCB-Realignment unterbrochen: ${tracking.pcbRealignmentDraft.matches?.length ?? 0} Paare gespeichert. Nach Zuordnung des passenden Videos erneut Berechnen waehlen.`);
+  if (Array.isArray(tracking.pcbRealignment?.originalPoses)) {
+    const original = new Map(tracking.pcbRealignment.originalPoses);
+    pcbUndo = { poses: original, dataset: { ...tracking, pcbRealignment: undefined } };
+    updatePcbControls();
+    text('pcbRealignStatus', `PCB-Realignment geladen: ${tracking.pcbRealignment.keyframes?.length ?? 0} Keyframes; Posekorrektur kann rueckgaengig gemacht werden.`);
+    refreshPcbPairDiagnostics();
+  }
+  if (tracking.reduction) text('frameReductionStatus', `${trackingPath.length} registrierte Frames nach Framereduzierung. Die entfernten Frames sind nicht im geladenen Datensatz.`);
   const last = [...trackingPath].reverse().find(entry => entry.pose);
   if (!last) return;
   trackingRectangle = last.rectangle ?? tracking.rectangle ?? tracking.options?.rectangle ?? trackingRectangle;
@@ -591,7 +1697,7 @@ function updateControls() {
   checkerboardView.refresh();
   updateCorrectionDataStatus();
   const hasVideo = Boolean(videoInfo);
-  element('globalUseWebGpu').disabled = taskBusy || continuous || rectifiedPlayback || trackingRunning;
+  updateGpuAdapterControl();
   for (const id of ['firstFrame', 'previousFrame', 'nextFrame', 'timeline']) element(id).disabled = !hasVideo || navigationBusy || rectifiedPlayback || trackingRunning;
   element('playButton').disabled = !hasVideo || trackingRunning || (navigationBusy && !rectifiedPlayback);
   element('detectButton').disabled = !hasVideo || taskBusy || continuous || rectifiedPlayback || trackingRunning;
@@ -607,7 +1713,10 @@ function updateControls() {
   element('importButton').disabled = taskBusy || continuous || rectifiedPlayback || trackingRunning;
   element('openVideo').disabled = taskBusy || continuous || rectifiedPlayback || trackingRunning;
   element('resetButton').disabled = taskBusy || continuous || rectifiedPlayback || trackingRunning;
-  const brightnessReady = Boolean(calibration && trackingPath.some(entry => entry.pose) && !trackingRunning);
+  const brightnessFrames = [...frames.values()].filter(frame =>
+    frame.accepted && frame.enabled && !frame.patchSize && frame.points.length >= 4).length;
+  const brightnessReady = Boolean(calibration && hasVideo && brightnessFrames >= 5 &&
+    !continuous && !rectifiedPlayback && !trackingRunning);
   element('brightnessFit').disabled = !brightnessReady || taskBusy || brightnessRunning;
   element('brightnessPause').disabled = !brightnessRunning;
   element('brightnessResume').disabled = !brightnessReady || taskBusy || brightnessRunning || !brightnessPaused || !brightnessSession;
@@ -632,6 +1741,7 @@ function updateControls() {
   text('resultState', calibration ? `Feld v${calibration.version} | ${stale ? 'veraltet' : calibration.quality === 'validated' ? 'validiert' : 'vorlaeufig'}` : 'Keine Kalibrierung');
   updateMergeControls();
   updateTrackingControls();
+  updatePcbControls();
 }
 
 async function task(operation) {
@@ -1226,14 +2336,16 @@ function draw() {
 }
 
 function updateTrackingControls() {
+  fineUi?.refresh();
+  updateGpuAdapterControl();
   element('trackingSearchRadius').max = '1024';
   const ready = Boolean(videoInfo && calibration && videoInfo.width === calibration.field.width && videoInfo.height === calibration.field.height && !taskBusy && !continuous && !rectifiedPlayback);
   const canContinue = trackingPath.some(entry => entry.pose) && trackingNextIndex <= number('trackingEnd', 0);
   element('trackingStartButton').disabled = !ready || trackingRunning || trackingPreviewBusy || !trackingRectangle;
   element('trackingPauseButton').disabled = !trackingRunning;
-  element('trackingResumeButton').disabled = !ready || trackingRunning || trackingPreviewBusy || !trackingRectangle ||
+  element('trackingResumeButton').disabled = !ready || trackingRunning || trackingPreviewBusy || !trackingRectangle || Boolean(trackingDataset?.reduction) ||
     trackingLost || (!trackingPaused && !canContinue) || trackingNextIndex > number('trackingEnd', 0);
-  element('trackingResetButton').disabled = trackingRunning || trackingPreviewBusy;
+  element('trackingResetButton').disabled = taskBusy || trackingRunning || trackingPreviewBusy;
   element('trackingExportButton').disabled = !trackingPath.some(entry => entry.pose);
   for (const control of document.querySelectorAll('.tracking-settings input, .tracking-settings select')) control.disabled = trackingRunning || trackingPreviewBusy;
   element('trackingSelectWindow').disabled = trackingRunning || trackingPreviewBusy || !trackingPreviewImage.width;
@@ -1247,18 +2359,25 @@ function updateTrackingControls() {
 
 function resetTrackingWorker() {
   trackingComputer.terminate();
-  trackingComputer = new WorkerClient('/compute-worker.js', showProgress);
+  trackingComputer = new WorkerClient('./compute-worker.js', showProgress);
 }
 
 function clearTrackingResults(preserveRectangle = false) {
+  fineUi?.restore(null);
+  pcbCancelled = true; pcbWorker?.terminate(); pcbProposal = null; pcbUndo = null;
+  resetFrameReduction();
   trackingInspector.clear();
   overlayRequest++;
   trackingMosaicRequest++; clearTimeout(trackingMosaicTimer);
   trackingMosaicImage.width = trackingMosaicImage.height = 0; trackingMosaicBounds = null;
+  trackingMosaicFrames.clear();
   pathHover = null; pathSelection = null; pathProject = null;
   pathRefitProposal = null; pathRefitBusy = false;
   clearPathOverlay();
-  element('trackingOverlayPane').hidden = true;
+  element('trackingOverlayEmpty').hidden = false;
+  text('trackingMatchTabFrame', '');
+  element('trackingMatchEmpty').hidden = false;
+  activateTrackingTab('poses');
   trackingPreviewRequest++;
   trackingRunning = false;
   trackingPaused = false;
@@ -1419,6 +2538,9 @@ function drawTrackingFrame(bitmap) {
 async function showTrackedFrame(entry) {
   if (trackingRunning || trackingPreviewBusy || taskBusy) return;
   trackingInspector.show(entry);
+  text('trackingMatchTabFrame', `(#${entry.frame})`);
+  element('trackingMatchEmpty').hidden = true;
+  activateTrackingTab('match');
   const request = ++trackingPreviewRequest;
   trackingPreviewBusy = true; updateTrackingControls();
   try {
@@ -1503,7 +2625,7 @@ async function previewTrackingStartFrame() {
 }
 
 async function renderTrackingMosaic() {
-  if (trackingRunning || pathRefitBusy || trackingMosaicBusy || !videoInfo || !calibration?.maps || !trackingPath.some(entry => entry.pose)) return;
+  if (fineBusy || mergeRunning || trackingRunning || pathRefitBusy || overlayGpuInFlight || trackingMosaicBusy || !videoInfo || !calibration?.maps || !trackingPath.some(entry => entry.pose)) return;
     trackingMosaicBusy = true;
     const request = trackingMosaicRequest;
     const geometries = trackingPath.map(trackingGeometry).filter(Boolean);
@@ -1518,31 +2640,40 @@ async function renderTrackingMosaic() {
       const context = composite.getContext('2d');
       const local = document.createElement('canvas');
       for (const geometry of selected) {
-        if (trackingRunning || request !== trackingMosaicRequest) return;
-        const decoded = await readTrackingFrame(geometry.entry.frame, { rectified: true });
-        try {
-          const localScale = Math.min(1, scale);
-          local.width = Math.max(1, Math.ceil(geometry.width * localScale));
-          local.height = Math.max(1, Math.ceil(geometry.height * localScale));
-          const localContext = local.getContext('2d', { willReadFrequently: true });
-          localContext.clearRect(0, 0, local.width, local.height);
-          localContext.drawImage(decoded.bitmap, 0, 0, local.width, local.height);
-          const image = localContext.getImageData(0, 0, local.width, local.height);
-          for (let y = 0; y < local.height; y++) for (let x = 0; x < local.width; x++) {
-            const sourceX = (x + 0.5) / localScale;
-            const sourceY = (y + 0.5) / localScale;
-            const alpha = (y * local.width + x) * 4 + 3;
-            const weight = trackingPixelAllowed(sourceX, sourceY) ?
-              edgeFeatherWeight(sourceX, sourceY, geometry.width, geometry.height, 0.1) : 0;
-            image.data[alpha] = Math.round(image.data[alpha] * weight);
-          }
-          localContext.putImageData(image, 0, 0);
-          const origin = geometry.world(0, 0);
-          const factor = scale / localScale;
-          context.setTransform(factor * geometry.c, factor * geometry.s, -factor * geometry.s, factor * geometry.c,
-            scale * (origin.x - bounds.minX), scale * (origin.y - bounds.minY));
-          context.drawImage(local, 0, 0);
-        } finally { decoded.bitmap.close(); }
+        if (fineBusy || mergeRunning || trackingRunning || request !== trackingMosaicRequest) return;
+        const maps = calibration.maps, brightness = brightnessCalibration;
+        const localScale = Math.min(1, 640 / Math.max(geometry.width, geometry.height));
+        local.width = Math.max(1, Math.ceil(geometry.width * localScale));
+        local.height = Math.max(1, Math.ceil(geometry.height * localScale));
+        const localContext = local.getContext('2d', { willReadFrequently: true });
+        let thumbnail = trackingMosaicFrames.get(geometry.entry.frame);
+        if (!thumbnail || thumbnail.decoder !== decoder || thumbnail.maps !== maps ||
+            thumbnail.brightness !== brightness || thumbnail.image.width !== local.width ||
+            thumbnail.image.height !== local.height) {
+          const decoded = await readTrackingFrame(geometry.entry.frame, { rectified: true });
+          try {
+            if (fineBusy || mergeRunning || trackingRunning || request !== trackingMosaicRequest) return;
+            localContext.clearRect(0, 0, local.width, local.height);
+            localContext.drawImage(decoded.bitmap, 0, 0, local.width, local.height);
+            thumbnail = { decoder, maps, brightness, image: localContext.getImageData(0, 0, local.width, local.height) };
+            trackingMosaicFrames.set(geometry.entry.frame, thumbnail);
+          } finally { decoded.bitmap.close(); }
+        }
+        const image = new ImageData(new Uint8ClampedArray(thumbnail.image.data), local.width, local.height);
+        for (let y = 0; y < local.height; y++) for (let x = 0; x < local.width; x++) {
+          const sourceX = (x + 0.5) / localScale;
+          const sourceY = (y + 0.5) / localScale;
+          const alpha = (y * local.width + x) * 4 + 3;
+          const weight = trackingPixelAllowed(sourceX, sourceY) ?
+            edgeFeatherWeight(sourceX, sourceY, geometry.width, geometry.height, 0.1) : 0;
+          image.data[alpha] = Math.round(image.data[alpha] * weight);
+        }
+        localContext.putImageData(image, 0, 0);
+        const origin = geometry.world(0, 0);
+        const factor = scale / localScale;
+        context.setTransform(factor * geometry.c, factor * geometry.s, -factor * geometry.s, factor * geometry.c,
+          scale * (origin.x - bounds.minX), scale * (origin.y - bounds.minY));
+        context.drawImage(local, 0, 0);
       }
       if (!trackingPath.length) return;
       trackingMosaicImage = composite; trackingMosaicBounds = bounds;
@@ -1551,7 +2682,7 @@ async function renderTrackingMosaic() {
       if (request === trackingMosaicRequest) console.warn('Tracking-Mosaik:', error.message);
     } finally {
       trackingMosaicBusy = false;
-      if (request !== trackingMosaicRequest && trackingPath.length && !trackingRunning && !pathRefitBusy) {
+      if (request !== trackingMosaicRequest && trackingPath.length && !fineBusy && !mergeRunning && !trackingRunning && !pathRefitBusy && !overlayGpuInFlight) {
         clearTimeout(trackingMosaicTimer);
         trackingMosaicTimer = setTimeout(() => void renderTrackingMosaic(), 100);
       }
@@ -1561,19 +2692,152 @@ async function renderTrackingMosaic() {
 function scheduleTrackingMosaic() {
   trackingMosaicRequest++;
   clearTimeout(trackingMosaicTimer);
-  if (trackingRunning || pathRefitBusy) return;
+  if (fineBusy || mergeRunning || trackingRunning || pathRefitBusy) return;
   trackingMosaicTimer = setTimeout(() => void renderTrackingMosaic(), 250);
+}
+
+function displayedNetworkStrength(pair) {
+  let quality=0,confirmed=0;
+  for(const cell of pair.cells){quality+=cell.quality??1;confirmed+=(cell.quality??1)*(cell.confidence??1);}
+  return pair.weight*(quality?confirmed/quality:1);
+}
+function refreshMatchNetworkControls(network, pairs, poses) {
+  const shown = element('trackingNetworkShow').checked;
+  const key = `${network.revision}|${pairs.map(pair=>pair.id).join(',')}|${networkSelectedPair}|${networkSelectedCell}|${shown}`;
+  if (key !== networkViewKey) {
+    networkViewKey = key;
+    const selector = element('trackingNetworkPair');
+    selector.replaceChildren(new Option('Verbindung auswaehlen', ''));
+    for (const pair of pairs) selector.add(new Option(`#${pair.reference} \u2194 #${pair.current} | ${pair.cells.length} Messpunkte | Staerke ${fixed(displayedNetworkStrength(pair),1)}`,pair.id));
+    selector.value = networkSelectedPair ?? '';
+    const cells = element('trackingNetworkCell');
+    cells.replaceChildren(new Option('Alle Messpunkte', ''));
+    const pair = pairs.find(pair => pair.id === networkSelectedPair);
+    for (const cell of pair?.cells ?? []) cells.add(new Option(`${cell.normal?'Kante':'Zelle'} ${cell.sourceCellId ?? cell.id} | ${cell.psr === null ? 'Geometrie' : `PSR ${fixed(cell.psr,1)}`} | Vertrauen ${fixed(100*(cell.confidence??1),0)}%`, cell.id));
+    cells.value = networkSelectedCell ?? '';
+  }
+  const pair = pairs.find(pair => pair.id === networkSelectedPair);
+  const busy = trackingRunning || taskBusy || pathRefitBusy || pcbBusy;
+  element('trackingNetworkPair').disabled = !shown || !pairs.length;
+  element('trackingNetworkCell').disabled = !shown || !pair?.cells.length;
+  element('trackingNetworkDeleteCell').disabled = !shown || busy || !pair?.cells.some(cell => cell.id === networkSelectedCell);
+  element('trackingNetworkDeletePair').disabled = !shown || busy || !pair;
+  element('trackingNetworkUndo').disabled = busy || !networkDeleteUndo;
+  const cells = pair ? projectNetworkCells(pair,poses) : [];
+  const cell = cells.find(cell => cell.id === networkSelectedCell);
+  const normalAngle=pair?poses.get(pair.reference)?.rotation??0:0;
+  const normal=cell?.normal?{x:Math.cos(normalAngle)*cell.normal.x-Math.sin(normalAngle)*cell.normal.y,
+    y:Math.sin(normalAngle)*cell.normal.x+Math.cos(normalAngle)*cell.normal.y}:null;
+  const error = cell ? normal?Math.abs((cell.referenceWorld.x-cell.currentWorld.x)*normal.x+(cell.referenceWorld.y-cell.currentWorld.y)*normal.y):
+    Math.hypot(cell.referenceWorld.x-cell.currentWorld.x,cell.referenceWorld.y-cell.currentWorld.y) : null;
+  const count = pairs.reduce((sum,pair)=>sum+pair.cells.length,0);
+  const inactive = pair && !networkEdges({...network,pairs:[pair]}).length;
+  text('trackingNetworkInfo', !shown ? 'Match-Netz ausgeblendet.' :
+    pair ? `#${pair.reference} \u2194 #${pair.current} | ${pair.cells.length} Messpunkte | Staerke ${fixed(displayedNetworkStrength(pair),1)} | ${pair.method}` +
+      `${pair.approximate ? ' | Punktlagen aus gespeicherter Bildpose rekonstruiert' : ''}` +
+      `${inactive ? ' | Zu wenige verteilte Messpunkte: Verbindung inaktiv' : ''}` +
+      `${error !== null ? ` | ${normal?'Kantenabstand quer':'Punktabstand'} ${fixed(error,2)} px` : ''}` +
+      `${normal?' | Wirkt nur quer zur Kante; entlang bleibt frei':''}` +
+      `${cell?.validationReason ? ` | Nachpruefung: ${cell.validationReason} (Vertrauen ${fixed(100*(cell.confidence??1),0)}%)` : ''}` :
+    `${pairs.length}/${network.pairs.length} Bildverbindungen | ${count} Messpunkte der aktiven Bilder. Punkte oder Linien anklicken; Gruen: stark, Orange: schwach.`);
+}
+function drawMatchNetwork(context, project, entries, geometries, width, height) {
+  const network = currentMatchNetwork();
+  const point = pathSelection ?? pathHover;
+  const active = overlayContributors.length ? new Set(overlayContributors.map(g=>g.entry.frame)) :
+    new Set(point ? geometries.filter(g=>g.supports(point,trackingPixelAllowed)).map(g=>g.entry.frame) : []);
+  const poses = new Map(entries.map(entry=>[entry.frame,entry.pose]));
+  if (overlayPoseDraft) poses.set(overlayPoseDraft.frame,overlayPoseDraft.pose);
+  const all = element('trackingNetworkAll').checked;
+  networkVisiblePairs = network.pairs.filter(pair=>poses.has(pair.reference)&&poses.has(pair.current)&&
+    (all||active.has(pair.reference)||active.has(pair.current)));
+  if (!networkVisiblePairs.some(pair=>pair.id === networkSelectedPair)) {
+    networkSelectedPair = null; networkSelectedCell = null;
+  }
+  refreshMatchNetworkControls(network,networkVisiblePairs,poses);
+  networkHitTargets = [];
+  if (!element('trackingNetworkShow').checked) return;
+  context.save();
+  const visible = (a,b) => Math.max(a.x,b.x)>=-8 && Math.min(a.x,b.x)<=width+8 &&
+    Math.max(a.y,b.y)>=-8 && Math.min(a.y,b.y)<=height+8;
+  for (const pair of networkVisiblePairs) {
+    const selected = pair.id === networkSelectedPair;
+    const strength = Math.min(1,Math.log1p(displayedNetworkStrength(pair))/Math.log(257));
+    const color = selected ? '#663bb2' : strength>.6 ? '#087d63' : '#b87912';
+    const a = project(poses.get(pair.reference)), b = project(poses.get(pair.current));
+    context.strokeStyle=color; context.globalAlpha=selected?.8:.25; context.lineWidth=selected?2:1;
+    if (visible(a,b)) { context.beginPath();context.moveTo(a.x,a.y);context.lineTo(b.x,b.y);context.stroke();
+      networkHitTargets.push({pairId:pair.id,cellId:null,a,b}); }
+    for (const cell of projectNetworkCells(pair,poses)) {
+      const a=project(cell.referenceWorld),b=project(cell.currentWorld);
+      if (!visible(a,b)) continue;
+      const highlighted=selected&&cell.id===networkSelectedCell;
+      context.globalAlpha=highlighted?1:selected?.75:.3+.4*strength;
+      context.strokeStyle=highlighted?'#cb294b':(cell.confidence??1)<.5?'#b87912':color;context.fillStyle=context.strokeStyle;
+      context.lineWidth=highlighted?2.5:.75+strength;
+      context.beginPath();context.moveTo(a.x,a.y);context.lineTo(b.x,b.y);context.stroke();
+      for (const p of [a,b]) {context.beginPath();context.arc(p.x,p.y,highlighted?5:selected?3:2,0,2*Math.PI);context.stroke();}
+      networkHitTargets.push({pairId:pair.id,cellId:cell.id,a,b});
+    }
+  }
+  context.restore();
+}
+function hitMatchNetwork(point) {
+  let nearest=null,best=7;
+  for (const target of networkHitTargets) {
+    const dx=target.b.x-target.a.x,dy=target.b.y-target.a.y;
+    const denominator=dx*dx+dy*dy;
+    const t=denominator?Math.max(0,Math.min(1,((point.x-target.a.x)*dx+(point.y-target.a.y)*dy)/denominator)):0;
+    const distance=Math.hypot(point.x-target.a.x-t*dx,point.y-target.a.y-t*dy)+(target.cellId===null?1:0);
+    if(distance<best){best=distance;nearest=target;}
+  }
+  return nearest;
+}
+function installMatchNetworkControls() {
+  for(const id of ['trackingNetworkShow','trackingNetworkAll'])element(id).onchange=()=>{networkViewKey='';drawTrackingPath();};
+  element('trackingNetworkPair').onchange=event=>{
+    networkSelectedPair=event.target.value||null;networkSelectedCell=null;networkViewKey='';drawTrackingPath();
+  };
+  element('trackingNetworkCell').onchange=event=>{
+    networkSelectedCell=event.target.value||null;networkViewKey='';drawTrackingPath();
+  };
+  const remove=cell=>{
+    if(trackingRunning||taskBusy||pathRefitBusy||pcbBusy||!networkSelectedPair)return;
+    const network=currentMatchNetwork();
+    const next=deleteNetworkMatch(network,networkSelectedPair,cell?networkSelectedCell:null);
+    if(next===network)return;
+    networkDeleteUndo=network;
+    trackingDataset={...trackingDataset,matchNetwork:next};
+    if(pcbUndo)pcbUndo.dataset={...pcbUndo.dataset,matchNetwork:next};
+    pcbProposal=null;pathRefitProposal=null;updatePcbControls();updatePathRefitControls();
+    text('trackingPathRefitInfo','Match-Netz geaendert. Positionsvorschlag erneut berechnen.');
+    if(!cell)networkSelectedPair=null;
+    networkSelectedCell=null;networkViewKey='';drawTrackingPath();
+    if(pathSelection)void loadPathOverlay(pathSelection);
+  };
+  element('trackingNetworkDeleteCell').onclick=()=>remove(true);
+  element('trackingNetworkDeletePair').onclick=()=>remove(false);
+  element('trackingNetworkUndo').onclick=()=>{
+    if(!networkDeleteUndo||trackingRunning||taskBusy||pathRefitBusy||pcbBusy)return;
+    trackingDataset={...trackingDataset,matchNetwork:networkDeleteUndo};
+    if(pcbUndo)pcbUndo.dataset={...pcbUndo.dataset,matchNetwork:networkDeleteUndo};
+    networkDeleteUndo=null;pcbProposal=null;pathRefitProposal=null;
+    updatePcbControls();updatePathRefitControls();networkViewKey='';drawTrackingPath();
+    if(pathSelection)void loadPathOverlay(pathSelection);
+  };
 }
 
 function drawTrackingPath() {
   const poses = trackingPath.filter(entry => entry.pose);
   const { context, width, height } = trackingCanvasContext('trackingPathCanvas');
   context.clearRect(0, 0, width, height);
-  if (!poses.length) { pathProject = null; element('trackingPathEmpty').hidden = false; return; }
+  if (!poses.length) { networkHitTargets=[];networkVisiblePairs=[];refreshMatchNetworkControls(currentMatchNetwork(),[],new Map());pathProject = null; pathZoom = 1; pathPan = { x: 0, y: 0 };
+    element('trackingPathEmpty').hidden = false; return; }
   element('trackingPathEmpty').hidden = true;
   const geometries = trackingPath.map(entry => frameGeometry(entry, calibration?.field, calibration?.maps)).filter(Boolean);
   const corners = geometries.flatMap(geometry => geometry.corners);
-  const proposed = pathRefitProposal ? [...pathRefitProposal.byFrame.values()].map(item => item.pose) : [];
+  const activeProposal = pathRefitProposal?.byFrame ?? pcbProposal?.byFrame;
+  const proposed = activeProposal ? [...activeProposal.values()].map(item => item.pose ?? item) : [];
   const bounds = pointBounds([poses.map(entry => entry.pose), proposed, corners], { x: 0, y: 0 });
   const minimumX = bounds.minX; const maximumX = bounds.maxX;
   const minimumY = bounds.minY; const maximumY = bounds.maxY;
@@ -1581,16 +2845,22 @@ function drawTrackingPath() {
   const rangeY = Math.max(1, maximumY - minimumY);
   const padding = 28;
   const scale = Math.min((width - 2 * padding) / rangeX, (height - 2 * padding) / rangeY);
-  const project = pose => ({ x: padding + (pose.x - minimumX) * scale, y: height - padding - (pose.y - minimumY) * scale });
+  const centerX = (minimumX + maximumX) / 2, centerY = (minimumY + maximumY) / 2;
+  const clampPan = (pan, extent, size) => extent <= size - 2 * padding ? 0 :
+    Math.max(size - padding - (size + extent) / 2, Math.min(padding - (size - extent) / 2, pan));
+  pathPan.x = clampPan(pathPan.x, rangeX * scale * pathZoom, width);
+  pathPan.y = clampPan(pathPan.y, rangeY * scale * pathZoom, height);
+  const project = pose => ({ x: width / 2 + (pose.x - centerX) * scale * pathZoom + pathPan.x,
+    y: height / 2 + (pose.y - centerY) * scale * pathZoom + pathPan.y });
   pathProject = project;
-  pathProject.invert = point => ({ x: minimumX + (point.x - padding) / scale,
-    y: minimumY + (height - padding - point.y) / scale });
+  pathProject.invert = point => ({ x: centerX + (point.x - width / 2 - pathPan.x) / (scale * pathZoom),
+    y: centerY + (point.y - height / 2 - pathPan.y) / (scale * pathZoom) });
   if (trackingMosaicImage.width && trackingMosaicBounds) {
-    const topLeft = project({ x: trackingMosaicBounds.minX, y: trackingMosaicBounds.maxY });
-    const bottomRight = project({ x: trackingMosaicBounds.maxX, y: trackingMosaicBounds.minY });
+    const topLeft = project({ x: trackingMosaicBounds.minX, y: trackingMosaicBounds.minY });
+    const bottomRight = project({ x: trackingMosaicBounds.maxX, y: trackingMosaicBounds.maxY });
     context.save(); context.globalAlpha = 0.82;
-    context.translate(topLeft.x, bottomRight.y); context.scale(1, -1);
-    context.drawImage(trackingMosaicImage, 0, 0, bottomRight.x - topLeft.x, bottomRight.y - topLeft.y);
+    context.drawImage(trackingMosaicImage, topLeft.x, topLeft.y,
+      bottomRight.x - topLeft.x, bottomRight.y - topLeft.y);
     context.restore();
   }
   const selected = pathHover ?? pathSelection;
@@ -1615,14 +2885,16 @@ function drawTrackingPath() {
   context.strokeStyle = '#067566'; context.lineWidth = 2; context.beginPath();
   poses.forEach((entry, index) => { const point = project(entry.pose); index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y); });
   context.stroke();
-  if (pathRefitProposal) {
+  if (activeProposal) {
     context.strokeStyle = '#c6404a'; context.lineWidth = 2; context.setLineDash([6, 4]); context.beginPath();
     poses.forEach((entry, index) => {
-      const point = project(pathRefitProposal.byFrame.get(entry.frame)?.pose ?? entry.pose);
+      const proposedPose = activeProposal.get(entry.frame);
+      const point = project(proposedPose?.pose ?? proposedPose ?? entry.pose);
       index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y);
     });
     context.stroke(); context.setLineDash([]);
   }
+  drawMatchNetwork(context, project, poses, geometries, width, height);
   const latest = project(poses.at(-1).pose);
   context.fillStyle = '#c6404a'; context.beginPath(); context.arc(latest.x, latest.y, 4, 0, Math.PI * 2); context.fill();
   if (selected) {
@@ -1632,6 +2904,7 @@ function drawTrackingPath() {
 }
 
 function updatePathRefitControls() {
+  updateGpuAdapterControl();
   element('trackingPathRefit').disabled = pathRefitBusy || Boolean(pathRefitProposal) || !pathSelection || trackingPath.length < 2;
   element('trackingPathRefitApply').disabled = pathRefitBusy || !pathRefitProposal?.overlayReady;
   const discard = element('trackingPathRefitDiscard');
@@ -1642,7 +2915,7 @@ function updatePathRefitControls() {
 }
 
 function trackingGeometry(entry) {
-  const proposed = pathRefitProposal?.byFrame.get(entry.frame)?.pose;
+  const proposed = pathRefitProposal?.byFrame.get(entry.frame)?.pose ?? pcbProposal?.byFrame.get(entry.frame);
   return frameGeometry(proposed ? { ...entry, pose: proposed } : entry, calibration?.field, calibration?.maps);
 }
 
@@ -1653,12 +2926,16 @@ function mergePlan() {
 }
 
 function updateMergeControls() {
-  const ready = Boolean(calibration && trackingPath.some(entry => entry.pose) && trackingVideoCompatible(trackingDataset, videoInfo));
+  updateGpuAdapterControl();
+  const ready = Boolean(useWebGpu() && calibration && trackingPath.some(entry => entry.pose) &&
+    trackingVideoCompatible(trackingDataset, videoInfo));
   element('mergeStart').disabled = !ready || taskBusy || mergeRunning;
   element('mergeCancel').disabled = !mergeRunning;
-  text('mergeState', mergeRunning ? 'Laeuft' : ready ? 'Bereit' : 'Nicht bereit');
+  text('mergeState', mergeRunning ? 'Laeuft' : ready ? 'Bereit' : useWebGpu() ? 'Nicht bereit' : 'WebGPU aus');
   element('mergeState').className = `tag ${ready ? 'good' : ''}`;
   if (workflow !== 'merge' || mergeRunning) return;
+  if (mergeResultStatus) { text('mergeStatus', mergeResultStatus); return; }
+  if (!useWebGpu()) { text('mergeStatus', 'FÃƒÂ¼r Merge ein WebGPU-GerÃƒÂ¤t auswÃƒÂ¤hlen.'); return; }
   const plan = mergePlan();
   if (!plan.bounds) {
     text('mergeMetrics', 'Keine Ausgabe geplant');
@@ -1668,22 +2945,23 @@ function updateMergeControls() {
   const key = `${calibration.maps.outputWidth}x${calibration.maps.outputHeight}`;
   const tileSize = mergeTilePlan?.key === key ? mergeTilePlan.tileSize : 2048;
   const estimate = mergeEstimate(plan.bounds, tileSize);
+  const files = planTiffParts({ ...plan.bounds, tileSize, tiles: [] }, 'merge.tif', element('mergeSplit').value);
   text('mergeMetrics', `${plan.bounds.width} x ${plan.bounds.height} px | ${plan.geometries.length} Frames | ` +
     `${trackingMaskHasSelection ? 'Rohmaske aktiv' : 'gesamter Bildbereich'}`);
-  text('mergeStatus', `${estimate.tiles} Kacheln bei ${tileSize} px | BigTIFF bis ca. ${megabytes(estimate.tiles * tileSize * tileSize * 4)}`);
+  text('mergeStatus', `${files.length} TIFF-Datei(en) | ${estimate.tiles} Kacheln bei ${tileSize} px | BigTIFF verlustfrei komprimiert | unkomprimiert bis ca. ${megabytes(estimate.tiles * tileSize * tileSize * 4)}`);
 }
 
 async function updateMergeTilePlan() {
-  if (!calibration?.maps || !navigator.gpu) return;
-  const adapter = await navigator.gpu.requestAdapter();
+  if (!calibration?.maps || !useWebGpu()) return;
+  const adapter = await requestSelectedGpuAdapter();
   if (!adapter) return;
   mergeTilePlan = { key: `${calibration.maps.outputWidth}x${calibration.maps.outputHeight}`,
-    tileSize: overlayTileSize(calibration.maps, adapter.limits.maxTextureDimension2D) };
+    tileSize: Math.min(2048, overlayTileSize(calibration.maps, adapter.limits.maxTextureDimension2D)) };
   updateMergeControls();
 }
 
 function prepareMergePreview(bounds) {
-  const scale = Math.min(1, 2048 / Math.max(bounds.width, bounds.height));
+  const scale = Math.min(1, 4096 / Math.max(bounds.width, bounds.height));
   mergePreviewImage.width = Math.max(1, Math.ceil(bounds.width * scale));
   mergePreviewImage.height = Math.max(1, Math.ceil(bounds.height * scale));
   const context = mergePreviewImage.getContext('2d');
@@ -1736,7 +3014,7 @@ function installMergePreviewInteraction() {
   new ResizeObserver(renderMergePreview).observe(canvas.parentElement);
 }
 
-async function renderMergeToBigTiff(handle) {
+async function renderMergeToBigTiff(createHandle, onPart = () => {}) {
   const maxFrames = number('mergeMaxFrames', 3);
   const edgeFeather = number('mergeEdgeFeather', 10) / 100;
   if (!Number.isInteger(maxFrames) || maxFrames < 1 || maxFrames > 64) throw new Error('Scharfe Frames je Pixel muss zwischen 1 und 64 liegen.');
@@ -1745,23 +3023,29 @@ async function renderMergeToBigTiff(handle) {
   if (!bounds || !geometries.length) throw new Error('Keine gueltigen Tracking-Posen fuer den Merge.');
   const selectedGeometries = selectMergeFrames(geometries, maxFrames, trackingPixelAllowed, edgeFeather);
   if (!selectedGeometries.length) throw new Error('Die Trackingmaske enthaelt keine verwendbaren Merge-Bereiche.');
-  const adapter = await navigator.gpu?.requestAdapter();
+  const adapter = await requestSelectedGpuAdapter();
   if (!adapter) throw new Error('Merge benoetigt WebGPU.');
-  const tileSize = overlayTileSize(calibration.maps, adapter.limits.maxTextureDimension2D);
+  const tileSize = Math.min(2048, overlayTileSize(calibration.maps, adapter.limits.maxTextureDimension2D));
   mergeTilePlan = { key: `${calibration.maps.outputWidth}x${calibration.maps.outputHeight}`, tileSize };
   const tiles = overlayTiles(bounds.width, bounds.height, bounds.minX, bounds.minY, selectedGeometries, tileSize,
     { maxFrames, pixelAllowed: trackingPixelAllowed, edgeFeather });
-  const writable = await handle.createWritable();
+  const name = `${(videoInfo?.name || 'mosaic').replace(/\.[^.]+$/, '')}-merge.tif`;
+  const parts = planTiffParts({ ...bounds, tileSize, tiles }, name, element('mergeSplit').value);
+  let writer;
+  mergeResultStatus = null;
   mergeRunning = true; mergeCancelled = false; updateMergeControls();
+  element('mergeSavePreview').disabled = true;
   const preview = prepareMergePreview(bounds);
   try {
-    const writer = await beginBigTiff(writable, { ...bounds, tileSize, tiles }, state => {
-      text('mergePreviewState', `Schreibe Kachel ${state.completed}/${state.total} | ${megabytes(state.bytes)} / ${megabytes(state.fileBytes)}`);
+    writer = await beginTiffParts(parts, typeof createHandle === 'function' ? createHandle : () => createHandle, onPart, state => {
+      text('mergePreviewState', `TIFF ${state.part}/${state.parts} | Kachel ${state.completed}/${state.total} | ${megabytes(state.bytes)} komprimiert`);
     });
+    trackingMosaicRequest++; clearTimeout(trackingMosaicTimer);
+    releaseOverlayGpuSession(); await overlayGpuIdle;
     await frameReader.dispose();
     const result = await renderTiledOverlay({ maps: calibration.maps, ...bounds, geometries: selectedGeometries, pixelAllowed: trackingPixelAllowed,
       maxFrames, edgeFeather, brightness: brightnessCalibration, frameOrder: 'blurriest', blend: element('mergeBlend').value,
-      tileSize, retainTiles: false, decode: index => readTrackingFrame(index, { output: 'native' }),
+      tileSize, retainTiles: false, decode: index => readTrackingFrame(index, { output: 'native', cache: false, measureSharpness: false }),
       cancelled: () => mergeCancelled,
       progress: state => {
         const status = `${state.stage === 'coverage' ? 'Abdeckung' : 'Mischen'} | Kachel ${state.tileIndex + 1}/${state.tileCount} | Frame ${state.frameIndex + 1}/${state.frameCount} (#${state.frame}) | GPU-Durchlauf ${state.framePass}/${state.plannedFramePasses}`;
@@ -1774,27 +3058,57 @@ async function renderMergeToBigTiff(handle) {
           tile.x * preview.scale, tile.y * preview.scale, tile.width * preview.scale, tile.height * preview.scale);
         renderMergePreview();
       } });
-    if (!result || mergeCancelled) { await writable.abort(); text('mergeStatus', 'Merge abgebrochen. Unvollstaendige Datei verworfen.'); return; }
-    const layout = await writer.finish();
-    await writable.close();
-    text('mergeStatus', `Fertig: ${bounds.width} x ${bounds.height} px | ${tiles.length} Kacheln | ${megabytes(layout.fileBytes)} BigTIFF | ` +
-      `${selectedGeometries.length}/${geometries.length} Frames nach Pose-, Masken- und Schaerfeauswahl.`);
-    text('mergePreviewState', 'BigTIFF gespeichert');
+    if (!result || mergeCancelled) { await writer.abort(); mergeResultStatus = 'Merge abgebrochen. Fertige Teile bleiben verfuegbar; der unvollstaendige Teil wurde verworfen.'; return null; }
+    text('mergePreviewState', 'Schliesse Bilddatei ab...');
+    const files = await writer.finish();
+    const totalBytes = files.reduce((sum, file) => sum + file.layout.fileBytes, 0);
+    mergeResultStatus = `Fertig: ${bounds.width} x ${bounds.height} px | ${tiles.length} Kacheln | ${files.length} TIFF-Datei(en), ${megabytes(totalBytes)} gesamt | ` +
+      `${selectedGeometries.length}/${geometries.length} Frames nach Pose-, Masken- und Schaerfeauswahl.`;
+    text('mergePreviewState', 'BigTIFF vollstaendig erstellt');
+    element('mergeSavePreview').disabled = false;
+    const command = tiffJoinCommand(files, bounds.width, bounds.height);
+    element('mergeJoin').hidden = !command; element('mergeJoinCommand').textContent = command;
+    return { files, bounds };
   } catch (error) {
-    try { await writable.abort(); } catch {}
+    try { await writer?.abort(); } catch {}
+    mergeResultStatus = `Merge fehlgeschlagen: ${error.message}`;
     throw error;
   } finally { mergeRunning = false; updateMergeControls(); }
 }
 
 async function startMerge() {
-  if (!globalThis.showSaveFilePicker) throw new Error('BigTIFF-Ausgabe benoetigt die File System Access API in Edge oder Chrome.');
+  if (taskBusy || mergeRunning) return;
   const baseName = (videoInfo?.name || 'mosaic').replace(/\.[^.]+$/, '');
-  let handle;
-  try {
-    handle = await showSaveFilePicker({ suggestedName: `${baseName}-merge.tif`,
-      types: [{ description: 'BigTIFF-Bild', accept: { 'image/tiff': ['.tif', '.tiff'] } }] });
-  } catch (error) { if (error.name === 'AbortError') return; else throw error; }
-  await task(() => renderMergeToBigTiff(handle));
+  let chosenHandle;
+  if (element('mergeSaveMethod').value === 'picker' && element('mergeSplit').value === '0' && globalThis.showSaveFilePicker) {
+    try { chosenHandle = await showSaveFilePicker({ suggestedName: `${baseName}-merge.tif`,
+      types: [{ description: 'BigTIFF (verlustfrei komprimiert)', accept: { 'image/tiff': ['.tif', '.tiff'] } }] }); }
+    catch (error) { if (error.name === 'AbortError') return;
+      if (!['SecurityError', 'NotAllowedError'].includes(error.name)) throw error; }
+  }
+  await task(async () => {
+    for (const download of mergeDownloads) { URL.revokeObjectURL(download.url); await download.handle.dispose?.(); }
+    mergeDownloads = []; element('mergeDownloads').replaceChildren(); element('mergeJoin').hidden = true;
+    const result = await renderMergeToBigTiff(part => chosenHandle ?? createBrowserImageFile(part.name), (part, index, total) => {
+      if (!part.handle.dispose) return;
+      const url = URL.createObjectURL(part.saved), link = document.createElement('a');
+      mergeDownloads.push({ url, handle: part.handle });
+      link.href = url; link.download = part.name; link.style.display = 'block';
+      link.textContent = `${part.name} (${megabytes(part.saved.size)})`;
+      element('mergeDownloads').append(link); link.click();
+      text('mergePreviewState', `TIFF ${index + 1}/${total} fertig. Download gestartet; Links bleiben zum erneuten Speichern verfuegbar.`);
+    });
+    if (result) text('mergePreviewState', chosenHandle ? 'TIFF gespeichert und Dateigroesse geprueft' :
+      `${result.files.length} TIFF-Datei(en) fertig. Falls ein Download fehlt, den Dateilink anklicken.`);
+  });
+}
+
+async function saveMergePreview() {
+  const blob = await new Promise(resolve => mergePreviewImage.toBlob(resolve, 'image/png'));
+  if (!blob) throw new Error('PNG-Uebersicht konnte nicht erstellt werden.');
+  const url = URL.createObjectURL(blob), link = document.createElement('a');
+  link.href = url; link.download = `${(videoInfo?.name || 'mosaic').replace(/\.[^.]+$/, '')}-merge-uebersicht.png`;
+  link.click(); setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
 function localRefitFailure(matches, conditionalLimit) {
@@ -1806,7 +3120,7 @@ function localRefitFailure(matches, conditionalLimit) {
   const reasons = new Map();
   for (const match of matches) {
     const reason = usable(match.forward) ? (usable(match.backward) ?
-      (Number.isFinite(match.reverseDistance) ? (match.reverseDistance <= conditionalLimit ? 'Kein Mehrheitskonsens' :
+      (Number.isFinite(match.reverseDistance) ? (match.reverseDistance <= conditionalLimit ? 'PCB-Zellenpruefung' :
         `Zyklus > ${fixed(conditionalLimit, 1)} px`) : 'Zyklus ungueltig') : 'Rueckwaertssuche') :
       (match.forward?.reason || 'Vorwaertssuche');
     reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
@@ -1901,7 +3215,7 @@ async function fitBrightnessCalibration(restart = false) {
     }
     const sampledFrames = selected.map(observation => session.samples.get(observation.id));
     const heldOut = new Set(sampledFrames.map((_, index) => index % 5 === 4 ? index : -1).filter(index => index >= 0));
-    text('brightnessStatus', `${sampledFrames.length} Checkerboard-Frames | direkte Weißreferenz | lokales Modell`);
+    text('brightnessStatus', `${sampledFrames.length} Checkerboard-Frames | direkte WeiÃƒÅ¸referenz | lokales Modell`);
     const result = fitCheckerboardBrightness(sampledFrames, heldOut, { outputWidth: session.width, outputHeight: session.height,
       maxGain: session.maxGain, allowed: trackingPixelAllowed });
     const frameNumbers = selected.map(frame => frame.id);
@@ -1910,10 +3224,6 @@ async function fitBrightnessCalibration(restart = false) {
     result.metrics.acceptedCells = sampledFrames.reduce((sum, frame) => sum + frame.cells, 0);
     const totalMs = session.timings.totalMs + performance.now() - runStarted;
     result.metrics.timings = { ...session.timings, totalMs };
-    if (!(result.metrics.validationRms < result.metrics.baselineValidationRms * 0.9)) {
-      brightnessPaused = true;
-      throw new Error(`Helligkeitsfeld nicht aktiviert: Validierung verbessert sich nicht ausreichend (${fixed(result.metrics.baselineValidationRms, 3)} -> ${fixed(result.metrics.validationRms, 3)} log).`);
-    }
     brightnessCalibration = result;
     const workerCalibration = { ...result, gain: result.gain.slice(), supported: result.supported.slice() };
     await computer.call('brightness-set', { calibration: workerCalibration }, [workerCalibration.gain.buffer, workerCalibration.supported.buffer]);
@@ -1982,108 +3292,55 @@ async function loadBrightnessCalibration(file) {
   text('brightnessStatus', 'Geladenes Helligkeitsfeld ist aktiv.'); updateControls();
 }
 
-async function localGroupComposite(entries, bounds, maxFrames, edgeFeather, featherMask, baseMask, region, activity = () => {}) {
-  const candidates = sharpestFramesFirst(entries.map(entry => frameGeometry(entry, calibration?.field, calibration?.maps)).filter(Boolean));
-  const supporting = approximateTopFrames(candidates, maxFrames, trackingPixelAllowed, pathSelection).slice(0, 16)
-    .sort((first, second) => first.entry.frame - second.entry.frame);
-  const composite = document.createElement('canvas');
-  composite.width = bounds.width; composite.height = bounds.height;
-  const context = composite.getContext('2d', { willReadFrequently: true });
-  const scratch = document.createElement('canvas');
-  const sum = new Float32Array(bounds.width * bounds.height * 4);
-  const counts = new Uint32Array(bounds.width * bounds.height);
-  for (const [index, geometry] of supporting.entries()) {
-    activity(`Gruppenmatch: Lade ${index + 1}/${supporting.length}, Frame #${geometry.entry.frame}`);
-    const image = await readTrackingFrame(geometry.entry.frame, { rectified: true, output: 'rgba' });
-    const mask = localSelectionMask(geometry, pathSelection, region, baseMask);
-    const allowed = (x, y) => trackingPixelAllowed(x, y) && maskIncludes(mask, x, y);
-    applyPixelMask(image.data, image.width, allowed);
-    applyEdgeFeather(image.data, image.width, image.height, edgeFeather, featherMask);
-    scratch.width = image.width; scratch.height = image.height;
-    scratch.getContext('2d').putImageData(new ImageData(image.data, image.width, image.height), 0, 0);
-    const origin = geometry.world(0, 0);
-    context.setTransform(1, 0, 0, 1, 0, 0); context.clearRect(0, 0, bounds.width, bounds.height);
-    context.setTransform(geometry.c, geometry.s, -geometry.s, geometry.c, origin.x - bounds.minX, origin.y - bounds.minY);
-    context.drawImage(scratch, 0, 0);
-    accumulateFrame(sum, context.getImageData(0, 0, bounds.width, bounds.height).data, counts, maxFrames);
+async function registerLocalPcbPairs(worker, images, pairs, limits, preprocessing, activity, parameters, featureRecovery = false) {
+  const byFrame = new Map(images.map(image => [image.frame, image]));
+  const matches = [];
+  for (const [index, pair] of pairs.entries()) {
+    if (pathRefitCancelRequested) throw new Error('Lokaler Refit abgebrochen.');
+    activity(`Pruefe PCB-Zellen ${index + 1}/${pairs.length}: #${pair.current} gegen #${pair.reference}`);
+    const selected = [byFrame.get(pair.reference), byFrame.get(pair.current)];
+    const diameter = Math.min(...selected.map(image => Math.min(image.bitmap.width, image.bitmap.height))) *
+      (selected.some(image => image.mask) ? preprocessing.region : 1);
+    const cellSize = Math.min(parameters.cellSize, 2 ** Math.floor(Math.log2(diameter / 2)));
+    const bitmaps = await Promise.all(selected.map(image => createImageBitmap(image.bitmap)));
+    try {
+      const match = await worker.call('pcb-pair-register', { images: selected.map((image, item) => ({
+        frame: image.frame, pose: image.pose, offset: image.offset, mask: image.mask, bitmap: bitmaps[item] })),
+      pair:{...pair,cells:currentMatchNetwork().pairs.find(p=>p.reference===pair.reference&&p.current===pair.current)?.cells??[]}, preprocessing, useWebGpu: false, featureRecovery, localLandmarks: true, coarseRadius: parameters.coarseRadius,
+      minimumOverlapFraction: parameters.coarseOverlap,
+      fft: { cellSize: Math.max(16, cellSize), cellsPerAxis: parameters.cellsPerAxis,
+        searchRadius: Math.min(limits.radius, Math.max(16, cellSize) / 2 - 1),
+        minimumPsr: parameters.minimumPsr, residualLimit: parameters.residualLimit,
+        adaptiveCells: true },
+      limits: { radius: limits.radius, angle: limits.angle, cycleLimit: parameters.cycleLimit,
+        fftCycleFactor: parameters.fftCycleFactor, minimumScore: parameters.minimumScore,
+        minimumSupport: parameters.minimumSupport } }, bitmaps);
+      storeNetworkMatches([match], parameters);
+      const verified = acceptedPcbConstraints([match], parameters).accepted.length > 0;
+      matches.push({ ...match, pcbVerified: verified,
+        forward: verified ? match.forward : { ...match.forward, accepted: false,
+          reason: match.forward?.reason ?? 'PCB-Paarpruefung' } });
+    } finally { for (const bitmap of bitmaps) bitmap.close(); }
   }
-  context.setTransform(1, 0, 0, 1, 0, 0);
-  context.putImageData(new ImageData(averagedFrames(sum), bounds.width, bounds.height), 0, 0);
-  return { bitmap: await createImageBitmap(composite), frames: supporting.map(geometry => geometry.entry.frame) };
-}
-
-async function seedFromLocalGroupMatch(entries, worker, limits, preprocessing, baseMask, selectedFrame, localLimit, activity = () => {}) {
-  const groups = localRefitGroups(entries);
-  if (groups.length < 2) return { entries, attempts: 0, accepted: 0 };
-  const radius = Math.min(calibration.maps.outputWidth, calibration.maps.outputHeight) * preprocessing.region / 2;
-  const bounds = { minX: Math.floor(pathSelection.x - radius), minY: Math.floor(pathSelection.y - radius),
-    width: Math.max(128, Math.ceil(radius * 2)), height: Math.max(128, Math.ceil(radius * 2)) };
-  const maxFrames = Math.min(8, Math.max(1, number('trackingOverlayMaxFrames', 3)));
-  const edgeFeather = number('overlayEdgeFeather', 10) / 100;
-  const anchor = Math.max(0, groups.findIndex(group => group.some(entry => entry.frame === Number(selectedFrame))));
-  const centerPose = { x: bounds.minX + bounds.width / 2, y: bounds.minY + bounds.height / 2, rotation: 0 };
-  activity('Gruppenmatch: bereite lokale Bildmaske vor');
-  const featherMask = edgeFeatherMask(calibration.maps.outputWidth, calibration.maps.outputHeight, trackingPixelAllowed, edgeFeather);
-  const composites = [];
-  try {
-    for (const [index, group] of groups.entries()) {
-      activity(`Gruppenmatch: baue Gruppe ${index + 1}/${groups.length}`);
-      const composite = await localGroupComposite(group, bounds, maxFrames, edgeFeather, featherMask, baseMask, preprocessing.region, activity);
-      composites.push({ frame: index, pose: centerPose,
-        bitmap: composite.bitmap, sourceFrames: composite.frames });
-    }
-    const pairs = [];
-    for (let reference = 0; reference < groups.length; reference++) for (let current = reference + 1; current < groups.length; current++) {
-      pairs.push({ reference, current, group: `${reference}:${current}` });
-    }
-    activity(`Pruefe ${pairs.length} Gruppenueberlappungen vor dem Einzelbild-Refinement`);
-    const matches = await worker.call('local-refit-register', { images: composites, pairs,
-      limits: { ...limits, radius: Math.max(limits.radius, radius), reverseRadius: Math.min(32, limits.reverseRadius) },
-      preprocessing }, composites.map(item => item.bitmap));
-    const accepted = matches.filter(match => match.forward?.accepted && match.backward?.accepted &&
-      Number.isFinite(match.reverseDistance) && match.reverseDistance <= localLimit);
-    const centers = new Map([[anchor, centerPose]]);
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const match of accepted) {
-        if (centers.has(match.reference) && !centers.has(match.current)) {
-          centers.set(match.current, applyPoseCorrection(match.forward.pose, match.referencePose, centers.get(match.reference)));
-          changed = true;
-        } else if (centers.has(match.current) && !centers.has(match.reference)) {
-          centers.set(match.reference, applyPoseCorrection(match.backward.pose, match.forward.pose, centers.get(match.current)));
-          changed = true;
-        }
-      }
-    }
-    return { entries: entries.map(entry => {
-      const group = groups.findIndex(items => items.some(item => item.frame === entry.frame));
-      return centers.has(group) ? { ...entry, pose: applyPoseCorrection(entry.pose, centerPose, centers.get(group)) } : entry;
-    }), attempts: matches.length, accepted: accepted.length, aligned: centers.size };
-  } finally { for (const composite of composites) composite.bitmap.close(); }
+  return matches;
 }
 
 async function refitTrackingPath() {
   if (!pathSelection || pathRefitBusy || trackingRunning || taskBusy) return;
   const geometries = trackingPath.map(entry => frameGeometry(entry, calibration?.field, calibration?.maps)).filter(Boolean);
-  const seeds = geometries.filter(geometry => geometry.supports(pathSelection, trackingPixelAllowed)).map(geometry => geometry.entry.frame);
+  const overlayFrames = new Set(overlayContributors.map(geometry => geometry.entry.frame));
+  const localEntries = geometries.filter(geometry => overlayFrames.has(geometry.entry.frame) ||
+    geometry.supports(pathSelection, trackingPixelAllowed))
+    .map(geometry => geometry.entry);
+  const seeds = localEntries.map(entry => entry.frame);
   if (!seeds.length) { text('trackingPathRefitInfo', 'Am Auswahlpunkt liegen keine Frames.'); return; }
-  const conditionalLimit = trackingRunOptions?.contextCycleConditional ?? number('trackingContextCycleConditional', 7.5);
   const preprocessing = refitPreprocessing();
   const baseMask = (trackingRunOptions ?? trackingDataset?.options)?.imageMask ?? null;
-  const regionRadius = Math.min(calibration.maps.outputWidth, calibration.maps.outputHeight) * preprocessing.region / 2;
-  const localCandidates = path => path.map(entry => frameGeometry(entry, calibration?.field, calibration?.maps)).filter(Boolean)
-    .map(geometry => ({ geometry, distance: localSelectionDistance(geometry, pathSelection) }))
-    .filter(item => item.distance <= regionRadius)
-    .filter(item => localSelectionSupport(item.geometry, pathSelection, preprocessing.region, baseMask,
-      (x, y) => Boolean(calibration.maps.valid[y * calibration.maps.outputWidth + x])) >= 128)
-    .map(item => ({ ...item.geometry.entry, localSelectionDistance: item.distance }));
-  let localEntries = localCandidates(trackingPath);
   const selectedFrame = element('trackingOverlayFrame').value;
   if (localEntries.length < 2) { text('trackingPathRefitInfo', 'Die Auswahl enthaelt zu wenige auswertbare Frames.'); return; }
   pathRefitBusy = true; pathRefitProposal = null; updatePathRefitControls();
   pathRefitCancelRequested = false;
-  let searchProgress = { pass: 1, round: 1, attempted: 0, limit: 128 };
+  let searchProgress = { attempted: 0, limit: 0 };
   const refitStarted = performance.now();
   let refitActivity = 'Lokaler Refit wird vorbereitet';
   const showRefitActivity = activity => {
@@ -2093,10 +3350,10 @@ async function refitTrackingPath() {
     text('processingStatus', `${refitActivity} | ${elapsed} s`);
   };
   const refitHeartbeat = setInterval(() => showRefitActivity(refitActivity), 1000);
-  const worker = new WorkerClient('/compute-worker.js', status => {
+  const worker = new WorkerClient('./compute-worker.js', status => {
     if (status.operation !== 'local-refit') return;
-    const scope = searchProgress.stage === 'group' ? 'Gruppenmatch' : `Refit-Iteration ${searchProgress.pass}, Suchrunde ${searchProgress.round}`;
-    const pair = searchProgress.stage === 'group' ? `${status.pair}/${status.pairs}` : `${searchProgress.attempted + (status.pair || 0)}/${searchProgress.limit}`;
+    const scope = 'Lokaler Refit';
+    const pair = `${searchProgress.attempted + (status.pair || 0)}/${searchProgress.limit}`;
     const activity = status.stage === 'prepare' ? `${scope}: bereite Matcherbild ${status.image}/${status.images} vor${Number.isFinite(status.frame) ? ` (#${status.frame})` : ''}` :
       status.stage === 'forward' ? `${scope} ${pair}: Vorwaertssuche ${status.attempt}/${status.attempts}, Radius ${status.radius} px` :
       status.stage === 'feature-forward' ? `${scope} ${pair}: Feature-Fallback vorwaerts` :
@@ -2113,58 +3370,71 @@ async function refitTrackingPath() {
     overlayRequest++; trackingMosaicRequest++; clearTimeout(trackingMosaicTimer);
     showRefitActivity('Lokaler Refit wartet auf laufende Bildabrufe');
     await frameReader.waitUntilIdle();
-    const limits = { radius: Math.min(256, Math.max(64, number('trackingContextRadius', 32) * 4)),
-      reverseRadius: Math.min(256, Math.max(64, number('trackingContextRadius', 32) * 4)),
-      angle: Math.min(5, Math.max(2, number('trackingContextAngle', 1) * 4)), coarseStep: 1 };
-    showRefitActivity('Lokaler Refit baut das Pose-Netz auf');
-    let graph = buildPoseGraph(trackingPath, { conditionalLimit });
-    const localLimit = Math.min(50, Math.max(25, conditionalLimit * 3));
-    const graphOptions = { conditionalLimit, cycleLimit: localLimit, consensusLimit: localLimit,
-      lever: Math.hypot(calibration.maps.outputWidth, calibration.maps.outputHeight) / 2 };
-    searchProgress = { stage: 'group', pass: 0, round: 0, attempted: 0, limit: 0 };
-    const groupSeed = await seedFromLocalGroupMatch(localEntries, worker, limits, preprocessing, baseMask, selectedFrame, localLimit, showRefitActivity);
-    localEntries = groupSeed.entries;
-    showRefitActivity(`Gruppenmatch: ${groupSeed.accepted}/${groupSeed.attempts} Ueberlappungen bestaetigt, ${groupSeed.aligned} Gruppen ausgerichtet; starte Einzelbild-Refinement`);
-    let result = null; let totalMatches = 0; let completedPasses = 0;
-    for (let pass = 1; pass <= 3 && localEntries.length >= 2; pass++) {
-      const entries = new Map(localEntries.map(entry => [entry.frame, entry]));
-      const search = await searchLocalRefit(localEntries, async (pairs, progress) => {
-        searchProgress = { ...progress, pass };
-        const requiredFrames = [...new Set(pairs.flatMap(pair => [pair.current, pair.reference]))].sort((first, second) => first - second);
+    const pcb = pcbParameters();
+    const limits = { radius: pcb.radius, angle: pcb.angle };
+    const pairs = planFocusedRefitPairs(localEntries, selectedFrame ? [Number(selectedFrame)] : []);
+    const entries = new Map(localEntries.map(entry => [entry.frame, entry]));
+    const matches = [];
+    const registerPairs = async (planned, featureRecovery = false) => {
+      const offset = matches.length;
+      searchProgress.limit = offset + planned.length;
+      for (let start = 0; start < planned.length; start += 2) {
+        if (pathRefitCancelRequested) throw new Error('Lokaler Refit abgebrochen.');
+        const batch = planned.slice(start, start + 2);
+        const requiredFrames = [...new Set(batch.flatMap(pair => [pair.reference, pair.current]))];
         const images = [];
         try {
-          for (const [index, frame] of requiredFrames.entries()) {
-            showRefitActivity(`Refit-Iteration ${pass}: Lade Frame ${index + 1}/${requiredFrames.length}: #${frame}`);
-            const decoded = await readTrackingFrame(frame, { rectified: true });
-            const entry = entries.get(frame); const geometry = frameGeometry(entry, calibration?.field, calibration?.maps);
+          for (const frame of requiredFrames) {
+            showRefitActivity(`Lade Frame #${frame} | Paar ${offset + start + 1}/${searchProgress.limit}`);
+            const decoded = await readTrackingFrame(frame, { rectified: true, sourceMask: pcbSourceMask() });
+            const entry = entries.get(frame);
+            const geometry = frameGeometry(entry, calibration?.field, calibration?.maps);
             images.push({ frame, pose: { ...entry.pose }, bitmap: decoded.bitmap,
+              offset: entry.mode === 'window' ? [-decoded.bitmap.width / 2, -decoded.bitmap.height / 2] :
+                [calibration.maps.origin[0] - calibration.field.width / 2,
+                  calibration.maps.origin[1] - calibration.field.height / 2],
               mask: localSelectionMask(geometry, pathSelection, preprocessing.region, baseMask) });
           }
-          return await worker.call('local-refit-register', { images, pairs, limits, preprocessing }, images.map(item => item.bitmap));
-        } finally { for (const item of images) item.bitmap.close(); }
-      }, { baseGraph: graph, preferredFrames: selectedFrame ? [Number(selectedFrame)] : [],
-        maxPairs: pass === 1 ? 128 : 64, graphOptions });
-      totalMatches += search.matches.length;
-      if (search.graph.localEdges < 1) {
-        if (!result) throw new Error(`Kein bestaetigter lokaler Match nach ${search.rounds} Runden (${search.limited ? 'Suchbudget erreicht' : 'Kandidaten ausgeschoepft'}). ${localRefitFailure(search.matches, localLimit)}`);
-        break;
+          searchProgress.attempted = offset + start;
+          matches.push(...await registerLocalPcbPairs(worker, images, batch, limits, preprocessing, showRefitActivity, pcb, featureRecovery));
+        } finally { for (const image of images) image.bitmap.close(); }
       }
-      graph = search.graph; completedPasses = pass;
-      showRefitActivity(`Refit-Iteration ${pass}: ${graph.localEdges} neue lokale Kanten; verteile Korrektur durch das Pose-Netz`);
-      result = await worker.call('pose-graph-refit', { graph, options: { seedFrames: seeds, iterations: 10, huber: 20 } });
-      const corrected = new Map(result.corrections.map(item => [item.frame, item.pose]));
-      localEntries = localCandidates(trackingPath.map(entry => corrected.has(entry.frame) ?
-        { ...entry, pose: corrected.get(entry.frame) } : entry));
+    };
+    const baseGraph = buildPoseGraph(localEntries, { conditionalLimit: pcb.cycleLimit });
+    const graphForMatches = () => applyNetworkToGraph(addLocalRefitEdges(baseGraph, matches,
+      { cycleLimit: pcb.cycleLimit, acceptVerifiedPairs: true }), currentMatchNetwork());
+    await registerPairs(pairs);
+    let graph = graphForMatches();
+    let refitPasses = 1;
+    if (pcb.localBudget) {
+      let measuredFrames = measuredRefitComponent(graph);
+      let remaining = pcb.localBudget;
+      while (remaining && measuredFrames.length < localEntries.length) {
+        const bridges = planRefitBridgePairs(localEntries, measuredFrames, matches, Math.min(32, remaining));
+        if (!bridges.length) break;
+        showRefitActivity(`Pruefe ${bridges.length} weitere Paare fuer unverbundene Frames`);
+        await registerPairs(bridges, true);
+        remaining -= bridges.length;
+        graph = graphForMatches();
+        measuredFrames = measuredRefitComponent(graph);
+        refitPasses++;
+      }
     }
-    pathRefitProposal = { ...result, byFrame: new Map(result.corrections.map(item => [item.frame, item])),
-      overlayFrames: localEntries.map(entry => entry.frame), preprocessing, refitPasses: completedPasses,
-      refitMatches: totalMatches, groupMatches: groupSeed.accepted, groupAttempts: groupSeed.attempts, overlayReady: false };
-    text('trackingPathRefitInfo', `${groupSeed.accepted}/${groupSeed.attempts} Gruppenmatches | ${completedPasses} Refit-Iterationen, ${totalMatches} Paarversuche | ${result.nodes} Frames, ${result.edges} Kanten (${result.localEdges} lokal, ${result.spatialEdges} raeumlich) | Lokal RMS ${fixed(result.localBeforeRms, 2)} -> ${fixed(result.localAfterRms, 2)} px | Netz RMS ${fixed(result.beforeRms, 2)} -> ${fixed(result.afterRms, 2)} px | Rot gestrichelt: Vorschlag.`);
+    if (!graph.localEdges) throw new Error(`Kein bestaetigter lokaler Match (${matches.length} Paare). ${localRefitFailure(matches, pcb.cycleLimit)}`);
+    showRefitActivity(`${graph.localEdges} bestaetigte lokale Kanten; optimiere Posen`);
+    const result = await worker.call('pose-graph-refit', { graph,
+      options: { seedFrames: seeds, iterations: pcb.iterations, huber: pcb.huber, includePassive: true } });
+    pathRefitProposal = { ...result, measuredFrames: measuredRefitComponent(graph).length, networkRevision:currentMatchNetwork().revision, byFrame: new Map(result.corrections.map(item => [item.frame, item])),
+      overlayFrames: localEntries.map(entry => entry.frame),
+      preprocessing, refitPasses,
+      refitMatches: matches.length, groupMatches: 0, groupAttempts: 0, overlayReady: false };
+    text('trackingPathRefitInfo', `${matches.length} Paarpruefungen | ${graph.localEdges} bestaetigte Netzverbindungen | ${pathRefitProposal.byFrame.size} korrigierbare Frames (${result.nodes} im Netz), ${result.edges} Kanten | Lokal RMS ${fixed(result.localBeforeRms, 2)} -> ${fixed(result.localAfterRms, 2)} px | Rot gestrichelt: Vorschlag.`);
     drawTrackingPath();
     await loadPathOverlay(pathSelection);
     if (!pathOverlay.width) throw new Error('Das Mischbild der Refit-Vorschau konnte nicht aufgebaut werden.');
     pathRefitProposal.overlayReady = true;
-    text('trackingPathRefitInfo', `${groupSeed.accepted}/${groupSeed.attempts} Gruppenmatches | ${completedPasses} Refit-Iterationen, ${totalMatches} Paarversuche | ${result.nodes} Frames, ${result.edges} Kanten (${result.localEdges} lokal, ${result.spatialEdges} raeumlich) | Lokal RMS ${fixed(result.localBeforeRms, 2)} -> ${fixed(result.localAfterRms, 2)} px | Netz RMS ${fixed(result.beforeRms, 2)} -> ${fixed(result.afterRms, 2)} px | Mischbild zeigt die Refit-Vorschau.`);
+    const bridgeWarning = pathRefitProposal.measuredFrames < localEntries.length ? " | Achtung: Noch getrennte Bildmatch-Gruppen; deren gegenseitiger Offset ist nicht bestaetigt." : "";
+    text('trackingPathRefitInfo', `${matches.length} Paarpruefungen | ${graph.localEdges} bestaetigte Netzverbindungen | ${pathRefitProposal.measuredFrames}/${localEntries.length} Frames durch Bildmatches verbunden, ${result.passiveFrames.length} passiv interpoliert | Lokal RMS ${fixed(result.localBeforeRms, 2)} -> ${fixed(result.localAfterRms, 2)} px | Mischbild zeigt alle ${pathRefitProposal.overlayFrames.length} Frames des Vorschlags.${bridgeWarning}`);
   } catch (error) {
     text('trackingPathRefitInfo', pathRefitCancelRequested ? 'Lokaler Refit abgebrochen.' : `Refit fehlgeschlagen: ${error.message}`);
   }
@@ -2202,7 +3472,9 @@ function applyTrackingPathRefit() {
     if (entry.raw) entry.raw = { ...entry.raw, x: entry.raw.x + correction.dx, y: entry.raw.y + correction.dy,
       rotation: Math.atan2(Math.sin(entry.raw.rotation + correction.rotation), Math.cos(entry.raw.rotation + correction.rotation)) };
   }
-  const summary = { created_at: new Date().toISOString(), nodes: pathRefitProposal.nodes, edges: pathRefitProposal.edges,
+  const summary = { created_at: new Date().toISOString(), nodes: pathRefitProposal.nodes,
+    correctedFrames: pathRefitProposal.byFrame.size, edges: pathRefitProposal.edges,
+    passiveFrames: pathRefitProposal.passiveFrames,
     spatialEdges: pathRefitProposal.spatialEdges, localEdges: pathRefitProposal.localEdges,
     refitPasses: pathRefitProposal.refitPasses, refitMatches: pathRefitProposal.refitMatches,
     groupMatches: pathRefitProposal.groupMatches, groupAttempts: pathRefitProposal.groupAttempts,
@@ -2210,21 +3482,62 @@ function applyTrackingPathRefit() {
     beforeRms: pathRefitProposal.beforeRms, afterRms: pathRefitProposal.afterRms,
     preprocessing: pathRefitProposal.preprocessing };
   if (trackingDataset) (trackingDataset.refits ??= []).push(summary);
-  pathRefitProposal = null; clearPathOverlay();
+  pathRefitProposal = null; clearPathOverlay(true);
+  pcbProposal = null; updatePcbControls();
+  frameReductionPreview = null;
+  element('frameReductionApply').disabled = true;
   text('trackingPathRefitInfo', `Refit uebernommen | RMS ${fixed(summary.beforeRms, 2)} -> ${fixed(summary.afterRms, 2)} px.`);
   updatePathRefitControls(); renderTrackingResults(trackingPath.at(-1));
   scheduleTrackingMosaic();
   if (pathSelection) void loadPathOverlay(pathSelection);
 }
 
+function scheduleOverlayLiveRender() {
+  overlayLiveRequest++;
+  if (overlayLiveRunning || !overlayGpuSession || !overlayPoseDraft || !overlayBounds) return;
+  overlayLiveRunning = true;
+  overlayGpuInFlight++; updateGpuAdapterControl();
+  requestAnimationFrame(async () => {
+    const previous = overlayGpuIdle;
+    let release;
+    overlayGpuIdle = new Promise(resolve => { release = resolve; });
+    await previous;
+    const session = overlayGpuSession, request = overlayRequest, revision = overlayLiveRequest;
+    try {
+      if (!session || !overlayPoseDraft || !overlayBounds) return;
+      const renderer = session.renderer, bounds = { ...overlayBounds };
+      const scale = Math.max(1, Math.max(bounds.width, bounds.height) / 1024);
+      const geometries = overlayContributors.map(g => g.entry.frame === overlayPoseDraft.frame ?
+        frameGeometry({ ...g.entry, pose: { ...overlayPoseDraft.pose } }, calibration.field, calibration.maps) : g);
+      if (geometries.some(g => !renderer.frameTextures.get(g.entry.frame)?.preview)) return;
+      const started = performance.now();
+      await renderer.resizeOutput(Math.ceil(bounds.width / scale), Math.ceil(bounds.height / scale), scale);
+      await renderer.clear(bounds.minX, bounds.minY);
+      for (const geometry of geometries) await renderer.addCachedFrame(geometry, 0, true);
+      const bitmap = await renderer.finish();
+      if (request !== overlayRequest || revision !== overlayLiveRequest || session !== overlayGpuSession) { bitmap.close(); return; }
+      renderer.lastLiveMs = performance.now() - started;
+      overlayLiveBitmap?.close(); overlayLiveBitmap = bitmap;
+      renderPathOverlay();
+      text('trackingOverlayInfo', `GPU-Livevorschau | ${geometries.length} Frames aus GPU-Texturen | ${fixed(renderer.lastLiveMs, 1)} ms | Uebernehmen rendert Vollaufloesung`);
+    } catch (error) {
+      if (request === overlayRequest) text('trackingOverlayInfo', `GPU-Livevorschau fehlgeschlagen: ${error.message}`);
+    } finally {
+      release(); overlayLiveRunning = false;
+      overlayGpuInFlight--; updateGpuAdapterControl();
+      if (revision !== overlayLiveRequest && overlayPoseDraft && overlayGpuSession) scheduleOverlayLiveRender();
+    }
+  });
+}
+
 function renderPathOverlay() {
-  if (element('trackingOverlayPane').hidden) return;
+  if (trackingTab !== 'overlay') return;
   const { context, width, height } = trackingCanvasContext('trackingOverlayCanvas');
   context.clearRect(0, 0, width, height);
   if (!pathOverlay.width) return;
   const scale = Math.min(width / pathOverlay.width, height / pathOverlay.height) * overlayZoom;
   context.imageSmoothingEnabled = false;
-  if (overlaySelectedImage && overlayBounds) {
+  if (overlaySelectedImage && overlayBounds && !overlayPoseDraft) {
     const left = (width - pathOverlay.width * scale) / 2 + overlayPan.x;
     const top = (height - pathOverlay.height * scale) / 2 + overlayPan.y;
     const { geometry, bitmap } = overlaySelectedImage;
@@ -2236,7 +3549,10 @@ function renderPathOverlay() {
     context.restore();
     return;
   }
-  if (pathOverlay.tiles) {
+  if (overlayLiveBitmap && overlayPoseDraft) {
+    drawRefitPreviewImage(context, overlayLiveBitmap, (width - pathOverlay.width * scale) / 2 + overlayPan.x,
+      (height - pathOverlay.height * scale) / 2 + overlayPan.y, pathOverlay.width * scale, pathOverlay.height * scale);
+  } else if (pathOverlay.tiles) {
     const left = (width - pathOverlay.width * scale) / 2 + overlayPan.x;
     const top = (height - pathOverlay.height * scale) / 2 + overlayPan.y;
     const ratio = context.getTransform().a;
@@ -2248,10 +3564,32 @@ function renderPathOverlay() {
       if (w <= 0 || h <= 0 || x >= width || y >= height || x + w <= 0 || y + h <= 0) continue;
       drawRefitPreviewImage(context, tile.bitmap, 0, 0, tile.width, tile.height, x, y, w, h);
     }
-    return;
+  } else {
+    drawRefitPreviewImage(context, pathOverlay, (width - pathOverlay.width * scale) / 2 + overlayPan.x,
+      (height - pathOverlay.height * scale) / 2 + overlayPan.y, pathOverlay.width * scale, pathOverlay.height * scale);
   }
-  drawRefitPreviewImage(context, pathOverlay, (width - pathOverlay.width * scale) / 2 + overlayPan.x,
-    (height - pathOverlay.height * scale) / 2 + overlayPan.y, pathOverlay.width * scale, pathOverlay.height * scale);
+  if (!overlayPoseDraft || !overlaySelectedImage || !overlayBounds) return;
+  const geometry = frameGeometry({ ...overlaySelectedImage.geometry.entry, pose: overlayPoseDraft.pose },
+    calibration?.field, calibration?.maps);
+  if (!geometry) return;
+  const left = (width - pathOverlay.width * scale) / 2 + overlayPan.x;
+  const top = (height - pathOverlay.height * scale) / 2 + overlayPan.y;
+  const project = point => ({ x: left + (point.x - overlayBounds.minX) * scale,
+    y: top + (point.y - overlayBounds.minY) * scale });
+  const origin = project(geometry.world(0, 0));
+  context.save();
+  // Keep the editable frame above both the cached mosaic and GPU live preview.
+  context.globalAlpha = 0.5;
+  context.translate(origin.x, origin.y);
+  context.transform(geometry.c * scale, geometry.s * scale, -geometry.s * scale, geometry.c * scale, 0, 0);
+  drawRefitPreviewImage(context, overlaySelectedImage.bitmap, 0, 0);
+  context.restore();
+  context.strokeStyle = '#f5d647'; context.lineWidth = 2; context.setLineDash([6, 4]);
+  context.beginPath(); geometry.corners.map(project).forEach((corner, index) => {
+    if (index) context.lineTo(corner.x, corner.y);
+    else context.moveTo(corner.x, corner.y);
+  });
+  context.closePath(); context.stroke(); context.setLineDash([]);
 }
 
 function publishOverlayContributors(supporting, bounds) {
@@ -2263,16 +3601,21 @@ function publishOverlayContributors(supporting, bounds) {
     const entry = geometry.entry;
     const score = Number.isFinite(entry.sharpness?.score) ? ` | Schaerfe ${fixed(entry.sharpness.score, 1)}` : '';
     const matches = (entry.incrementalMatch ? 1 : 0) + (entry.context?.matches?.length ?? 0);
-    selector.add(new Option(`#${entry.frame}${score} | ${matches} Matches`, String(entry.frame)));
+    const passive = pathRefitProposal?.passiveFrames?.includes(entry.frame) ? ' | passiv interpoliert' : '';
+    selector.add(new Option(`#${entry.frame}${score} | ${matches} Matches${passive}`, String(entry.frame)));
   }
   selector.disabled = false;
 }
 
 async function selectOverlayContributor() {
+  overlayLiveRequest++; overlayLiveBitmap?.close(); overlayLiveBitmap = null;
   const request = ++overlaySelectionRequest;
   overlaySelectedImage?.bitmap.close();
   overlaySelectedImage = null;
-  const frame = Number(element('trackingOverlayFrame').value);
+  overlayPoseDraft = null;
+  updateOverlayPoseControls();
+  const value = element('trackingOverlayFrame').value;
+  const frame = value === '' ? null : Number(value);
   const geometry = overlayContributors.find(item => item.entry.frame === frame);
   element('trackingOverlayInspect').disabled = !geometry;
   if (!geometry) { renderPathOverlay(); return; }
@@ -2281,12 +3624,15 @@ async function selectOverlayContributor() {
   if (request !== overlaySelectionRequest) { decoded.bitmap.close(); return; }
   overlaySelectedImage = { geometry, bitmap: decoded.bitmap };
   const pose = geometry.entry.pose ?? geometry.entry.raw;
-  text('trackingOverlayInfo', `Frame #${frame} einzeln | Pose (${fixed(pose.x, 2)}, ${fixed(pose.y, 2)}, ${fixed(pose.rotation * 180 / Math.PI, 3)} Grad) | Pruefen zeigt die zugehoerigen Referenzmatches.`);
+  overlayPoseDraft = { frame, originalPose: { ...pose }, pose: { ...pose } };
+  updateOverlayPoseControls();
+  text('trackingOverlayInfo', `Frame #${frame} ueber Mischbild | Pose (${fixed(pose.x, 2)}, ${fixed(pose.y, 2)}, ${fixed(pose.rotation * 180 / Math.PI, 3)} Grad) | Shift+Mausrad: fein drehen; Alt+Mausrad: grob drehen`);
   renderPathOverlay();
 }
 
-async function loadPathOverlay(point) {
+async function loadPathOverlay(point, { forceFrame = null } = {}) {
   const request = ++overlayRequest;
+  trackingMosaicRequest++; clearTimeout(trackingMosaicTimer);
   pathSelection = point;
   updatePathRefitControls();
   const maxFrames = number('trackingOverlayMaxFrames', 3);
@@ -2295,8 +3641,9 @@ async function loadPathOverlay(point) {
     text('trackingOverlayInfo', 'Framegrenze muss zwischen 1 und 64 liegen.'); return;
   }
   const positionLabel = `${pathRefitProposal ? 'Refit-Vorschau | ' : ''}Position (${fixed(point.x, 1)}, ${fixed(point.y, 1)}) | Top ${maxFrames}/Bereich`;
-  element('trackingOverlayPane').hidden = false;
-  clearPathOverlay();
+  element('trackingOverlayEmpty').hidden = true;
+  activateTrackingTab('overlay');
+  clearPathOverlay(true);
   overlayZoom = 1; overlayPan = { x: 0, y: 0 };
   text('trackingOverlayInfo', `${positionLabel} | Suche passende Frames...`);
   renderPathOverlay(); drawTrackingPath();
@@ -2313,15 +3660,26 @@ async function loadPathOverlay(point) {
   if (request !== overlayRequest) return;
   const previewFrames = pathRefitProposal?.overlayFrames ? new Set(pathRefitProposal.overlayFrames) : null;
   const candidates = sharpestFramesFirst(trackingPath.filter(item => !previewFrames || previewFrames.has(item.frame))
-    .map(item => trackingGeometry(item)).filter(geometry => geometry?.supports(point, trackingPixelAllowed)));
+    .map(item => trackingGeometry(item)).filter(geometry => geometry &&
+      (geometry.entry.frame === forceFrame || previewFrames || geometry.supports(point, trackingPixelAllowed))));
   if (!candidates.length) { text('trackingOverlayInfo', 'Keine Bilddaten an dieser Position.'); return; }
-  const supporting = approximateTopFrames(candidates, maxFrames, trackingPixelAllowed, point);
+  const supporting = previewFrames ? candidates : approximateTopFrames(candidates, maxFrames, trackingPixelAllowed, point);
+  const forced = candidates.find(item => item.entry.frame === forceFrame);
+  if (forced && !supporting.includes(forced)) supporting.push(forced);
   const corners = supporting.flatMap(geometry => geometry.corners);
   const minX = Math.floor(Math.min(...corners.map(p => p.x))), minY = Math.floor(Math.min(...corners.map(p => p.y)));
   const width = Math.ceil(Math.max(...corners.map(p => p.x))) - minX;
   const height = Math.ceil(Math.max(...corners.map(p => p.y))) - minY;
   const bounds = { minX, minY, width, height };
   if (useWebGpu() && navigator.gpu) {
+    const retryAllocation = async create => {
+      try { return await create(); }
+      catch (error) {
+        if (!frameReader.releaseOnAllocationError(error)) throw error;
+        return create();
+      }
+    };
+    overlayGpuInFlight++; updateGpuAdapterControl();
     const previous = overlayGpuIdle;
     let release;
     overlayGpuIdle = new Promise(resolve => { release = resolve; });
@@ -2329,15 +3687,32 @@ async function loadPathOverlay(point) {
     let overlay = null;
     const started = performance.now();
     try {
-      await frameReader.dispose(); // Reserve the GPU budget for the overlay's accumulation buffers.
+      const key = [calibration.maps, videoInfo, brightnessCalibration, trackingImageMask,
+        trackingImageMask?.revision, trackingMaskHasSelection, edgeFeather, element('globalGpuAdapter')?.value];
+      if (overlayGpuSession && key.some((value, i) => value !== overlayGpuSession.key[i])) {
+        overlayGpuSession.renderer.destroy(); overlayGpuSession = null;
+      }
+      const tiledNeeded = await WebGpuOverlay.needsTiles(calibration.maps, width, height);
+      const tileEdge = tiledNeeded ? overlayTileSize(calibration.maps, overlayGpuSession?.renderer.device.limits.maxTextureDimension2D || 8192) : null;
+      if (!overlayGpuSession) {
+        await frameReader.releaseRenderer();
+        const renderer = await retryAllocation(() => WebGpuOverlay.create(calibration.maps,
+          tiledNeeded ? Math.min(tileEdge, width) : width, tiledNeeded ? Math.min(tileEdge, height) : height,
+          minX, minY, trackingPixelAllowed, maxFrames, edgeFeather, brightnessCalibration));
+        renderer.cacheEnabled = true;
+        overlayGpuSession = { key, renderer };
+      }
+      overlay = overlayGpuSession.renderer;
+      overlay.setActiveFrames(supporting.map(g => g.entry.frame));
+      overlay.maxFrames = maxFrames;
       if (request !== overlayRequest) return;
       text('trackingOverlayInfo', `${positionLabel} | Bereite Vollaufloesung ${width} x ${height} vor...`);
-      if (await WebGpuOverlay.needsTiles(calibration.maps, width, height)) {
-        const tiled = await renderTiledOverlay({ maps: calibration.maps, width, height, minX, minY,
-          geometries: supporting, pixelAllowed: trackingPixelAllowed, maxFrames, edgeFeather,
+      if (tiledNeeded) {
+        const tiled = await retryAllocation(() => renderTiledOverlay({ maps: calibration.maps, width, height, minX, minY,
+          geometries: supporting, pixelAllowed: trackingPixelAllowed, maxFrames, edgeFeather, renderer: overlay, tileSize: tileEdge,
           brightness: brightnessCalibration,
           decode: index => readTrackingFrame(index, { output: 'native' }), cancelled: () => request !== overlayRequest,
-          progress: p => text('trackingOverlayInfo', `${positionLabel} | Kachel ${p.tileIndex + 1}/${p.tileCount} bis ${p.tileSize} px | Kandidat ${p.frameIndex + 1}/${p.frameCount}: #${p.frame} | Durchlauf ${p.framePass}/${p.plannedFramePasses} | WebGPU, Vollaufloesung`) });
+          progress: p => text('trackingOverlayInfo', `${positionLabel} | Kachel ${p.tileIndex + 1}/${p.tileCount} bis ${p.tileSize} px | Kandidat ${p.frameIndex + 1}/${p.frameCount}: #${p.frame} | Durchlauf ${p.framePass}/${p.plannedFramePasses} | WebGPU, Vollaufloesung`) }));
         if (!tiled) return;
         if (request !== overlayRequest) { closeOverlayTiles(tiled); return; }
         pathOverlay = tiled;
@@ -2347,16 +3722,24 @@ async function loadPathOverlay(point) {
         renderPathOverlay();
         return;
       }
-      overlay = await WebGpuOverlay.create(calibration.maps, width, height, minX, minY, trackingPixelAllowed,
-        maxFrames, edgeFeather, brightnessCalibration);
+      await overlay.resizeOutput(width, height);
+      await overlay.clear(minX, minY);
       if (request !== overlayRequest) return;
-      const setupMs = performance.now() - started;
-      let frameMs = 0, decodeMs = 0, gpuMs = 0;
+      const setupMs = performance.now() - started, previousGpuHits = overlay.cacheHits;
+      let frameMs = 0, decodeMs = 0, gpuMs = 0, cacheHits = 0;
       for (const [index, geometry] of supporting.entries()) {
         text('trackingOverlayInfo', `${positionLabel} | Lade ${index + 1}/${supporting.length}: Frame #${geometry.entry.frame} | WebGPU, Vollaufloesung`);
         const frameStarted = performance.now();
+        if (await overlay.addCachedFrame(geometry)) {
+          cacheHits++; gpuMs += performance.now() - frameStarted;
+          frameMs += performance.now() - frameStarted; continue;
+        }
         const decoded = await readTrackingFrame(geometry.entry.frame, { output: 'native' });
         decodeMs += performance.now() - frameStarted;
+        if (decoded.frameTiming?.cacheHit) {
+          cacheHits++;
+          text('trackingOverlayInfo', `${positionLabel} | Cache ${index + 1}/${supporting.length}: Frame #${geometry.entry.frame} | WebGPU, Vollaufloesung`);
+        }
         try {
           if (request !== overlayRequest) return;
           const gpuStarted = performance.now();
@@ -2373,12 +3756,18 @@ async function loadPathOverlay(point) {
         pathOverlay.getContext('2d').drawImage(bitmap, 0, 0);
       } finally { bitmap.close(); }
       text('trackingOverlayInfo', `${positionLabel} | ${supporting.length} von ${candidates.length} Kandidaten | ${width} x ${height} px, Vollaufloesung | WebGPU | ${fixed(frameMs / supporting.length, 1)} ms/Frame | Vorbereitung ${fixed(setupMs, 0)} ms | Gesamt ${fixed((performance.now() - started) / 1000, 2)} s`);
-      element('trackingOverlayInfo').textContent += ` | Frameabruf ${fixed(decodeMs / 1000, 2)} s | GPU inkl. Entzerrung/Warten ${fixed(gpuMs / 1000, 2)} s`;
+      element('trackingOverlayInfo').textContent += ` | ${cacheHits}/${supporting.length} Frames aus Cache | Frameabruf ${fixed(decodeMs / 1000, 2)} s | GPU inkl. Entzerrung/Warten ${fixed(gpuMs / 1000, 2)} s`;
+      element('trackingOverlayInfo').textContent += ` | ${overlay.cacheHits - previousGpuHits}/${supporting.length} direkt aus GPU-Texturen | GPU-Bildcache ${fixed(overlay.cacheBytes / 1048576, 0)} MiB`;
       publishOverlayContributors(supporting, bounds);
       renderPathOverlay();
     } catch (error) {
+      overlayGpuSession?.renderer.destroy(); overlayGpuSession = null;
+      frameReader.releaseOnAllocationError(error);
       if (request === overlayRequest) text('trackingOverlayInfo', `Ueberlagerung fehlgeschlagen: ${error.message}`);
-    } finally { overlay?.destroy(); release(); }
+    } finally {
+      release(); overlayGpuInFlight--; updateGpuAdapterControl();
+      if (request === overlayRequest) scheduleTrackingMosaic();
+    }
     return;
   }
   // Keep the native pixel scale. Larger mosaics need tiling, never silent downscaling.
@@ -2420,22 +3809,132 @@ async function loadPathOverlay(point) {
 }
 
 function installPathInteraction() {
+  installMatchNetworkControls();
   const path = element('trackingPathCanvas');
+  let pathDrag = null;
+  let ignorePathClick = false;
   const hit = event => {
     if (!pathProject) return null;
     const bounds = path.getBoundingClientRect();
     return pathProject.invert({ x: event.clientX - bounds.left, y: event.clientY - bounds.top });
   };
-  path.addEventListener('pointermove', event => { pathHover = hit(event); drawTrackingPath(); });
+  path.addEventListener('pointerdown', event => { if (event.button !== 0 || !pathProject || pathZoom === 1) return;
+    ignorePathClick = false;
+    pathDrag = { x: event.clientX, y: event.clientY, pan: { ...pathPan }, moved: false };
+    path.setPointerCapture(event.pointerId);
+  });
+  path.addEventListener('pointermove', event => {
+    if (pathDrag) {
+      const dx = event.clientX - pathDrag.x, dy = event.clientY - pathDrag.y;
+      if (Math.hypot(dx, dy) > 3) pathDrag.moved = true;
+      if (pathDrag.moved) pathPan = { x: pathDrag.pan.x + dx, y: pathDrag.pan.y + dy };
+    }
+    pathHover = hit(event); drawTrackingPath();
+  });
+  for (const name of ['pointerup', 'pointercancel', 'lostpointercapture']) path.addEventListener(name, () => {
+    if (pathDrag?.moved) {
+      ignorePathClick = true;
+      setTimeout(() => { ignorePathClick = false; }, 0);
+    }
+    pathDrag = null;
+  });
   path.addEventListener('pointerleave', () => { pathHover = null; drawTrackingPath(); });
-  path.addEventListener('click', event => { const point = hit(event); if (point) void loadPathOverlay(point); });
+  path.addEventListener('click', event => {
+    if (ignorePathClick) return;
+    const bounds = path.getBoundingClientRect();
+    const target = hitMatchNetwork({x:event.clientX-bounds.left,y:event.clientY-bounds.top});
+    if (target) { networkSelectedPair = target.pairId; networkSelectedCell = target.cellId;
+      networkViewKey = ''; drawTrackingPath(); return; }
+    const point = hit(event); if (point) void loadPathOverlay(point);
+  });
+  path.addEventListener('wheel', event => {
+    if (!pathProject) return;
+    event.preventDefault();
+    const bounds = path.getBoundingClientRect();
+    const x = event.clientX - bounds.left - bounds.width / 2;
+    const y = event.clientY - bounds.top - bounds.height / 2;
+    const next = Math.max(1, Math.min(32, pathZoom * Math.exp(-event.deltaY * 0.001)));
+    const factor = next / pathZoom;
+    pathPan = next === 1 ? { x: 0, y: 0 } :
+      { x: x - (x - pathPan.x) * factor, y: y - (y - pathPan.y) * factor };
+    pathZoom = next;
+    drawTrackingPath();
+  }, { passive: false });
   const canvas = element('trackingOverlayCanvas');
   let drag = null;
-  canvas.addEventListener('pointerdown', event => { if (event.button !== 0) return; drag = { clientX: event.clientX, clientY: event.clientY, pan: { ...overlayPan } }; canvas.setPointerCapture(event.pointerId); });
-  canvas.addEventListener('pointermove', event => { if (!drag) return; overlayPan = { x: drag.pan.x + event.clientX - drag.clientX, y: drag.pan.y + event.clientY - drag.clientY }; renderPathOverlay(); });
-  for (const name of ['pointerup', 'pointercancel', 'lostpointercapture']) canvas.addEventListener(name, () => { drag = null; });
+  const overlayPoint = event => {
+    if (!overlayBounds || !pathOverlay.width) return null;
+    const bounds = canvas.getBoundingClientRect();
+    const scale = Math.min(bounds.width / pathOverlay.width, bounds.height / pathOverlay.height) * overlayZoom;
+    const x = (event.clientX - bounds.left - (bounds.width - pathOverlay.width * scale) / 2 - overlayPan.x) / scale;
+    const y = (event.clientY - bounds.top - (bounds.height - pathOverlay.height * scale) / 2 - overlayPan.y) / scale;
+    return x >= 0 && y >= 0 && x < pathOverlay.width && y < pathOverlay.height ?
+      { x: overlayBounds.minX + x, y: overlayBounds.minY + y, scale } : null;
+  };
+  canvas.addEventListener('pointerdown', event => {
+    if (event.button !== 0 || !pathOverlay.width) return;
+    const point = overlayPoint(event);
+    const selected = overlayPoseDraft && overlaySelectedImage &&
+      frameGeometry({ ...overlaySelectedImage.geometry.entry, pose: overlayPoseDraft.pose },
+        calibration?.field, calibration?.maps);
+    drag = { x: event.clientX, y: event.clientY, pan: { ...overlayPan },
+      pose: overlayPoseDraft ? { ...overlayPoseDraft.pose } : null,
+      scale: point?.scale, frame: Boolean(point && selected?.supports(point, trackingPixelAllowed)), moved: false };
+    canvas.setPointerCapture(event.pointerId);
+  });
+  canvas.addEventListener('pointermove', event => {
+    if (!drag) {
+      const point = overlayPoint(event);
+      const selected = overlayPoseDraft && overlaySelectedImage &&
+        frameGeometry({ ...overlaySelectedImage.geometry.entry, pose: overlayPoseDraft.pose },
+          calibration?.field, calibration?.maps);
+      canvas.style.cursor = point && selected?.supports(point, trackingPixelAllowed) ? 'move' : 'grab';
+      return;
+    }
+    const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
+    if (Math.hypot(dx, dy) > 3) drag.moved = true;
+    if (!drag.moved) return;
+    if (drag.frame && overlayPoseDraft && drag.scale) {
+      canvas.style.cursor = 'move';
+      overlayPoseDraft.pose = { ...drag.pose, x: drag.pose.x + dx / drag.scale, y: drag.pose.y + dy / drag.scale };
+      scheduleOverlayLiveRender();
+      updateOverlayPoseControls();
+      drawTrackingPath();
+      text('trackingOverlayInfo', `Frame #${overlayPoseDraft.frame} | Versatz (${fixed(dx / drag.scale, 1)}, ${fixed(dy / drag.scale, 1)}) px | Vorschau`);
+    } else { canvas.style.cursor = 'grabbing'; overlayPan = { x: drag.pan.x + dx, y: drag.pan.y + dy }; }
+    renderPathOverlay();
+  });
+  canvas.addEventListener('pointerup', event => {
+    if (!drag) return;
+    const wasClick = !drag.moved;
+    drag = null;
+    canvas.style.cursor = 'grab';
+    if (!wasClick || !overlayContributors.length) return;
+    const point = overlayPoint(event);
+    if (!point) return;
+    const candidates = overlayContributors.filter(geometry => geometry.supports(point, trackingPixelAllowed));
+    if (!candidates.length) return;
+    const current = candidates.findIndex(geometry => geometry.entry.frame === overlayPoseDraft?.frame);
+    const next = candidates[(current + 1) % candidates.length].entry.frame;
+    if (next === overlayPoseDraft?.frame) return;
+    element('trackingOverlayFrame').value = String(next);
+    void selectOverlayContributor().catch(error => message(error.message, true));
+  });
+  for (const name of ['pointercancel', 'lostpointercapture']) canvas.addEventListener(name, () => {
+    drag = null; canvas.style.cursor = 'grab';
+  });
   canvas.addEventListener('wheel', event => {
     event.preventDefault();
+    if (overlayPoseDraft && (event.shiftKey || event.altKey)) {
+      const degrees = event.altKey ? 1 : 0.1;
+      const delta = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? event.deltaY * 16 :
+        event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? event.deltaY * canvas.clientHeight : event.deltaY;
+      overlayPoseDraft.pose.rotation += Math.max(-3, Math.min(3, delta / 100)) * degrees * Math.PI / 180;
+      scheduleOverlayLiveRender();
+      updateOverlayPoseControls(); renderPathOverlay(); drawTrackingPath();
+      text('trackingOverlayInfo', `Frame #${overlayPoseDraft.frame} | Rotation ${fixed(overlayPoseDraft.pose.rotation * 180 / Math.PI, 3)} Grad | Vorschau`);
+      return;
+    }
     const bounds = canvas.getBoundingClientRect();
     const next = Math.max(0.25, Math.min(64, overlayZoom * Math.exp(-event.deltaY * 0.001)));
     const factor = next / overlayZoom;
@@ -2444,6 +3943,41 @@ function installPathInteraction() {
     overlayZoom = next; renderPathOverlay();
   }, { passive: false });
   element('trackingOverlayFit').onclick = () => { overlayZoom = 1; overlayPan = { x: 0, y: 0 }; renderPathOverlay(); };
+  element('trackingOverlayPoseDiscard').onclick = () => {
+    if (!overlayPoseDraft) return;
+    overlayPoseDraft.pose = { ...overlayPoseDraft.originalPose };
+    scheduleOverlayLiveRender();
+    updateOverlayPoseControls(); renderPathOverlay(); drawTrackingPath();
+    text('trackingOverlayInfo', `Frame #${overlayPoseDraft.frame} | PosenÃƒÂ¤nderung verworfen.`);
+  };
+  element('trackingOverlayPoseApply').onclick = () => {
+    updateOverlayPoseControls();
+    if (!overlayPoseDraft || element('trackingOverlayPoseApply').disabled) return;
+    const { frame, pose, originalPose } = overlayPoseDraft;
+    const entry = trackingPath.find(item => item.frame === frame);
+    if (!entry || !entry.pose || entry.pose.x !== originalPose.x || entry.pose.y !== originalPose.y ||
+        entry.pose.rotation !== originalPose.rotation) {
+      text('trackingOverlayInfo', 'Frame-Pose wurde zwischenzeitlich geaendert. Ueberlagerung erneut laden.');
+      return;
+    }
+    const dx = pose.x - originalPose.x, dy = pose.y - originalPose.y;
+    const rotationDelta = pose.rotation - originalPose.rotation;
+    entry.pose = { ...entry.pose, x: pose.x, y: pose.y, rotation: pose.rotation };
+    if (entry.raw) entry.raw = { ...entry.raw, x: entry.raw.x + dx, y: entry.raw.y + dy,
+      rotation: entry.raw.rotation + rotationDelta };
+    overlayPoseDraft = null;
+    frameReductionPreview = null;
+    element('frameReductionApply').disabled = true;
+    updateOverlayPoseControls();
+    renderTrackingResults(trackingPath.at(-1));
+    const refreshRequest = overlayRequest + 1;
+    if (pathSelection) void loadPathOverlay(pathSelection).then(() => {
+      if (refreshRequest === overlayRequest && pathOverlay.width) {
+        text('trackingOverlayInfo', `Frame #${frame} | Versatz (${fixed(dx, 1)}, ${fixed(dy, 1)}) px | Rotation ${fixed(rotationDelta * 180 / Math.PI, 3)} Grad | Mischbild aktualisiert.`);
+      }
+    }).catch(error => message(error.message, true)).finally(scheduleTrackingMosaic);
+    else scheduleTrackingMosaic();
+  };
   element('trackingPathRefit').onclick = () => void refitTrackingPath();
   element('trackingPathRefitApply').onclick = applyTrackingPathRefit;
   element('trackingPathRefitDiscard').onclick = () => void discardTrackingPathRefit();
@@ -2454,7 +3988,7 @@ function installPathInteraction() {
   element('refitPreprocessPreview').onchange = renderPathOverlay;
   element('refitPreprocessReset').onclick = () => {
     const defaults = { refitBrightness: 0, refitContrast: 100, refitGamma: 1, refitRed: 30, refitGreen: 59, refitBlue: 11,
-      refitRegion: 40, overlayEdgeFeather: 10 };
+      refitRegion: 100, overlayEdgeFeather: 10 };
     for (const [id, value] of Object.entries(defaults)) element(id).value = value;
     updateRefitPreprocessing();
     if (pathSelection) void loadPathOverlay(pathSelection);
@@ -2464,7 +3998,7 @@ function installPathInteraction() {
     const frame = Number(element('trackingOverlayFrame').value);
     const entry = overlayContributors.find(item => item.entry.frame === frame)?.entry;
     if (!entry) return;
-    void showTrackedFrame(entry).then(() => element('trackingInspector').scrollIntoView({ behavior: 'smooth', block: 'start' })).catch(error => message(error.message, true));
+    void showTrackedFrame(entry).then(() => element('trackingMatchPanel').scrollIntoView({ behavior: 'smooth', block: 'start' })).catch(error => message(error.message, true));
   };
   element('trackingOverlayMaxFrames').onchange = () => { if (pathSelection) void loadPathOverlay(pathSelection); };
   updateRefitPreprocessing();
@@ -2554,7 +4088,7 @@ function renderTrackingResults(entry) {
   text('trackingSummary', `${trackingPath.length} Frames | Fenster ${number('trackingWindow', 1)}`);
   const tbody = element('trackingTable'); tbody.replaceChildren();
   const referenceCounts = trackingReferenceCounts(trackingPath);
-  for (const item of [...trackingPath, ...trackingFailures].sort((first, second) => first.frame - second.frame).slice(-200).reverse()) {
+  for (const item of [...trackingPath, ...trackingFailures].sort((first, second) => first.frame - second.frame).reverse()) {
     const row = tbody.insertRow();
     row.className = 'tracking-row'; row.tabIndex = 0;
     row.insertCell().textContent = `#${item.frame} / ${(item.timestamp / 1e6).toFixed(3)} s`;
@@ -2630,6 +4164,12 @@ async function runTracking(restart = false) {
   }
   trackingInspector.clear();
   video.pause(); trackingRunning = true; trackingPaused = false; updateControls();
+  pcbProposal = null; updatePcbControls();
+  frameReductionPreview = null;
+  element('frameReductionApply').disabled = true;
+  text('trackingMatchTabFrame', '');
+  element('trackingMatchEmpty').hidden = false;
+  activateTrackingTab('poses');
   trackingMosaicRequest++; clearTimeout(trackingMosaicTimer);
   let lastRenderedFrame = null;
   try {
@@ -2716,6 +4256,9 @@ async function runTracking(restart = false) {
       if (!detection.success) {
         trackingFailures.push(entry);
         renderTrackingResults(entry); trackingInspector.show(entry);
+        text('trackingMatchTabFrame', `(#${entry.frame})`);
+        element('trackingMatchEmpty').hidden = true;
+        activateTrackingTab('match');
         trackingPaused = true;
         message(`${detection.reason} Suchgrenze anpassen und denselben Frame mit Fortsetzen erneut versuchen.`, true);
         break;
@@ -2857,9 +4400,7 @@ video.addEventListener('ended', () => { updatePlayIcon(); void showFrame(current
 video.addEventListener('error', () => message(`Videovorschau fehlgeschlagen (Medienfehler ${video.error?.code}). Framegenauer WebCodecs-Zugriff kann davon unabhaengig verfuegbar sein.`, true));
 
 async function resetCalibration() {
-  await computer.call('reset');
-  brightnessSession = null; brightnessRunning = false; brightnessPaused = false; brightnessCalibration = null;
-  clearTrackingResults();
+  await computer.call('reset-calibration');
   calibration = null; frames = new Map(); snapshotFrames = []; snapshotParameters = null;
   observationDiagnostics = null; observationDiagnosticsDirty = true; geometrySelection = null;
   detections.clear(); currentDetection = null; phaseChecked = false; phaseStarted = false; stale = false; detectionsStale = false;
@@ -2877,7 +4418,7 @@ element('videoFile').onchange = () => void task(async () => {
   const file = element('videoFile').files[0];
   if (!file) return;
   message();
-  const candidate = new WorkerClient('/decoder-worker.js', showProgress);
+  const candidate = new WorkerClient('./decoder-worker.js', showProgress);
   let metadata;
   try { metadata = await candidate.call('open', { file }); }
   catch (error) { candidate.terminate(); throw error; }
@@ -2924,7 +4465,7 @@ element('resumeButton').onclick = () => { nextProcessingIndex = Math.max(nextPro
 element('evaluateButton').onclick = () => void task(async () => { cancelRequested = false; phaseStarted = true; await evaluateIndex(currentIndex); await refit(); });
 element('evaluateNextButton').onclick = () => void task(async () => { cancelRequested = false; phaseStarted = true; await evaluateIndex(Math.min(videoInfo.frameCount - 1, currentIndex + 1)); await refit(); });
 element('refitButton').onclick = () => { cancelRequested = false; void task(refit); };
-element('resetButton').onclick = () => { if (confirm('Kalibrierung und alle Beobachtungen zuruecksetzen? Das geladene Video bleibt erhalten.')) void task(resetCalibration); };
+element('resetButton').onclick = () => { if (confirm('Linsenkalibrierung und Checkerboard-Beobachtungen zuruecksetzen? Video, Helligkeitskorrektur und Tracking bleiben erhalten.')) void task(resetCalibration); };
 element('firstFrame').onclick = () => void showFrame(0).catch(error => message(error.message, true));
 element('previousFrame').onclick = () => void showFrame(currentIndex - 1).catch(error => message(error.message, true));
 element('nextFrame').onclick = () => void showFrame(currentIndex + 1).catch(error => message(error.message, true));
@@ -2978,9 +4519,41 @@ function updatePreviewAdjustments(save = true) {
   if (save) saveVideoOptions();
 }
 for (const id of ['previewBrightness', 'previewContrast', 'previewGamma']) element(id).oninput = updatePreviewAdjustments;
-element('globalUseWebGpu').onchange = async () => {
+async function initializeGpuAdapterSelector() {
+  const select = element('globalGpuAdapter');
+  const adapters = await discoverWebGpuAdapters();
+  select.replaceChildren(new Option('Keine', 'none'),
+    ...adapters.map(adapter => new Option(adapter.label, adapter.value)));
+  let saved = null;
+  try { saved = localStorage.getItem('rasterlabor-webgpu-adapter'); } catch {}
+  const selected = adapters.find(adapter => adapter.value === saved) ?? adapters[0] ?? null;
+  const value = saved === 'none' ? 'none' : selected?.value ?? 'none';
+  const unavailable = saved && saved !== 'none' && saved !== value;
+  setWebGpuSelection(value);
+  select.value = value;
+  gpuAdapterReady = true;
+  const adapter = adapters.find(item => item.value === value);
+  text('globalGpuStatus', adapter ? `${unavailable ? 'Gespeicherte Auswahl nicht mehr angeboten. ' : ''}${adapter.name} Ã‚Â· ` +
+    `max. Textur ${adapter.limits.maxTextureDimension2D} px. Der Browser bestimmt die Hardware anhand der Auswahl.` :
+    adapters.length ? 'GPU aus: CPU wird verwendet.' : 'Kein WebGPU-GerÃƒÂ¤t verwendbar; CPU wird verwendet.');
+  updateControls(); updateMergeControls();
+}
+element('globalGpuAdapter').onchange = async () => {
+  if (taskBusy || continuous || rectifiedPlayback || navigationBusy || trackingRunning || trackingPreviewBusy ||
+      pcbBusy || pathRefitBusy || mergeRunning || overlayGpuInFlight > 0) {
+    element('globalGpuAdapter').value = getWebGpuSelection(); return;
+  }
+  releaseOverlayGpuSession();
+  setWebGpuSelection(element('globalGpuAdapter').value);
+  try { localStorage.setItem('rasterlabor-webgpu-adapter', getWebGpuSelection()); } catch {}
   await frameReader.dispose();
   trackingComputer.nativeMaps = null;
+  mergeTilePlan = null;
+  const option = element('globalGpuAdapter').selectedOptions[0];
+  text('globalGpuStatus', useWebGpu() ? `${option.textContent}. Der Browser bestimmt die Hardware anhand der Auswahl.` :
+    'GPU aus: CPU wird verwendet.');
+  updateMergeControls();
+  if (useWebGpu()) void updateMergeTilePlan();
 };
 element('resetPreviewAdjustments').onclick = () => {
   element('previewBrightness').value = 0;
@@ -3032,7 +4605,15 @@ for (const button of document.querySelectorAll('[data-workflow]')) button.onclic
 };
 element('mergeStart').onclick = () => void startMerge().catch(error => message(error.message, true));
 element('mergeCancel').onclick = () => { mergeCancelled = true; text('mergeStatus', 'Breche nach dem laufenden GPU-Durchlauf ab...'); };
-for (const id of ['mergeBlend', 'mergeMaxFrames', 'mergeEdgeFeather']) element(id).onchange = updateMergeControls;
+element('mergeSavePreview').onclick = () => void saveMergePreview().catch(error => message(error.message, true));
+element('mergeSaveMethod').onchange = () => {
+  if (element('mergeSaveMethod').value === 'picker') element('mergeSplit').value = '0';
+  mergeResultStatus = null; updateMergeControls();
+};
+for (const id of ['mergeBlend', 'mergeMaxFrames', 'mergeEdgeFeather', 'mergeSplit']) element(id).onchange = () => {
+  if (element('mergeSplit').value !== '0') element('mergeSaveMethod').value = 'download';
+  mergeResultStatus = null; updateMergeControls();
+};
 element('brightnessFit').onclick = () => void task(() => fitBrightnessCalibration(true)).catch(error => message(error.message, true));
 element('brightnessPause').onclick = () => { brightnessRunning = false; brightnessPaused = true; updateControls(); };
 element('brightnessResume').onclick = () => void task(() => fitBrightnessCalibration(false)).catch(error => message(error.message, true));
@@ -3053,7 +4634,6 @@ element('trackingResumeButton').onclick = () => void runTracking(false).catch(er
   message(error.message, true); trackingRunning = false; updateControls();
 });
 element('trackingResetButton').onclick = () => void (async () => {
-  await discardBrightnessSession();
   clearTrackingResults();
   void previewTrackingStartFrame();
   void loadTrackingMaskPreview();
@@ -3193,6 +4773,14 @@ element('importButton').onclick = () => {
 };
 element('calibrationFile').onchange = () => void task(async () => {
   const file = element('calibrationFile').files[0]; if (!file) return;
+  if (file.name.toLowerCase().endsWith('.json')) {
+    const imported = importOptimizedProject(JSON.parse(await file.text()),calibration,videoInfo);
+    clearTrackingResults();
+    restoreTracking(imported);
+    updateControls(); drawTrackingPath();
+    message('Optimierte Posen und Match-Netz geladen. Linsen- und Helligkeitskalibrierung bleiben erhalten.');
+    return;
+  }
   if (calibration && !confirm('Aktuelle Kalibrierung durch das ausgewaehlte Paket ersetzen?')) return;
   await discardBrightnessSession();
   if (file.size > 768 * 1024 * 1024) throw new Error('Paket groesser als 768 MiB.');
@@ -3228,15 +4816,20 @@ element('closeInfo').onclick = () => element('infoDialog').close();
 installPan(rawCanvas); installPan(resultCanvas);
 installMergePreviewInteraction();
 installTrackingPreviewInteraction();
+installTrackingTabs();
+installPcbRealignment();
+installFineControls();
+installFrameReduction();
 installPathInteraction();
 installTrackingMaskInteraction();
 new ResizeObserver(draw).observe(element('rawCanvas').parentElement);
 new ResizeObserver(draw).observe(element('resultCanvas').parentElement);
 new ResizeObserver(renderTrackingPreview).observe(element('trackingPreviewCanvas').parentElement);
-window.addEventListener('beforeunload', event => { if (frames.size && !calibration) { event.preventDefault(); event.returnValue = ''; } });
+window.addEventListener('beforeunload', event => { if (mergeRunning || (frames.size && !calibration)) { event.preventDefault(); event.returnValue = ''; } });
 restoreVideoOptions();
 video.playbackRate = Number(element('speed').value);
 text('trackingMaskBrushValue', `${element('trackingMaskBrush').value} px`);
 updatePreviewAdjustments(false);
 updateControls(); updateMetrics(); draw();
+void initializeGpuAdapterSelector();
 setInterval(updateMemoryStats, 2000);

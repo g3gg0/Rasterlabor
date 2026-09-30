@@ -126,7 +126,8 @@ function partialCorrelation(pairs, scale, width, height) {
 }
 
 function* overlapSteps(current, reference, prediction, referencePose, {
-  radius = 32, angle = 1, coarseStep = 0, coarseRadiusFactor = 0.8, partial = false
+  radius = 32, angle = 1, coarseStep = 0, coarseRadiusFactor = 0.8, partial = false,
+  minimumOverlapFraction = 0.2, stopAfterEmptyCoarseLevel = false, sampleRegion = null
 } = {}) {
   const initial = relative(prediction, referencePose);
   const angleRadius = angle * Math.PI / 180;
@@ -142,6 +143,8 @@ function* overlapSteps(current, reference, prediction, referencePose, {
       if (value < 0) continue;
       const x = (column + 0.5) * source.scale - current.width / 2;
       const y = (row + 0.5) * source.scale - current.height / 2;
+      if (sampleRegion && (x < sampleRegion.xMin || x >= sampleRegion.xMax ||
+          y < sampleRegion.yMin || y >= sampleRegion.yMax)) continue;
       samples.push({ x, y, value });
     }
     if (samples.length < 128) continue;
@@ -150,7 +153,7 @@ function* overlapSteps(current, reference, prediction, referencePose, {
     const evaluate = function* (pose) {
       evaluated++;
       if (Math.hypot(pose.x - initial.x, pose.y - initial.y) > radius || Math.abs(wrap(pose.angle - initial.angle)) > angleRadius) return null;
-      return yield { type: 'evaluate', pose, cpu: () => {
+      return yield { type: 'evaluate', pose, minimumOverlapFraction, cpu: () => {
       const pairs = [];
       for (const sample of samples) {
         const transformed = rotate(sample.x, sample.y, pose.angle);
@@ -161,7 +164,7 @@ function* overlapSteps(current, reference, prediction, referencePose, {
         pairs.push({ ...sample, px, py, valueSecond: value, rotatedX: transformed.x, rotatedY: transformed.y });
       }
       const count = pairs.length;
-      if (count < 128 || count < samples.length * 0.2) return null;
+      if (count < 128 || count < samples.length * minimumOverlapFraction) return null;
       const result = partial ? partialCorrelation(pairs, target.scale, current.width, current.height) : correlation(pairs);
       return result ? { ...result, pairs: result.pairs ?? pairs } : null;
       } };
@@ -194,7 +197,10 @@ function* overlapSteps(current, reference, prediction, referencePose, {
         }
       }
     }
-    if (!best) continue;
+    if (!best) {
+      if (coarseStep > 0 && stopAfterEmptyCoarseLevel) break;
+      continue;
+    }
     initialized = true;
     if (coarseStep > 0) {
       for (const stepSize of [target.scale * 2, target.scale]) {

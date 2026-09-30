@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { frameGeometry, localSelectionMask, localSelectionDistance, localSelectionSupport, nearestPathEntry, applyPixelMask, edgeFeatherMask, applyEdgeFeather, accumulateFrame, approximateTopFrames, averagedFrames, sharpestFramesFirst, sparsePathFrames, pointBounds, evenlySpaced } from '../src/path-support.js';
 import { contextImage } from '../src/context-tracker.js';
+import { maskIncludes } from '../src/patch-mask.js';
 
 test('point bounds handle tracking paths larger than the call argument limit', () => {
   const points = Array.from({ length: 100_000 }, (_, index) => ({ x: index - 40_000, y: 50_000 - index }));
@@ -52,6 +53,15 @@ test('local refit mask follows the selected point in frame coordinates', () => {
   const valueAt = (x, y) => mask.data[Math.floor(y / mask.cellSize) * mask.width + Math.floor(x / mask.cellSize)];
   assert.equal(valueAt(50, 40), 1);
   assert.equal(valueAt(5, 5), 0);
+});
+
+test('100 percent local refit region covers the whole allowed image', () => {
+  const geometry = { width: 100, height: 80, local: point => point };
+  const mask = localSelectionMask(geometry, { x: 2, y: 40 }, 1);
+  assert.equal(maskIncludes(mask, 95, 75), true);
+  assert.equal(maskIncludes(mask, 5, 5), true);
+  assert.ok(localSelectionSupport(geometry, { x: 2, y: 40 }, 1) >
+    localSelectionSupport(geometry, { x: 2, y: 40 }, 0.4));
 });
 
 test('local selection distance measures the gap outside a frame', () => {

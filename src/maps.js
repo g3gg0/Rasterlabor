@@ -210,14 +210,19 @@ export async function buildMaps(calibration, frames, notify = () => {}, cancelle
   return maps;
 }
 
-export function remapRGBA(image, maps) {
+export function remapRGBA(image, maps, sourceMask = null) {
   const output = new Uint8ClampedArray(maps.outputWidth * maps.outputHeight * 4);
+  const maskData = sourceMask?.data;
+  const cellSize = sourceMask?.cellSize;
+  const includes = (x, y) => !maskData || maskData[Math.floor(y / cellSize) * sourceMask.width + Math.floor(x / cellSize)] === 1;
   for (let index = 0; index < maps.valid.length; index++) {
     if (!maps.valid[index]) continue;
     const px = maps.inverseX[index];
     const py = maps.inverseY[index];
     const col = Math.floor(px);
     const row = Math.floor(py);
+    if (maskData && (col < 0 || row < 0 || col + 1 >= sourceMask.sourceWidth || row + 1 >= sourceMask.sourceHeight ||
+        !includes(col, row) || !includes(col + 1, row) || !includes(col, row + 1) || !includes(col + 1, row + 1))) continue;
     const localX = px - col;
     const localY = py - row;
     const sourceIndex = (row * image.width + col) * 4;

@@ -4,8 +4,8 @@ const wrap = angle => Math.atan2(Math.sin(angle), Math.cos(angle));
 const rotate = (x, y, angle) => ({ x: Math.cos(angle) * x - Math.sin(angle) * y,
   y: Math.sin(angle) * x + Math.cos(angle) * y });
 
-function featureLevel(image) {
-  return image.levels.findLast(level => Math.max(level.width, level.height) >= 240) ?? image.levels[0];
+function featureLevel(image, minimumEdge) {
+  return image.levels.findLast(level => Math.max(level.width, level.height) >= minimumEdge) ?? image.levels[0];
 }
 
 function validPatch(level, x, y, radius = 17) {
@@ -14,8 +14,8 @@ function validPatch(level, x, y, radius = 17) {
     level.gray[Math.round(y + dy) * level.width + Math.round(x + dx)] >= 0);
 }
 
-function features(image, maximum = 700) {
-  const level = featureLevel(image);
+function features(image, maximum = 700, minimumEdge = 240) {
+  const level = featureLevel(image, minimumEdge);
   const matrix = new jsfeat.matrix_t(level.width, level.height, jsfeat.U8_t | jsfeat.C1_t);
   for (let index = 0; index < level.gray.length; index++) matrix.data[index] = Math.max(0, level.gray[index]);
   jsfeat.imgproc.gaussian_blur(matrix, matrix, 3, 0);
@@ -91,10 +91,15 @@ function refine(matches) {
   return { x: reference.x - center.x, y: reference.y - center.y, angle };
 }
 
-export function registerFeatureOverlap(current, reference, referencePose, { iterations = 1200 } = {}) {
-  const currentFeatures = features(current); const referenceFeatures = features(reference);
+export function registerFeatureOverlap(current, reference, referencePose,
+  { iterations = 1200, minimumFeatureEdge = 240, maximumFeatures = 700 } = {}) {
+  const currentFeatures = features(current, maximumFeatures, minimumFeatureEdge);
+  const referenceFeatures = features(reference, maximumFeatures, minimumFeatureEdge);
   const matches = descriptorMatches(currentFeatures, referenceFeatures);
-  if (matches.length < 8) return { accepted: false, reason: 'Zu wenige Feature-Paare', matches: matches.length };
+  const diagnostics = { featureScale: currentFeatures.scale,
+    currentFeatures: currentFeatures.points.length, referenceFeatures: referenceFeatures.points.length, matches: matches.length };
+  const minimumMatches = 8;
+  if (matches.length < minimumMatches) return { ...diagnostics, accepted: false, reason: 'Zu wenige Feature-Paare' };
   const threshold = Math.max(4, currentFeatures.scale * 1.5);
   let best = [];
   let state = 0x9e3779b9;
@@ -106,14 +111,15 @@ export function registerFeatureOverlap(current, reference, referencePose, { iter
     const inliers = matches.filter(match => residual(match, model) <= threshold);
     if (inliers.length > best.length) best = inliers;
   }
-  if (best.length < 8 || best.length < matches.length * 0.12) {
-    return { accepted: false, reason: 'Kein robuster Feature-Konsens', matches: matches.length, inliers: best.length };
+  if (best.length < minimumMatches || best.length < matches.length * 0.12) {
+    return { ...diagnostics, accepted: false, reason: 'Kein robuster Feature-Konsens', inliers: best.length };
   }
   const measurement = refine(best);
   const errors = best.map(match => residual(match, measurement)).sort((first, second) => first - second);
   const translation = rotate(measurement.x, measurement.y, referencePose.rotation);
-  return { accepted: true, method: 'ORB + RANSAC', matches: matches.length, inliers: best.length,
+  const pose={x:referencePose.x+translation.x,y:referencePose.y+translation.y,
+    rotation:wrap(referencePose.rotation+measurement.angle)};
+  return { ...diagnostics, accepted: true, method: 'ORB + RANSAC', inliers: best.length,
     residual: errors[Math.floor(errors.length / 2)], score: best.length / matches.length,
-    pose: { x: referencePose.x + translation.x, y: referencePose.y + translation.y,
-      rotation: wrap(referencePose.rotation + measurement.angle) } };
+    pose };
 }
